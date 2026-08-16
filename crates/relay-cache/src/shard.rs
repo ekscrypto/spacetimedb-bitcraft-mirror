@@ -892,10 +892,16 @@ pub(crate) fn apply_rows(
         CLAIM_TABLE => {
             for row in deletes {
                 let decoded = decode::decode_claim_with_fields(row, &meta.claim_fields, meta.cols.claim, schema)?;
+                store
+                    .hexite
+                    .update_claim(decoded.entity_id, decoded.owner_player_entity_id, None);
                 store.claim.delete(decoded.entity_id);
             }
             for row in inserts {
                 let decoded = decode::decode_claim_with_fields(row, &meta.claim_fields, meta.cols.claim, schema)?;
+                store
+                    .hexite
+                    .update_claim(decoded.entity_id, decoded.owner_player_entity_id, Some(&decoded.name));
                 store.claim.upsert(decoded);
             }
         }
@@ -1010,7 +1016,17 @@ pub(crate) fn apply_rows(
                 });
                 // Hexite PK location subscribes land here too; stash x/z
                 // onto the resource row (overworld deposits are dimension 1).
-                store.resource.set_location(decoded.entity_id, decoded.x, decoded.z);
+                if !store.resource.set_location(decoded.entity_id, decoded.x, decoded.z)
+                    && decoded.dimension == decode::OVERWORLD_DIMENSION
+                    && store.hexite.contains(decoded.x, decoded.z)
+                {
+                    // Seed order (table-alphabetical in the embedded feed)
+                    // streams a deposit's location before its resource row;
+                    // stash for the resource arm to consume at upsert.
+                    store
+                        .resource
+                        .stash_pending_location(decoded.entity_id, decoded.x, decoded.z);
+                }
                 if let Some(t) = touches.as_deref_mut() {
                     touch_location_entity(store, decoded.entity_id, decoded.dimension, t);
                 }
@@ -1220,6 +1236,7 @@ pub(crate) fn apply_rows(
                     meta.cols.claim_local,
                     schema,
                 )?;
+                store.hexite.update_claim_location(decoded.entity_id, false, 0, 0);
                 store.claim_local.delete(decoded.entity_id);
             }
             for row in inserts {
@@ -1229,6 +1246,12 @@ pub(crate) fn apply_rows(
                     meta.cols.claim_local,
                     schema,
                 )?;
+                store.hexite.update_claim_location(
+                    decoded.entity_id,
+                    decoded.has_location,
+                    decoded.location_x,
+                    decoded.location_z,
+                );
                 store.claim_local.upsert(decoded);
             }
         }
@@ -1492,6 +1515,8 @@ pub(crate) fn apply_rows(
             }
             for row in inserts {
                 let decoded = decode_resource_row(meta, row, schema)?;
+                // Consumes a stashed pending location when one exists (see
+                // the LOCATION arm).
                 store.resource.upsert(decoded);
             }
         }

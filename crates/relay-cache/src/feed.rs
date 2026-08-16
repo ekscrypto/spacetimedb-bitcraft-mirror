@@ -28,8 +28,12 @@
 //! full-table batches:
 //!
 //! - the per-hexite `location_state` second subscription set is gone — the
-//!   feed sees every location row, and `ResourceSoA::set_location` attaches
-//!   x/z for tracked deposits as rows arrive (both orders work);
+//!   feed sees every location row. Because the tables seed alphabetically
+//!   (location_state before resource_state), a deposit's location row can
+//!   stream past before its resource row; the `HexiteIndex` (claim name ×
+//!   claim_local coords, both seeded earlier) lets the location arm stash
+//!   those rows for the resource arm to consume at upsert — order-safe both
+//!   ways, with no follow-up subscription;
 //! - the hexite-integrity reconnect class is gone for the same reason (the
 //!   location rows cannot be missing from the batch stream).
 

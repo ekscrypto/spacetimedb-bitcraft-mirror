@@ -22,6 +22,13 @@ use hashbrown::HashMap;
 
 use crate::decode::ClaimRow;
 
+/// Hexite Deposit claims: unowned (`owner_player_entity_id == 0`) with
+/// name prefix `{0} (N: {1}, E: {2})|~Hexite Deposit|`.
+pub fn is_hexite_claim(owner_player_entity_id: u64, name: &str) -> bool {
+    const PREFIX: &str = "{0} (N: {1}, E: {2})|~Hexite Deposit|";
+    owner_player_entity_id == 0 && name.starts_with(PREFIX)
+}
+
 pub struct ClaimSoA {
     pub entity_id: Vec<u64>,
     pub owner_player_entity_id: Vec<u64>,
@@ -80,10 +87,9 @@ impl ClaimSoA {
     /// Hexite Deposit claims: unowned (`owner_player_entity_id == 0`) with
     /// name prefix `{0} (N: {1}, E: {2})|~Hexite Deposit|`.
     pub fn iter_hexite_deposit_slots(&self) -> impl Iterator<Item = u32> + '_ {
-        const PREFIX: &str = "{0} (N: {1}, E: {2})|~Hexite Deposit|";
         self.pk.values().copied().filter(move |&slot| {
             let i = slot as usize;
-            self.owner_player_entity_id[i] == 0 && self.name[i].starts_with(PREFIX)
+            is_hexite_claim(self.owner_player_entity_id[i], &self.name[i])
         })
     }
 

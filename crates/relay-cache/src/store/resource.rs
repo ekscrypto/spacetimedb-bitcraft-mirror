@@ -18,6 +18,10 @@ pub struct ResourceSoA {
     pub has_location: Vec<bool>,
     free_slots: Vec<u32>,
     pk: HashMap<u64, u32>,
+    /// Location rows seen before their resource row (table-alphabetical seed
+    /// order in the embedded feed). Consumed at upsert; entries for entities
+    /// that never become resources linger until the next reconnect clear.
+    pending_locations: HashMap<u64, (i32, i32)>,
 }
 
 impl ResourceSoA {
@@ -30,6 +34,7 @@ impl ResourceSoA {
             has_location: Vec::with_capacity(cap),
             free_slots: Vec::new(),
             pk: HashMap::with_capacity(cap),
+            pending_locations: HashMap::new(),
         }
     }
 
@@ -75,6 +80,11 @@ impl ResourceSoA {
         self.location_z[i] = 0;
         self.has_location[i] = false;
         self.pk.insert(row.entity_id, slot);
+        // A location row for this entity may have streamed past before the
+        // resource row (seed order) — consume it now.
+        if let Some((x, z)) = self.pending_locations.remove(&row.entity_id) {
+            self.attach_location_if_missing(row.entity_id, x, z);
+        }
     }
 
     pub fn delete(&mut self, entity_id: u64) {
@@ -101,6 +111,34 @@ impl ResourceSoA {
         self.location_z[i] = z;
         self.has_location[i] = true;
         true
+    }
+
+    /// Like [`Self::set_location`], but never overwrites an existing attach.
+    ///
+    /// Used for coords that may predate the resource row (claim_local seeds
+    /// before resource_state in table-alphabetical order): an existing
+    /// location came from a live `location_state` move and is authoritative.
+    pub fn attach_location_if_missing(&mut self, entity_id: u64, x: i32, z: i32) {
+        if let Some(&slot) = self.pk.get(&entity_id) {
+            let i = slot as usize;
+            if !self.has_location[i] {
+                self.location_x[i] = x;
+                self.location_z[i] = z;
+                self.has_location[i] = true;
+            }
+        }
+    }
+
+    /// Remember a location for an entity whose resource row has not arrived
+    /// yet. Callers must bound what they stash (the location arm gates on the
+    /// hexite-claim coords index, so only deposit rows land here).
+    pub fn stash_pending_location(&mut self, entity_id: u64, x: i32, z: i32) {
+        if self.pk.contains_key(&entity_id) {
+            // Resource known: attach directly (authoritative path).
+            self.set_location(entity_id, x, z);
+        } else {
+            self.pending_locations.insert(entity_id, (x, z));
+        }
     }
 
     pub fn clear_location(&mut self, entity_id: u64) {
@@ -166,5 +204,25 @@ mod tests {
         assert!(s.any_missing_location());
         assert!(s.set_location(10, 1, 2));
         assert!(!s.any_missing_location());
+    }
+
+    #[test]
+    fn attach_location_if_missing_never_overwrites() {
+        let mut s = ResourceSoA::with_capacity(2);
+        s.upsert(ResourceRow {
+            entity_id: 10,
+            resource_id: HEXITE_DEPOSIT_RESOURCE_ID,
+        });
+        // Coords that predate the resource row attach once…
+        s.attach_location_if_missing(10, 7, 8);
+        assert_eq!((s.location_x[0], s.location_z[0]), (7, 8));
+        // …and a later (possibly staler) claim_local update does not win over
+        // a live location_state move.
+        s.set_location(10, 9, 10);
+        s.attach_location_if_missing(10, 7, 8);
+        assert_eq!((s.location_x[0], s.location_z[0]), (9, 10));
+        // Unknown entities stay a no-op (nothing to attach to).
+        s.attach_location_if_missing(99, 1, 2);
+        assert_eq!(s.len(), 1);
     }
 }

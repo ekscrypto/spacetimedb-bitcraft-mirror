@@ -53,6 +53,45 @@ fn location_row(entity_id: u64, x: i32, z: i32, dimension: u32) -> Bytes {
     Bytes::from(buf)
 }
 
+/// Hand-encode a `claim_state` row. Real field order: entity_id u64,
+/// owner_player_entity_id u64, owner_building_entity_id u64, name String
+/// (u32 length + UTF-8), neutral Bool.
+fn claim_row(entity_id: u64, owner_player: u64, name: &str, neutral: bool) -> Bytes {
+    let mut buf = Vec::with_capacity(25 + name.len());
+    buf.extend_from_slice(&entity_id.to_le_bytes());
+    buf.extend_from_slice(&owner_player.to_le_bytes());
+    buf.extend_from_slice(&0u64.to_le_bytes()); // owner_building_entity_id
+    buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    buf.extend_from_slice(name.as_bytes());
+    buf.push(neutral as u8);
+    Bytes::from(buf)
+}
+
+/// Hand-encode a `claim_local_state` row with `location = some {x, z, 1}`.
+/// Real field order: entity_id u64, supplies i32, building_maintenance f32,
+/// num_tiles i32, num_tile_neighbors u32, location Sum[some{x,z,dimension},
+/// none], treasury u32, xp_gained_since_last_coin_minting u32,
+/// supplies_purchase_threshold u32, supplies_purchase_price f32,
+/// building_description_id i32.
+fn claim_local_row(entity_id: u64, x: i32, z: i32) -> Bytes {
+    let mut buf = Vec::with_capacity(57);
+    buf.extend_from_slice(&entity_id.to_le_bytes());
+    buf.extend_from_slice(&0i32.to_le_bytes()); // supplies
+    buf.extend_from_slice(&0u32.to_le_bytes()); // building_maintenance bits
+    buf.extend_from_slice(&0i32.to_le_bytes()); // num_tiles
+    buf.extend_from_slice(&0u32.to_le_bytes()); // num_tile_neighbors
+    buf.push(0u8); // location: some
+    buf.extend_from_slice(&x.to_le_bytes());
+    buf.extend_from_slice(&z.to_le_bytes());
+    buf.extend_from_slice(&1u32.to_le_bytes()); // dimension
+    buf.extend_from_slice(&0u32.to_le_bytes()); // treasury
+    buf.extend_from_slice(&0u32.to_le_bytes()); // xp_gained_since_last_coin_minting
+    buf.extend_from_slice(&0u32.to_le_bytes()); // supplies_purchase_threshold
+    buf.extend_from_slice(&0u32.to_le_bytes()); // supplies_purchase_price bits
+    buf.extend_from_slice(&0i32.to_le_bytes()); // building_description_id
+    Bytes::from(buf)
+}
+
 /// Hand-encode a `resource_state` row. Real field order: entity_id u64,
 /// resource_id i32, direction_index i32 (16 bytes).
 fn resource_row(entity_id: u64, resource_id: i32) -> Bytes {
@@ -148,24 +187,31 @@ async fn feed_seed_live_lifecycle_marks_ready_and_attaches_hexite() {
         .expect("regional database yields a handle");
     assert_eq!(handle.region, 7);
 
-    // Seed: an interior location row, an overworld hexite row pair
-    // (resource + its dimension-1 location), and an untracked resource.
+    // Seed in the table-alphabetical order the embedded feed dispatches:
+    // claim_state → claim_local_state → location_state → resource_state.
+    // The hexite claim (700) sits at world coords (30, 40); its resource
+    // (501) and location row share those coords.
+    const HEXITE_NAME: &str = "{0} (N: {1}, E: {2})|~Hexite Deposit|~6158|~8174";
     let seed = seed_update(vec![
+        ops("claim_state", vec![], vec![claim_row(700, 0, HEXITE_NAME, true)]),
+        ops("claim_local_state", vec![], vec![claim_local_row(700, 30, 40)]),
+        ops(
+            "location_state",
+            vec![],
+            vec![
+                location_row(600, 10, 20, 7), // interior
+                location_row(501, 30, 40, 1), // overworld hexite — BEFORE its resource
+                location_row(999, 1, 2, 1),   // overworld, not tracked
+            ],
+        ),
+        // resource_state arrives after location_state: 501's location was
+        // stashed via the hexite-claim coords index and must attach here.
         ops(
             "resource_state",
             vec![],
             vec![
                 resource_row(501, HEXITE_RESOURCE_ID),
                 resource_row(502, OTHER_RESOURCE_ID),
-            ],
-        ),
-        ops(
-            "location_state",
-            vec![],
-            vec![
-                location_row(600, 10, 20, 7), // interior
-                location_row(501, 30, 40, 1), // overworld hexite
-                location_row(999, 1, 2, 1),   // overworld, not tracked
             ],
         ),
     ]);

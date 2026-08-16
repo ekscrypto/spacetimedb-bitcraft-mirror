@@ -18,6 +18,7 @@ pub mod deployable;
 pub mod dimension_network;
 pub mod experience;
 pub mod growth;
+pub mod hexite;
 pub mod inventory;
 pub mod location_dim;
 pub mod mobile_entity;
@@ -46,6 +47,7 @@ pub use deployable::{DeployableDescStore, DeployableSoA};
 pub use dimension_network::DimensionNetworkStore;
 pub use experience::ExperienceSoA;
 pub use growth::GrowthStore;
+pub use hexite::HexiteIndex;
 pub use inventory::{InventorySoA, Pocket};
 pub use location_dim::LocationDimStore;
 pub use mobile_entity::MobileEntitySoA;
@@ -98,6 +100,11 @@ pub struct RegionStore {
     pub growth: GrowthStore,
     pub growth_timer: ResourceGrowthTimerStore,
     pub storage_log: StorageLogSoA,
+    /// Hexite-deposit claim world coords (see `hexite.rs`) — lets
+    /// `location_state` rows that stream before `resource_state` (table
+    /// -alphabetical seed order in the embedded feed) attach to their
+    /// resource at upsert time.
+    pub hexite: HexiteIndex,
 }
 
 impl RegionStore {
@@ -135,6 +142,7 @@ impl RegionStore {
             growth: GrowthStore::new(),
             growth_timer: ResourceGrowthTimerStore::new(),
             storage_log: StorageLogSoA::with_capacity(0),
+            hexite: HexiteIndex::default(),
         }
     }
 }
