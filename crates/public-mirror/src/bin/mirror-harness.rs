@@ -30,7 +30,10 @@ use url::Url;
 const SUBPROTOCOL_V1: &str = "v1.bsatn.spacetimedb";
 
 #[derive(Parser, Debug)]
-#[command(name = "mirror-harness", about = "Compare upstream vs local mirror TransactionUpdates")]
+#[command(
+    name = "mirror-harness",
+    about = "Compare upstream vs local mirror TransactionUpdates"
+)]
 struct Args {
     /// Upstream SpacetimeDB host (ws/wss/http/https).
     #[arg(long)]
@@ -100,15 +103,9 @@ async fn main() -> anyhow::Result<()> {
         args.token = std::env::var("MIRROR_TOKEN").ok();
     }
     if args.tables.is_empty() {
-        args.tables = vec![
-            "player_username_state".to_string(),
-            "player_state".to_string(),
-        ];
+        args.tables = vec!["player_username_state".to_string(), "player_state".to_string()];
     }
-    let mirror_db = args
-        .mirror_database
-        .clone()
-        .unwrap_or_else(|| args.database.clone());
+    let mirror_db = args.mirror_database.clone().unwrap_or_else(|| args.database.clone());
 
     let upstream_host: Url = args.upstream.parse()?;
     let mirror_host: Url = args.mirror_url.parse()?;
@@ -165,9 +162,7 @@ async fn main() -> anyhow::Result<()> {
         // Local mirror issues its own identity; do not send the upstream BitCraft JWT
         // (signed for a different issuer / keypair → 401 Unauthorized).
         let secs = args.seconds;
-        tokio::spawn(async move {
-            run_client("mirror", mirror_host, &mirror_db, None, &tables, collector, secs).await
-        })
+        tokio::spawn(async move { run_client("mirror", mirror_host, &mirror_db, None, &tables, collector, secs).await })
     };
 
     let (up_res, mir_res) = tokio::join!(up_task, mir_task);
@@ -286,7 +281,13 @@ async fn run_client(
                 ServerMessage::SubscriptionError(e) => anyhow::bail!("{label}: subscribe error: {}", e.error),
                 ServerMessage::TransactionUpdate(tu) => {
                     if let UpdateStatus::Committed(db) = tu.status {
-                        record_tu(&collector, &tu.reducer_call.reducer_name, tu.reducer_call.request_id, &tu.caller_identity.to_string(), &db);
+                        record_tu(
+                            &collector,
+                            &tu.reducer_call.reducer_name,
+                            tu.reducer_call.request_id,
+                            &tu.caller_identity.to_string(),
+                            &db,
+                        );
                     }
                 }
                 _ => {}

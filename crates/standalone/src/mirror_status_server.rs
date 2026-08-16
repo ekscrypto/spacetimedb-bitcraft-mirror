@@ -67,9 +67,7 @@ fn run(listen_addr: String, registry: Arc<MirrorStatusRegistry>) -> anyhow::Resu
             "mirror status HTTP listening on {} (isolated GET /v1/mirrors)",
             listener.local_addr()?
         );
-        axum::serve(listener, app)
-            .await
-            .context("mirror status axum serve")
+        axum::serve(listener, app).await.context("mirror status axum serve")
     })
 }
 
@@ -79,17 +77,8 @@ mod tests {
 
     #[test]
     fn default_listen_addr_is_loopback_port_plus_offset() {
-        assert_eq!(
-            default_listen_addr("127.0.0.1:3030").unwrap(),
-            "127.0.0.1:3060"
-        );
-        assert_eq!(
-            default_listen_addr("0.0.0.0:3000").unwrap(),
-            "127.0.0.1:3030"
-        );
-        assert_eq!(
-            default_listen_addr("127.0.0.1:3007").unwrap(),
-            "127.0.0.1:3037"
-        );
+        assert_eq!(default_listen_addr("127.0.0.1:3030").unwrap(), "127.0.0.1:3060");
+        assert_eq!(default_listen_addr("0.0.0.0:3000").unwrap(), "127.0.0.1:3030");
+        assert_eq!(default_listen_addr("127.0.0.1:3007").unwrap(), "127.0.0.1:3037");
     }
 }

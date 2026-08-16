@@ -22,17 +22,18 @@ use spacetimedb::worker_metrics;
 use spacetimedb::Identity;
 use spacetimedb_client_api::routes::database::DatabaseRoutes;
 use spacetimedb_client_api::routes::router;
+use spacetimedb_client_api::routes::subscribe::WebSocketOptions;
 use spacetimedb_client_api_messages::name::DatabaseName;
+use spacetimedb_paths::cli::{PrivKeyPath, PubKeyPath};
+use spacetimedb_paths::server::{ConfigToml, ServerDataDir};
+use spacetimedb_public_mirror_client::observer::MirrorObserverRegistry;
 use spacetimedb_public_mirror_client::runtime::{run_public_mirror_loop, schema_program_hash, PublicMirrorConfig};
 use spacetimedb_public_mirror_client::schema::fetch_and_parse_schema;
 use spacetimedb_public_mirror_client::schema::public_user_table_names;
 use std::str::FromStr;
 use std::time::Duration;
-use url::Url;
-use spacetimedb_client_api::routes::subscribe::WebSocketOptions;
-use spacetimedb_paths::cli::{PrivKeyPath, PubKeyPath};
-use spacetimedb_paths::server::{ConfigToml, ServerDataDir};
 use tokio::net::TcpListener;
+use url::Url;
 
 pub fn cli() -> clap::Command {
     clap::Command::new("start")
@@ -196,6 +197,37 @@ pub fn cli() -> clap::Command {
                 )
                 .requires("public_mirror_v1"),
         )
+        .arg(
+            Arg::new("bitcraft_cache")
+                .long("bitcraft-cache")
+                .action(SetTrue)
+                .help(
+                    "Embed the BitCraft read cache (relay-cache) in this process: the mirror's \
+                     decoded upstream batches feed the cache stores directly (no WebSocket hop, \
+                     no re-encode/re-decode). Serves the full relay-cache HTTP/protobuf API + \
+                     dim-buildings WebSocket on --cache-bind, per --mirror bitcraft-live-<N>.",
+                )
+                .requires("public_mirror_v1"),
+        )
+        .arg(
+            Arg::new("cache_bind")
+                .long("cache-bind")
+                .help("Loopback bind for the embedded relay-cache HTTP API (default 127.0.0.1:8089).")
+                .requires("bitcraft_cache")
+                .default_value("127.0.0.1:8089"),
+        )
+        .arg(
+            Arg::new("cache_mem_ceiling_bytes")
+                .long("cache-mem-ceiling-bytes")
+                .help(
+                    "Soft RSS ceiling in bytes for the embedded cache sampler \
+                     (default 8 GiB). At/above it /cache-health flips ready=false \
+                     (same policy as the standalone relay-cache).",
+                )
+                .requires("bitcraft_cache")
+                .value_parser(clap::value_parser!(u64))
+                .default_value("8589934592"),
+        )
     // .after_help("Run `spacetime help start` for more detailed information.")
 }
 
@@ -262,9 +294,7 @@ pub async fn exec(args: &ArgMatches, db_cores: JobCores) -> anyhow::Result<()> {
         None
     };
     let mirror_subscribe_concurrency = if public_mirror_v1 {
-        let n = *args
-            .get_one::<usize>("mirror_subscribe_concurrency")
-            .unwrap_or(&1);
+        let n = *args.get_one::<usize>("mirror_subscribe_concurrency").unwrap_or(&1);
         anyhow::ensure!(n >= 1, "--mirror-subscribe-concurrency must be >= 1");
         n
     } else {
@@ -356,6 +386,30 @@ pub async fn exec(args: &ArgMatches, db_cores: JobCores) -> anyhow::Result<()> {
     worker_metrics::spawn_bsatn_rlb_pool_stats(listen_addr.clone(), ctx.bsatn_rlb_pool().clone());
 
     let mirror_mode = mirrors.is_some();
+    // Embedded BitCraft cache (--bitcraft-cache): one FeedManager + observer
+    // registry shared by every mirror; each mirror registers its region
+    // during bootstrap, before its upstream loop can dispatch.
+    let cache_ctx: Option<CacheContext> = if mirror_mode && args.get_flag("bitcraft_cache") {
+        let interest = relay_cache::interest::InterestHub::new();
+        let memory_pressure = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let feed = relay_cache::feed::FeedManager::new(interest.clone());
+        let registry = Arc::new(MirrorObserverRegistry::new());
+        log::info!(
+            "bitcraft-cache: embedded relay-cache enabled (bind {}, mem ceiling {} bytes)",
+            args.get_one::<String>("cache_bind").unwrap_or(&"127.0.0.1:8089".into()),
+            args.get_one::<u64>("cache_mem_ceiling_bytes")
+                .copied()
+                .unwrap_or(8 * 1024 * 1024 * 1024),
+        );
+        Some(CacheContext {
+            interest,
+            memory_pressure,
+            feed,
+            registry,
+        })
+    } else {
+        None
+    };
     if let Some(mirrors) = mirrors {
         let subscribe_gate = Arc::new(tokio::sync::Semaphore::new(mirror_subscribe_concurrency));
         let coordinator_socket = args
@@ -383,10 +437,41 @@ pub async fn exec(args: &ArgMatches, db_cores: JobCores) -> anyhow::Result<()> {
                 reject_one_off_query,
                 Arc::clone(&subscribe_gate),
                 coordinator_socket.clone(),
+                cache_ctx.clone(),
             )
             .await
             .with_context(|| format!("failed to bootstrap public-mirror for `{}`", m.database))?;
         }
+    }
+
+    // Serve the embedded cache API once every mirror region is registered.
+    if let Some(cache) = cache_ctx {
+        let bind = args
+            .get_one::<String>("cache_bind")
+            .cloned()
+            .unwrap_or_else(|| "127.0.0.1:8089".into());
+        let ceiling = args
+            .get_one::<u64>("cache_mem_ceiling_bytes")
+            .copied()
+            .unwrap_or(8 * 1024 * 1024 * 1024);
+        let addr: std::net::SocketAddr = bind.parse().with_context(|| format!("parse --cache-bind `{bind}`"))?;
+        let fleet = relay_cache::serve::Fleet {
+            shards: cache.feed.shard_handles(),
+            memory_pressure: cache.memory_pressure.clone(),
+            interest: cache.interest.clone(),
+        };
+        tokio::spawn(async move {
+            if let Err(e) = relay_cache::serve::serve(addr, fleet, std::future::pending()).await {
+                log::error!("bitcraft-cache: HTTP server exited: {e:#}");
+            }
+        });
+        let pressure = cache.memory_pressure.clone();
+        tokio::spawn(relay_cache::run_memory_sampler(
+            ceiling,
+            pressure,
+            Box::pin(std::future::pending()),
+        ));
+        log::info!("bitcraft-cache: serving HTTP/protobuf API on {bind}");
     }
 
     let mut db_routes = DatabaseRoutes::default();
@@ -687,9 +772,9 @@ fn parse_mirror_spec(raw: &str) -> anyhow::Result<MirrorSpec> {
 
     let mut upstream = url.clone();
     {
-        let mut path = upstream.path_segments_mut().map_err(|_| {
-            anyhow::anyhow!("--mirror `{raw}`: cannot modify path (is the URL a base URL?)")
-        })?;
+        let mut path = upstream
+            .path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("--mirror `{raw}`: cannot modify path (is the URL a base URL?)"))?;
         path.clear();
         for seg in &segments {
             path.push(seg);
@@ -717,6 +802,17 @@ fn parse_mirror_specs(raw: &[String]) -> anyhow::Result<Vec<MirrorSpec>> {
     Ok(out)
 }
 
+/// Shared state for `--bitcraft-cache`: the feed manager every mirror
+/// registers its region into, the observer registry the mirror runtime
+/// dispatches through, and the serving bits for the HTTP API.
+#[derive(Clone)]
+struct CacheContext {
+    interest: std::sync::Arc<relay_cache::interest::InterestHub>,
+    memory_pressure: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    feed: std::sync::Arc<relay_cache::feed::FeedManager>,
+    registry: std::sync::Arc<MirrorObserverRegistry>,
+}
+
 async fn bootstrap_public_mirror(
     ctx: &StandaloneEnv,
     upstream_url: &Url,
@@ -726,6 +822,7 @@ async fn bootstrap_public_mirror(
     reject_one_off_query: bool,
     subscribe_gate: Arc<tokio::sync::Semaphore>,
     coordinator_socket: Option<std::path::PathBuf>,
+    cache: Option<CacheContext>,
 ) -> anyhow::Result<()> {
     log::info!("public-mirror: fetching schema for {mirror_database} from {upstream_url}");
     let (schema_bytes, module_def) = fetch_and_parse_schema(upstream_url, mirror_database)
@@ -827,6 +924,22 @@ async fn bootstrap_public_mirror(
         .mirror_status_registry()
         .register(upstream_url, mirror_database, database_identity, tables_total);
 
+    // Register the embedded cache feed for this region before the upstream
+    // loop can dispatch, so no batch is missed. The feed consumes the same
+    // raw schema bytes parsed above — no second fetch, no drift.
+    if let Some(cache) = &cache {
+        match cache.feed.register_region(mirror_database, &schema_bytes) {
+            Ok(Some(_)) => cache.registry.register(
+                mirror_database,
+                cache.feed.clone() as Arc<dyn spacetimedb_public_mirror_client::observer::MirrorObserver>,
+            ),
+            Ok(None) => {} // bitcraft-live-global: mirrored for WS clients, not cached
+            Err(e) => {
+                return Err(e).with_context(|| format!("--bitcraft-cache failed to register `{mirror_database}`"))
+            }
+        }
+    }
+
     let mirror_cfg = PublicMirrorConfig {
         upstream: upstream_url.clone(),
         database: mirror_database.to_string(),
@@ -834,6 +947,7 @@ async fn bootstrap_public_mirror(
         tables,
         connect_timeout: Duration::from_secs(60),
     };
+    let observers = cache.as_ref().map(|c| c.registry.clone());
     tokio::spawn(async move {
         if let Err(e) = run_public_mirror_loop(
             module_host,
@@ -842,6 +956,7 @@ async fn bootstrap_public_mirror(
             status,
             subscribe_gate,
             coordinator_socket,
+            observers,
         )
         .await
         {
@@ -872,8 +987,8 @@ fn resolve_mirror_token(args: &ArgMatches) -> anyhow::Result<Option<String>> {
         .cloned()
         .or_else(|| std::env::var_os("MIRROR_TOKEN_FILE").map(std::path::PathBuf::from));
     if let Some(path) = file {
-        let contents = std::fs::read_to_string(&path)
-            .with_context(|| format!("read mirror token file {}", path.display()))?;
+        let contents =
+            std::fs::read_to_string(&path).with_context(|| format!("read mirror token file {}", path.display()))?;
         return Ok(Some(normalize_mirror_token(&contents)));
     }
     Ok(None)

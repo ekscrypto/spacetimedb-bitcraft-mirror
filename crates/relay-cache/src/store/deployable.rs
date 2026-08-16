@@ -146,9 +146,7 @@ pub struct DeployableDescStore {
 
 impl DeployableDescStore {
     pub fn new() -> Self {
-        Self {
-            by_id: HashMap::new(),
-        }
+        Self { by_id: HashMap::new() }
     }
 
     pub fn len(&self) -> usize {
@@ -188,10 +186,7 @@ mod tests {
             deployable_description_id: 5,
             nickname: "Bird".into(),
         });
-        assert_eq!(
-            s.find(10).map(|slot| s.nickname[slot as usize].as_ref()),
-            Some("Bird")
-        );
+        assert_eq!(s.find(10).map(|slot| s.nickname[slot as usize].as_ref()), Some("Bird"));
         assert_eq!(s.by_owner(1).len(), 1);
 
         let mut d = DeployableDescStore::new();

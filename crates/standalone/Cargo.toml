@@ -33,6 +33,7 @@ spacetimedb-lib.workspace = true
 spacetimedb-paths.workspace = true
 spacetimedb-pg.workspace = true
 spacetimedb-public-mirror-client.workspace = true
+relay-cache.workspace = true
 spacetimedb-table.workspace = true
 spacetimedb-schema.workspace = true
 

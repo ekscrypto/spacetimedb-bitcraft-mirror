@@ -26,11 +26,7 @@ pub struct Args {
     /// `relay-bc<N>` fleet. Defaults to the system path; the relay tests
     /// override this to a tmpdir. Regions also listed in `--mirrors-url`
     /// are skipped (public-mirror wins).
-    #[arg(
-        long,
-        env = "RELAY_CACHE_UNIT_DIR",
-        default_value = "/etc/systemd/system"
-    )]
+    #[arg(long, env = "RELAY_CACHE_UNIT_DIR", default_value = "/etc/systemd/system")]
     pub unit_dir: PathBuf,
 
     /// Public-mirror readiness URL (`GET /v1/mirrors`). When set, each
@@ -50,20 +46,12 @@ pub struct Args {
     /// module schema once at startup. All regions serve byte-identical
     /// schemas; the choice is arbitrary. Must be a frontend port
     /// (`3000+region`), not the public `:443` health site.
-    #[arg(
-        long,
-        env = "RELAY_CACHE_SCHEMA_HOST",
-        default_value = "127.0.0.1:3014"
-    )]
+    #[arg(long, env = "RELAY_CACHE_SCHEMA_HOST", default_value = "127.0.0.1:3014")]
     pub schema_host: String,
 
     /// Database name on the schema host. Defaults to the production
     /// mirror; override for staging.
-    #[arg(
-        long,
-        env = "RELAY_CACHE_SCHEMA_DB",
-        default_value = "relay-mirror-bc14"
-    )]
+    #[arg(long, env = "RELAY_CACHE_SCHEMA_DB", default_value = "relay-mirror-bc14")]
     pub schema_db: String,
 
     /// Soft memory ceiling in bytes. On approach: log at `warn`, flip the

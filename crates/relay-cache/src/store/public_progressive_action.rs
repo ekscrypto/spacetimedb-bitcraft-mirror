@@ -11,9 +11,7 @@ pub struct PublicProgressiveActionStore {
 
 impl PublicProgressiveActionStore {
     pub fn new() -> Self {
-        Self {
-            ids: HashSet::new(),
-        }
+        Self { ids: HashSet::new() }
     }
 
     pub fn len(&self) -> usize {

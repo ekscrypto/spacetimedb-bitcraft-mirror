@@ -47,10 +47,7 @@ impl PassiveCraftSoA {
     }
 
     pub fn by_building(&self, building: u64) -> &[u32] {
-        self.by_building
-            .get(&building)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+        self.by_building.get(&building).map(Vec::as_slice).unwrap_or(&[])
     }
 
     pub fn upsert(&mut self, row: PassiveCraftRow) {
@@ -63,26 +60,15 @@ impl PassiveCraftSoA {
                 reindex(&mut self.by_owner, slot, old_owner, row.owner_entity_id);
             }
             if old_building != row.building_entity_id {
-                reindex(
-                    &mut self.by_building,
-                    slot,
-                    old_building,
-                    row.building_entity_id,
-                );
+                reindex(&mut self.by_building, slot, old_building, row.building_entity_id);
             }
             return;
         }
         let slot = self.alloc_slot();
         self.write_at(slot, &row);
         self.pk.insert(row.entity_id, slot);
-        self.by_owner
-            .entry(row.owner_entity_id)
-            .or_default()
-            .push(slot);
-        self.by_building
-            .entry(row.building_entity_id)
-            .or_default()
-            .push(slot);
+        self.by_owner.entry(row.owner_entity_id).or_default().push(slot);
+        self.by_building.entry(row.building_entity_id).or_default().push(slot);
     }
 
     pub fn delete(&mut self, entity_id: u64) {

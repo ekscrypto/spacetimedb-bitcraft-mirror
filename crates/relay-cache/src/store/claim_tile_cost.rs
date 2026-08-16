@@ -34,11 +34,7 @@ impl ClaimTileCostStore {
 
     /// Cost per tile for a claim with `num_tiles` tiles.
     pub fn cost_per_tile(&self, num_tiles: i32) -> Option<f32> {
-        self.rows
-            .iter()
-            .rev()
-            .find(|(tc, _)| *tc <= num_tiles)
-            .map(|(_, c)| *c)
+        self.rows.iter().rev().find(|(tc, _)| *tc <= num_tiles).map(|(_, c)| *c)
     }
 }
 

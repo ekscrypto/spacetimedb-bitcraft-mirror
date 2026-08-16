@@ -125,9 +125,7 @@ impl InterestHub {
             self.active_connections.fetch_sub(1, Ordering::Relaxed);
             return None;
         }
-        Some(ConnectionGuard {
-            hub: Arc::clone(self),
-        })
+        Some(ConnectionGuard { hub: Arc::clone(self) })
     }
 
     /// Record that `player` is a member of `claim` (idempotent).
@@ -211,8 +209,7 @@ impl InterestHub {
     fn unsubscribe(&self, topic: Topic, entity_id: u64) {
         self.active_leases.fetch_sub(1, Ordering::Relaxed);
         let key = (topic, entity_id);
-        self.map
-            .remove_if(&key, |_, tx| tx.receiver_count() == 0);
+        self.map.remove_if(&key, |_, tx| tx.receiver_count() == 0);
     }
 }
 
@@ -223,9 +220,7 @@ pub struct ConnectionGuard {
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        self.hub
-            .active_connections
-            .fetch_sub(1, Ordering::Relaxed);
+        self.hub.active_connections.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -407,9 +402,7 @@ mod tests {
         assert!(hub.is_watched(Topic::PlayerInventory, 42));
 
         hub.notify(Topic::PlayerInventory, 42);
-        rx.changed()
-            .await
-            .expect("generation should advance");
+        rx.changed().await.expect("generation should advance");
         assert_eq!(*rx.borrow(), 1);
         assert_eq!(hub.lifetime_notifies(), 1);
 

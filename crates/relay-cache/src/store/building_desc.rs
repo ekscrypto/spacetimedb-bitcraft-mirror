@@ -24,9 +24,7 @@ fn name_is_bank(name: &str) -> bool {
 
 impl BuildingDescStore {
     pub fn new() -> Self {
-        Self {
-            by_id: HashMap::new(),
-        }
+        Self { by_id: HashMap::new() }
     }
 
     pub fn len(&self) -> usize {
@@ -40,9 +38,7 @@ impl BuildingDescStore {
     /// Claim-inventory inclusion: storage-capable and not a bank.
     /// Missing ids are treated as excluded.
     pub fn include_in_claim_inventory(&self, id: i32) -> bool {
-        self.by_id
-            .get(&id)
-            .is_some_and(|e| e.is_storage && !e.is_bank)
+        self.by_id.get(&id).is_some_and(|e| e.is_storage && !e.is_bank)
     }
 
     pub fn upsert(&mut self, row: BuildingDescRow) {

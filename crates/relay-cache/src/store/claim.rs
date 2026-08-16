@@ -145,11 +145,7 @@ pub(crate) fn contains_ascii_ci(haystack: &str, needle_lower: &str) -> bool {
         return false;
     }
     for window in h.windows(n.len()) {
-        if window
-            .iter()
-            .zip(n.iter())
-            .all(|(a, b)| a.to_ascii_lowercase() == *b)
-        {
+        if window.iter().zip(n.iter()).all(|(a, b)| a.to_ascii_lowercase() == *b) {
             return true;
         }
     }
@@ -221,10 +217,7 @@ mod tests {
         s.upsert(row(4, "Gamma"));
 
         let mut hits = s.search_name("umb");
-        let mut names: Vec<&str> = hits
-            .drain(..)
-            .map(|slot| s.name[slot as usize].as_ref())
-            .collect();
+        let mut names: Vec<&str> = hits.drain(..).map(|slot| s.name[slot as usize].as_ref()).collect();
         names.sort();
         assert_eq!(names, ["UMB Concordia", "umb cohort"]);
     }

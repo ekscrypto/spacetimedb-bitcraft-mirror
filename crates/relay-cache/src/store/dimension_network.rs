@@ -60,8 +60,7 @@ impl DimensionNetworkStore {
             entrance_dimension_id: row.entrance_dimension_id,
             is_collapsed: row.is_collapsed,
         };
-        self.by_entrance_dim
-            .insert(row.entrance_dimension_id, entry.clone());
+        self.by_entrance_dim.insert(row.entrance_dimension_id, entry.clone());
         self.by_entity_id.insert(row.entity_id, entry);
     }
 

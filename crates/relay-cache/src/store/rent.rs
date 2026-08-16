@@ -45,10 +45,7 @@ impl RentSoA {
     /// Kept for when `rent_state` becomes non-empty on the public feed.
     #[allow(dead_code)]
     pub fn by_player(&self, player: u64) -> &[u32] {
-        self.by_player
-            .get(&player)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+        self.by_player.get(&player).map(Vec::as_slice).unwrap_or(&[])
     }
 
     pub fn upsert(&mut self, row: RentRow) {

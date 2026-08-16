@@ -18,6 +18,7 @@ use url::Url;
 
 use crate::coordinator_client::CoordinatorClient;
 
+use crate::observer::MirrorObserverRegistry;
 use crate::schema::public_user_table_names;
 use crate::status::MirrorStatusHandle;
 use crate::upstream::{self, UpstreamConfig, UpstreamUpdate};
@@ -61,10 +62,7 @@ fn update_to_mirrored(update: UpstreamUpdate, table_ids: &HashMap<String, TableI
     let mut ops = Vec::with_capacity(update.tables.len());
     for t in update.tables {
         let Some(&table_id) = table_ids.get(&t.table_name) else {
-            log::warn!(
-                "public-mirror: skipping ops for unknown local table `{}`",
-                t.table_name
-            );
+            log::warn!("public-mirror: skipping ops for unknown local table `{}`", t.table_name);
             continue;
         };
         ops.push(TableOps {
@@ -104,6 +102,7 @@ pub async fn run_public_mirror_loop(
     status: MirrorStatusHandle,
     subscribe_gate: Arc<Semaphore>,
     coordinator_socket: Option<PathBuf>,
+    observers: Option<Arc<MirrorObserverRegistry>>,
 ) -> anyhow::Result<()> {
     let tables = match config.tables {
         Some(t) if !t.is_empty() => t,
@@ -124,34 +123,6 @@ pub async fn run_public_mirror_loop(
     let table_ids = resolve_table_ids(&stdb, &tables)?;
     let flush_table_ids: Vec<TableId> = table_ids.values().copied().collect();
     let module_for_reset = module_host.clone();
-
-    let on_update = Arc::new(
-        move |updates: Vec<UpstreamUpdate>,
-              progress: Option<crate::status::SeedApplyProgress>|
-              -> BoxFuture<'static, Result<(), anyhow::Error>> {
-            let module_host = module_host.clone();
-            let table_ids = table_ids.clone();
-            async move {
-                let batch: Vec<MirroredUpdate> = updates
-                    .into_iter()
-                    .filter_map(|u| update_to_mirrored(u, &table_ids))
-                    .collect();
-                if batch.is_empty() {
-                    return Ok(());
-                }
-                let progress = progress.map(|p| spacetimedb::host::public_mirror::SeedApplyProgress {
-                    rows_applied: p.rows_applied,
-                    last_apply_unix_ms: p.last_apply_unix_ms,
-                });
-                module_host
-                    .apply_mirrored_updates(batch, progress)
-                    .await
-                    .map_err(|e| anyhow::anyhow!(e))?;
-                Ok(())
-            }
-            .boxed()
-        },
-    );
 
     let upstream_cfg = UpstreamConfig {
         host: config.upstream,
@@ -178,15 +149,68 @@ pub async fn run_public_mirror_loop(
         .as_ref()
         .map(|path| CoordinatorClient::new(path, config.database.clone()));
 
+    // Session generations for observer dispatch (see `crate::observer`):
+    // session N dispatches carry N; the reset after session N carries N+1.
+    let mut session_generation: u64 = 0;
+
     loop {
+        session_generation += 1;
+        let generation = session_generation;
+
+        // Built per session so the closure captures this session's generation.
+        let on_update = {
+            let module_host = module_host.clone();
+            let table_ids = table_ids.clone();
+            let database = config.database.clone();
+            let observers = observers.clone();
+            Arc::new(
+                move |updates: Vec<UpstreamUpdate>,
+                      progress: Option<crate::status::SeedApplyProgress>|
+                      -> BoxFuture<'static, Result<(), anyhow::Error>> {
+                    let module_host = module_host.clone();
+                    let table_ids = table_ids.clone();
+                    let database = database.clone();
+                    let observers = observers.clone();
+                    async move {
+                        // Observers first, then the relational apply. The applier
+                        // awaits this future, so the dispatch is FIFO with the
+                        // apply queue and a slow observer backpressures the session
+                        // exactly like a slow consumer did over the wire; the
+                        // embedded cache never runs ahead of the relational store.
+                        if let Some(registry) = observers.as_ref() {
+                            registry
+                                .dispatch_updates(&database, generation, updates.clone())
+                                .await?;
+                        }
+                        let batch: Vec<MirroredUpdate> = updates
+                            .into_iter()
+                            .filter_map(|u| update_to_mirrored(u, &table_ids))
+                            .collect();
+                        if batch.is_empty() {
+                            return Ok(());
+                        }
+                        let progress = progress.map(|p| spacetimedb::host::public_mirror::SeedApplyProgress {
+                            rows_applied: p.rows_applied,
+                            last_apply_unix_ms: p.last_apply_unix_ms,
+                        });
+                        module_host
+                            .apply_mirrored_updates(batch, progress)
+                            .await
+                            .map_err(|e| anyhow::anyhow!(e))?;
+                        Ok(())
+                    }
+                    .boxed()
+                },
+            )
+        };
+
         // Gate + coordinator: serialise re-seeds so a shared upstream blip
         // cannot pull every region through SubscribeMulti at once.
         let coordinator_permit = match &coordinator {
             Some(client) => client.acquire().await,
             None => None,
         };
-        let gate_permit =
-            acquire_subscribe_slot(&subscribe_gate, &config.database, &status).await?;
+        let gate_permit = acquire_subscribe_slot(&subscribe_gate, &config.database, &status).await?;
         let mut live_started = None;
         let mut failed_table = None;
         let result = upstream::connect_and_mirror(
@@ -200,6 +224,8 @@ pub async fn run_public_mirror_loop(
             gate_permit,
             coordinator_permit,
             Arc::clone(&completed_tables),
+            observers.clone(),
+            generation,
         )
         .await;
         let lived_for = live_started.map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
@@ -232,6 +258,18 @@ pub async fn run_public_mirror_loop(
             .await
         {
             log::error!("public-mirror: reconnect cold-reset failed: {e:#}");
+        }
+        // Observers drop their derived state too. The next session dispatches
+        // with `session_generation + 1`; late in-flight batches from the dead
+        // session carry the old (smaller) generation and are discarded.
+        if let Some(registry) = observers.as_ref() {
+            let next_generation = session_generation + 1;
+            if let Err(e) = registry.dispatch_reset(&config.database, next_generation).await {
+                log::error!(
+                    "public-mirror: observer on_reset for `{}` failed: {e:#}",
+                    config.database
+                );
+            }
         }
         if let Some(failed) = failed_table
             && let Some(pos) = table_order.iter().position(|t| *t == failed)

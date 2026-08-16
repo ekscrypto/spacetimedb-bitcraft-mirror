@@ -17,9 +17,7 @@ pub struct CraftingRecipeDescEntry {
 
 impl CraftingRecipeDescStore {
     pub fn new() -> Self {
-        Self {
-            by_id: HashMap::new(),
-        }
+        Self { by_id: HashMap::new() }
     }
 
     pub fn len(&self) -> usize {

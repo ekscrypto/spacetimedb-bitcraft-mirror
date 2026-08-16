@@ -18,8 +18,7 @@ fn levels() -> &'static [XpLevelThreshold] {
     LEVELS
         .get_or_init(|| {
             let mut v: Vec<XpLevelThreshold> =
-                serde_json::from_str(include_str!("../data/xp_levels.json"))
-                    .expect("xp_levels.json must parse");
+                serde_json::from_str(include_str!("../data/xp_levels.json")).expect("xp_levels.json must parse");
             v.sort_by_key(|t| t.xp);
             v
         })

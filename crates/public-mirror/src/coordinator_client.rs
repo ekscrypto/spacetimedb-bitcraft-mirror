@@ -36,10 +36,7 @@ impl CoordinatorClient {
     pub async fn acquire(&self) -> Option<CoordinatorPermit> {
         match self.try_acquire().await {
             Ok(permit) => {
-                log::info!(
-                    "public-mirror: coordinator permit granted for `{}`",
-                    self.relay_id
-                );
+                log::info!("public-mirror: coordinator permit granted for `{}`", self.relay_id);
                 Some(permit)
             }
             Err(e) => {

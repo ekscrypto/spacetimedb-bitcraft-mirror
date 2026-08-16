@@ -30,6 +30,7 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures_util::{SinkExt, StreamExt};
 use http::header::{AUTHORIZATION, SEC_WEBSOCKET_PROTOCOL};
+use spacetimedb::util::thread_scheduling::deprioritize_mirror_background_thread;
 use spacetimedb_client_api_messages::websocket::common::{
     QuerySetId, SERVER_MSG_COMPRESSION_TAG_BROTLI, SERVER_MSG_COMPRESSION_TAG_GZIP, SERVER_MSG_COMPRESSION_TAG_NONE,
 };
@@ -37,7 +38,6 @@ use spacetimedb_client_api_messages::websocket::v1::{
     BsatnFormat, ClientMessage, CompressableQueryUpdate, DatabaseUpdate, OneOffQuery, QueryUpdate, ServerMessage,
     SubscribeMulti, TransactionUpdate, TransactionUpdateLight, UpdateStatus,
 };
-use spacetimedb::util::thread_scheduling::deprioritize_mirror_background_thread;
 use spacetimedb_lib::{bsatn, ConnectionId, Identity, ProductValue, Timestamp};
 use spacetimedb_sats::{ProductType, WithTypespace};
 use spacetimedb_schema::def::ModuleDef;
@@ -52,6 +52,7 @@ use url::Url;
 
 use crate::byte_count::ByteCountStream;
 use crate::coordinator_client::CoordinatorPermit;
+use crate::observer::MirrorObserverRegistry;
 use crate::status::{ByteCounter, MirrorStatusHandle, SeedApplyProgress};
 
 const SUBPROTOCOL_V1: &str = "v1.bsatn.spacetimedb";
@@ -150,6 +151,11 @@ pub struct UpstreamProvenance {
 pub struct UpstreamTableOps {
     pub table_name: String,
     pub deletes: Vec<ProductValue>,
+    /// Raw BSATN delete rows, parallel to `deletes` and likewise zero-copy.
+    /// Kept for in-process observers (the embedded relay-cache) that decode
+    /// deletes with their own schema-driven decoder. Empty for seeds — an
+    /// upstream snapshot carries no delete rows.
+    pub delete_bytes: Vec<Bytes>,
     pub inserts: Vec<Bytes>,
 }
 
@@ -244,6 +250,8 @@ pub async fn connect_and_mirror(
     subscribe_permit: OwnedSemaphorePermit,
     coordinator_permit: Option<CoordinatorPermit>,
     completed_tables: Arc<Mutex<HashSet<String>>>,
+    observers: Option<Arc<MirrorObserverRegistry>>,
+    generation: u64,
 ) -> Result<(), UpstreamError> {
     *live_started = None;
     *failed_table = None;
@@ -268,10 +276,13 @@ pub async fn connect_and_mirror(
             .uri()
             .host()
             .ok_or_else(|| UpstreamError::Connect("request URI missing host".into()))?;
-        let port = request.uri().port_u16().unwrap_or_else(|| match request.uri().scheme_str() {
-            Some("wss") | Some("https") => 443,
-            _ => 80,
-        });
+        let port = request
+            .uri()
+            .port_u16()
+            .unwrap_or_else(|| match request.uri().scheme_str() {
+                Some("wss") | Some("https") => 443,
+                _ => 80,
+            });
         let addr = format!("{host}:{port}");
         let tcp = TcpStream::connect(&addr)
             .await
@@ -300,10 +311,7 @@ pub async fn connect_and_mirror(
 
     // Probe timers start dormant (`probe_enabled = false`) until the live
     // loop; subscribe already has its own stall timeout on socket bytes.
-    let mut probe_interval = tokio::time::interval_at(
-        tokio::time::Instant::now() + PROBE_INTERVAL,
-        PROBE_INTERVAL,
-    );
+    let mut probe_interval = tokio::time::interval_at(tokio::time::Instant::now() + PROBE_INTERVAL, PROBE_INTERVAL);
     probe_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut probe_deadline = tokio::time::interval(PROBE_DEADLINE_POLL);
     probe_deadline.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -322,6 +330,11 @@ pub async fn connect_and_mirror(
         row_types,
         on_update,
         status,
+        observers: SessionObservers {
+            database: Arc::from(config.database.as_str()),
+            generation,
+            registry: observers,
+        },
         counter,
         deferred: VecDeque::new(),
     };
@@ -379,6 +392,14 @@ where
 
     await_all_seeds_applied(ctx, &completed_tables).await?;
 
+    // Observers see `on_live` strictly after every seed dispatch (the applier
+    // drains before `await_all_seeds_applied` returns) and before the mirror
+    // accepts clients — so an embedded cache publishes its snapshot before
+    // downstream traffic can query it.
+    if let Err(e) = ctx.observers.dispatch_live().await {
+        return Err(UpstreamError::Apply(format!("observer on_live: {e:#}")));
+    }
+
     log::info!(
         "public-mirror: all {} tables subscribed; entering live update loop",
         tables.len()
@@ -394,12 +415,7 @@ where
 ///
 /// The next table's subscribe is sent while prior seeds drain from the apply
 /// queue. Ordering is preserved because [`Applier`] is strictly FIFO.
-async fn subscribe_table<S>(
-    ctx: &mut SessionCtx<S>,
-    table: &str,
-    idx: usize,
-    total: usize,
-) -> Result<(), UpstreamError>
+async fn subscribe_table<S>(ctx: &mut SessionCtx<S>, table: &str, idx: usize, total: usize) -> Result<(), UpstreamError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -424,6 +440,7 @@ where
         tables_ops.push(UpstreamTableOps {
             table_name: table.to_owned(),
             deletes: Vec::new(),
+            delete_bytes: Vec::new(),
             inserts: Vec::new(),
         });
     }
@@ -507,6 +524,7 @@ struct SessionCtx<S> {
     row_types: HashMap<String, ProductType>,
     on_update: ApplyFn,
     status: MirrorStatusHandle,
+    observers: SessionObservers,
     counter: ByteCounter,
     /// Frames received while a large seed frame is decoding off-thread.
     /// Applying them immediately would reorder them **ahead of the seed**
@@ -515,6 +533,22 @@ struct SessionCtx<S> {
     /// violation). They are replayed in arrival order once the decoded seed
     /// (or non-seed message) has been routed.
     deferred: VecDeque<Bytes>,
+}
+
+/// In-process observer context for one session (see [`crate::observer`]).
+struct SessionObservers {
+    database: Arc<str>,
+    generation: u64,
+    registry: Option<Arc<MirrorObserverRegistry>>,
+}
+
+impl SessionObservers {
+    async fn dispatch_live(&self) -> anyhow::Result<()> {
+        match &self.registry {
+            Some(registry) => registry.dispatch_live(&self.database, self.generation).await,
+            None => Ok(()),
+        }
+    }
 }
 
 impl<S> SessionCtx<S>
@@ -767,8 +801,7 @@ where
         self.probe_answered = true;
         self.probe_sent_at = None;
         // First probe fires one full interval after live starts.
-        self.probe
-            .reset_at(tokio::time::Instant::now() + PROBE_INTERVAL);
+        self.probe.reset_at(tokio::time::Instant::now() + PROBE_INTERVAL);
         loop {
             if let Event::Frame(frame) = self.next_event().await? {
                 self.handle_background_frame(frame)?;
@@ -898,13 +931,7 @@ impl Applier {
         Ok(())
     }
 
-    fn enqueue_seed(
-        &mut self,
-        table_name: String,
-        update: UpstreamUpdate,
-        seed_rows: u64,
-        table_number: u32,
-    ) {
+    fn enqueue_seed(&mut self, table_name: String, update: UpstreamUpdate, seed_rows: u64, table_number: u32) {
         self.queue.push_back(PendingApply {
             update,
             kind: ApplyKind::Seed {
@@ -917,16 +944,10 @@ impl Applier {
     }
 
     fn has_pending_seeds(&self) -> bool {
-        if self
-            .in_flight
-            .as_ref()
-            .is_some_and(|f| f.seed_table_number.is_some())
-        {
+        if self.in_flight.as_ref().is_some_and(|f| f.seed_table_number.is_some()) {
             return true;
         }
-        self.queue
-            .iter()
-            .any(|p| matches!(p.kind, ApplyKind::Seed { .. }))
+        self.queue.iter().any(|p| matches!(p.kind, ApplyKind::Seed { .. }))
     }
 
     fn drain_completed_seed_tables(&mut self) -> Vec<String> {
@@ -1017,7 +1038,8 @@ fn update_cost(update: &UpstreamUpdate) -> usize {
         .tables
         .iter()
         .map(|t| {
-            t.inserts.iter().map(Bytes::len).sum::<usize>() + t.deletes.len() * DELETE_COST_ESTIMATE
+            t.inserts.iter().map(Bytes::len).sum::<usize>()
+                + t.deletes.len() * DELETE_COST_ESTIMATE
                 + t.table_name.len()
         })
         .sum()
@@ -1170,11 +1192,13 @@ fn database_update_to_ops(
 
         let mut inserts = Vec::new();
         let mut deletes = Vec::new();
+        let mut delete_bytes = Vec::new();
         for update in &table.updates {
             let qu = query_update_owned(update)?;
             // `BsatnRowList` iteration yields zero-copy `Bytes` slices into the
             // shared row blob — one allocation per table, not one per row.
             inserts.extend(&qu.inserts);
+            delete_bytes.extend(&qu.deletes);
             if !seed {
                 for row in &qu.deletes {
                     let mut bytes: &[u8] = row.as_ref();
@@ -1190,6 +1214,7 @@ fn database_update_to_ops(
         out.push(UpstreamTableOps {
             table_name,
             deletes,
+            delete_bytes,
             inserts,
         });
     }
@@ -1383,6 +1408,7 @@ mod tests {
             tables: vec![UpstreamTableOps {
                 table_name: "t".into(),
                 deletes: Vec::new(),
+                delete_bytes: Vec::new(),
                 inserts: vec![Bytes::from(vec![0u8; insert_bytes])],
             }],
             is_seed: false,
@@ -1439,10 +1465,7 @@ mod tests {
         let result = applier.in_flight.as_mut().unwrap().fut.as_mut().await;
         applier.finish_in_flight(result, &status).unwrap();
         assert!(!applier.has_pending_seeds());
-        assert_eq!(
-            applier.drain_completed_seed_tables(),
-            vec!["seed_table".to_string()]
-        );
+        assert_eq!(applier.drain_completed_seed_tables(), vec!["seed_table".to_string()]);
         assert_eq!(applied.load(Ordering::SeqCst), 6);
 
         // Job 3: the trailing live updates.

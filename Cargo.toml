@@ -156,6 +156,7 @@ spacetimedb-query = { path = "crates/query", version = "=2.7.1" }
 spacetimedb-query-builder = { path = "crates/query-builder", version = "=2.7.1" }
 spacetimedb-runtime = { path = "crates/runtime", version = "=2.7.1" }
 spacetimedb-sats = { path = "crates/sats", version = "=2.7.1" }
+relay-cache = { path = "crates/relay-cache" }
 spacetimedb-schema = { path = "crates/schema", version = "=2.7.1" }
 spacetimedb-snapshot = { path = "crates/snapshot", version = "=2.7.1" }
 spacetimedb-standalone = { path = "crates/standalone", version = "=2.7.1" }

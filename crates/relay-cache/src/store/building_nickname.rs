@@ -26,8 +26,7 @@ impl BuildingNicknameStore {
     }
 
     pub fn upsert(&mut self, row: BuildingNicknameRow) {
-        self.by_entity
-            .insert(row.entity_id, Box::from(row.nickname.as_str()));
+        self.by_entity.insert(row.entity_id, Box::from(row.nickname.as_str()));
     }
 
     pub fn delete(&mut self, entity_id: u64) {

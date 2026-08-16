@@ -49,12 +49,8 @@ pub async fn open_connection(host: &Url, database: &str) -> Result<Conn> {
     let mut url = host.clone();
     match url.scheme() {
         "ws" | "wss" => {}
-        "http" => url
-            .set_scheme("ws")
-            .map_err(|_| anyhow!("scheme rewrite failed"))?,
-        "https" => url
-            .set_scheme("wss")
-            .map_err(|_| anyhow!("scheme rewrite failed"))?,
+        "http" => url.set_scheme("ws").map_err(|_| anyhow!("scheme rewrite failed"))?,
+        "https" => url.set_scheme("wss").map_err(|_| anyhow!("scheme rewrite failed"))?,
         other => bail!("unsupported scheme: {other}"),
     }
     {
@@ -64,9 +60,7 @@ pub async fn open_connection(host: &Url, database: &str) -> Result<Conn> {
         path.push_str("/subscribe");
         url.set_path(&path);
     }
-    url.query_pairs_mut()
-        .clear()
-        .append_pair("compression", "None");
+    url.query_pairs_mut().clear().append_pair("compression", "None");
 
     let mut request = url.to_string().into_client_request()?;
     request
@@ -105,8 +99,8 @@ pub async fn recv_server_message(conn: &mut Conn) -> Result<RecvFrame> {
                 }
                 let body = &data[1..];
                 let decode_started = Instant::now();
-                let server_msg: ServerMessage = bsatn::from_slice(body)
-                    .map_err(|e| anyhow!("ServerMessage decode failed: {e}"))?;
+                let server_msg: ServerMessage =
+                    bsatn::from_slice(body).map_err(|e| anyhow!("ServerMessage decode failed: {e}"))?;
                 tracing::debug!(
                     target: "relay_cache::wire",
                     wire_bytes,
@@ -155,8 +149,7 @@ pub async fn expect_subscribe_applied(
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Skip the immediate first tick so we don't log before any wait.
     heartbeat.tick().await;
-    let deadline_sleep =
-        tokio::time::sleep_until(tokio::time::Instant::from_std(started + SUBSCRIBE_APPLIED_DEADLINE));
+    let deadline_sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(started + SUBSCRIBE_APPLIED_DEADLINE));
     tokio::pin!(deadline_sleep);
 
     loop {

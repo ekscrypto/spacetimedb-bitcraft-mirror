@@ -33,8 +33,7 @@ impl GrowthStore {
     }
 
     pub fn upsert(&mut self, row: GrowthRow) {
-        self.by_entity
-            .insert(row.entity_id, row.end_timestamp_micros);
+        self.by_entity.insert(row.entity_id, row.end_timestamp_micros);
     }
 
     pub fn delete(&mut self, entity_id: u64) {

@@ -45,9 +45,12 @@ hex = { workspace = true }
 reqwest = { workspace = true }
 
 # SpacetimeDB in-repo crates (this workspace's v2.7.1) — the mirror this crate
-# talks to (or embeds into) speaks exactly these wire formats.
+# talks to (or embeds into) speaks exactly these wire formats. The
+# public-mirror client provides the observer seam + decoded upstream types
+# consumed by the embedded feed (src/feed.rs).
 spacetimedb-sats = { workspace = true }
 spacetimedb-client-api-messages = { workspace = true }
+spacetimedb-public-mirror-client = { workspace = true }
 
 # Shared relay crates from the sibling spacetimedb-relay repo (schema parsing +
 # BSATN row decode, and legacy systemd-unit discovery for the WS-mode binary).

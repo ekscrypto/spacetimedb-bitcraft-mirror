@@ -30,9 +30,9 @@ use clap::Parser;
 use relay_cache::config::Args;
 use relay_cache::discovery::discover_regions;
 use relay_cache::interest::InterestHub;
+use relay_cache::run_memory_sampler;
 use relay_cache::serve::{self, Fleet};
 use relay_cache::shard::spawn_shard;
-use relay_cache::run_memory_sampler;
 use relay_protocol::{parse_schema, MirroredSchema};
 use tracing_subscriber::EnvFilter;
 
@@ -48,9 +48,7 @@ async fn main() -> Result<()> {
         "relay_cache=info"
     };
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter)),
-        )
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter)))
         .init();
 
     tracing::info!(
@@ -174,9 +172,7 @@ async fn fetch_schema(host_port: &str, database: &str) -> Result<MirroredSchema>
     };
     let url = format!("{scheme}://{host_port}/v1/database/{database}/schema?version=9");
     tracing::info!(target: "relay_cache", %url, "fetching schema");
-    let response = reqwest::get(&url)
-        .await
-        .with_context(|| format!("GET {url}"))?;
+    let response = reqwest::get(&url).await.with_context(|| format!("GET {url}"))?;
     let status = response.status();
     if !status.is_success() {
         return Err(anyhow!("schema fetch returned HTTP {status}"));

@@ -86,14 +86,8 @@ impl BuildingSoA {
         let slot = self.alloc_slot();
         self.write_at(slot, &row);
         self.pk.insert(row.entity_id, slot);
-        self.by_claim
-            .entry(row.claim_entity_id)
-            .or_default()
-            .push(slot);
-        self.by_desc
-            .entry(row.building_description_id)
-            .or_default()
-            .push(slot);
+        self.by_claim.entry(row.claim_entity_id).or_default().push(slot);
+        self.by_desc.entry(row.building_description_id).or_default().push(slot);
     }
 
     pub fn delete(&mut self, entity_id: u64) {

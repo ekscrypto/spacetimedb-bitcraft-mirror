@@ -55,9 +55,7 @@ impl ResourceSoA {
     /// True when at least one hexite resource lacks a `location_state` attach.
     /// That breaks the `/deposits` claim→resource join.
     pub fn any_missing_location(&self) -> bool {
-        self.pk
-            .values()
-            .any(|&slot| !self.has_location[slot as usize])
+        self.pk.values().any(|&slot| !self.has_location[slot as usize])
     }
 
     pub fn upsert(&mut self, row: ResourceRow) {

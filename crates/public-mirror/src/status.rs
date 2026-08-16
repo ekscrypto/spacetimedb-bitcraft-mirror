@@ -117,10 +117,10 @@ impl MirrorStatusInner {
         };
 
         let (current_table_bytes_received, last_byte_at) = if self.current_table.is_some() {
-            let bytes = self.byte_counter.as_ref().map(|c| {
-                c.bytes_total()
-                    .saturating_sub(self.current_table_bytes_baseline)
-            });
+            let bytes = self
+                .byte_counter
+                .as_ref()
+                .map(|c| c.bytes_total().saturating_sub(self.current_table_bytes_baseline));
             let last = self
                 .byte_counter
                 .as_ref()
@@ -463,8 +463,18 @@ mod tests {
     fn register_two_mirrors_and_drive_phases() {
         let reg = MirrorStatusRegistry::new();
         let host = Url::parse("wss://ea.example").unwrap();
-        let a = reg.register(&host, "bitcraft-live-1", Identity::from_claims("public-mirror-v1", "bitcraft-live-1"), 2);
-        let b = reg.register(&host, "bitcraft-live-global", Identity::from_claims("public-mirror-v1", "bitcraft-live-global"), 12);
+        let a = reg.register(
+            &host,
+            "bitcraft-live-1",
+            Identity::from_claims("public-mirror-v1", "bitcraft-live-1"),
+            2,
+        );
+        let b = reg.register(
+            &host,
+            "bitcraft-live-global",
+            Identity::from_claims("public-mirror-v1", "bitcraft-live-global"),
+            12,
+        );
 
         a.set_connecting();
         a.set_connected();

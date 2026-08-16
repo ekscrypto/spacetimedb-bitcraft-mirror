@@ -16,15 +16,13 @@ use spacetimedb_client_api_messages::websocket::v2::{
 use url::Url;
 
 use crate::decode::{
-    self, ColMaps, BUILDING_DESC_TABLE, BUILDING_NICKNAME_TABLE, BUILDING_TABLE, CLAIM_LOCAL_TABLE,
-    CLAIM_MEMBER_TABLE, CLAIM_TABLE, CLAIM_TECH_DESC_TABLE, CLAIM_TECH_STATE_TABLE,
-    CLAIM_TILE_COST_TABLE, CRAFTING_RECIPE_DESC_TABLE, DEPLETED_HEXITE_DEPOSIT_RESOURCE_ID,
-    DEPLOYABLE_DESC_TABLE, DEPLOYABLE_TABLE, DIMENSION_NETWORK_TABLE, EXPERIENCE_TABLE,
-    GROWTH_TABLE, HEXITE_DEPOSIT_RESOURCE_ID, INVENTORY_TABLE, LOCATION_TABLE, MOBILE_ENTITY_TABLE,
-    OVERWORLD_DIMENSION, PASSIVE_CRAFT_TABLE, PLAYER_HOUSING_DESC_TABLE, PLAYER_HOUSING_TABLE,
-    PLAYER_STATE_TABLE, PLAYER_USERNAME_TABLE, PROGRESSIVE_ACTION_TABLE,
-    PUBLIC_PROGRESSIVE_ACTION_TABLE, RENT_TABLE, RESOURCE_GROWTH_TIMER_TABLE, RESOURCE_TABLE,
-    SKILL_DESC_TABLE, STORAGE_LOG_TABLE,
+    self, ColMaps, BUILDING_DESC_TABLE, BUILDING_NICKNAME_TABLE, BUILDING_TABLE, CLAIM_LOCAL_TABLE, CLAIM_MEMBER_TABLE,
+    CLAIM_TABLE, CLAIM_TECH_DESC_TABLE, CLAIM_TECH_STATE_TABLE, CLAIM_TILE_COST_TABLE, CRAFTING_RECIPE_DESC_TABLE,
+    DEPLETED_HEXITE_DEPOSIT_RESOURCE_ID, DEPLOYABLE_DESC_TABLE, DEPLOYABLE_TABLE, DIMENSION_NETWORK_TABLE,
+    EXPERIENCE_TABLE, GROWTH_TABLE, HEXITE_DEPOSIT_RESOURCE_ID, INVENTORY_TABLE, LOCATION_TABLE, MOBILE_ENTITY_TABLE,
+    OVERWORLD_DIMENSION, PASSIVE_CRAFT_TABLE, PLAYER_HOUSING_DESC_TABLE, PLAYER_HOUSING_TABLE, PLAYER_STATE_TABLE,
+    PLAYER_USERNAME_TABLE, PROGRESSIVE_ACTION_TABLE, PUBLIC_PROGRESSIVE_ACTION_TABLE, RENT_TABLE,
+    RESOURCE_GROWTH_TIMER_TABLE, RESOURCE_TABLE, SKILL_DESC_TABLE, STORAGE_LOG_TABLE,
 };
 use crate::discovery::RegionBackend;
 use crate::interest::{InterestHub, TouchBatch};
@@ -52,7 +50,7 @@ pub struct ShardHandle {
 }
 
 /// Cached field slices + column indices for the tables we hold.
-struct TableMeta {
+pub(crate) struct TableMeta {
     cols: ColMaps,
     claim_fields: Vec<MirroredField>,
     claim_local_fields: Vec<MirroredField>,
@@ -84,11 +82,20 @@ struct TableMeta {
     growth_fields: Vec<MirroredField>,
     growth_timer_fields: Vec<MirroredField>,
     storage_log_fields: Vec<MirroredField>,
+    /// Fixed-offset fast readers for the two all-primitive hot tables
+    /// (`location_state` ~13M rows/seed, `resource_state`). `None` = layout
+    /// not fixed-width; the generic [`crate::decode`] path is used instead.
+    location_fast: Option<decode::LocationFast>,
+    resource_fast: Option<decode::ResourceFast>,
 }
 
 impl TableMeta {
-    fn from_schema(schema: &MirroredSchema) -> Result<Self> {
+    pub(crate) fn from_schema(schema: &MirroredSchema) -> Result<Self> {
         let cols = decode::resolve_cols(schema)?;
+        let location_fields = fields_owned(schema, LOCATION_TABLE)?;
+        let resource_fields = fields_owned(schema, RESOURCE_TABLE)?;
+        let location_fast = decode::LocationFast::try_from_fields(&location_fields, schema);
+        let resource_fast = decode::ResourceFast::try_from_fields(&resource_fields, schema);
         Ok(Self {
             cols,
             claim_fields: fields_owned(schema, CLAIM_TABLE)?,
@@ -101,7 +108,7 @@ impl TableMeta {
             inventory_fields: fields_owned(schema, INVENTORY_TABLE)?,
             building_desc_fields: fields_owned(schema, BUILDING_DESC_TABLE)?,
             building_nickname_fields: fields_owned(schema, BUILDING_NICKNAME_TABLE)?,
-            location_fields: fields_owned(schema, LOCATION_TABLE)?,
+            location_fields,
             dimension_network_fields: fields_owned(schema, DIMENSION_NETWORK_TABLE)?,
             player_username_fields: fields_owned(schema, PLAYER_USERNAME_TABLE)?,
             player_state_fields: fields_owned(schema, PLAYER_STATE_TABLE)?,
@@ -114,16 +121,15 @@ impl TableMeta {
             experience_fields: fields_owned(schema, EXPERIENCE_TABLE)?,
             skill_desc_fields: fields_owned(schema, SKILL_DESC_TABLE)?,
             progressive_action_fields: fields_owned(schema, PROGRESSIVE_ACTION_TABLE)?,
-            public_progressive_action_fields: fields_owned(
-                schema,
-                PUBLIC_PROGRESSIVE_ACTION_TABLE,
-            )?,
+            public_progressive_action_fields: fields_owned(schema, PUBLIC_PROGRESSIVE_ACTION_TABLE)?,
             passive_craft_fields: fields_owned(schema, PASSIVE_CRAFT_TABLE)?,
             crafting_recipe_desc_fields: fields_owned(schema, CRAFTING_RECIPE_DESC_TABLE)?,
-            resource_fields: fields_owned(schema, RESOURCE_TABLE)?,
+            resource_fields,
             growth_fields: fields_owned(schema, GROWTH_TABLE)?,
             growth_timer_fields: fields_owned(schema, RESOURCE_GROWTH_TIMER_TABLE)?,
             storage_log_fields: fields_owned(schema, STORAGE_LOG_TABLE)?,
+            location_fast,
+            resource_fast,
         })
     }
 }
@@ -245,12 +251,8 @@ async fn run_shard_loop(
             Ok(end) => {
                 let (connected_at, reason) = match &end {
                     SessionEnd::Disconnected { connected_at } => (*connected_at, "disconnected"),
-                    SessionEnd::PrematureEmpty { connected_at } => {
-                        (*connected_at, "empty bulk load")
-                    }
-                    SessionEnd::HexiteLocationsMissing { connected_at } => {
-                        (*connected_at, "hexite locations missing")
-                    }
+                    SessionEnd::PrematureEmpty { connected_at } => (*connected_at, "empty bulk load"),
+                    SessionEnd::HexiteLocationsMissing { connected_at } => (*connected_at, "hexite locations missing"),
                     SessionEnd::Shutdown => unreachable!(),
                 };
                 clear_store(&store, region);
@@ -320,35 +322,33 @@ async fn wait_for_relay_ready(
     let mut backoff = READY_GATE_BACKOFF_MIN;
     loop {
         match http.get(&url).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                match resp.json::<serde_json::Value>().await {
-                    Ok(body) if metrics_indicate_ready(&body) => {
-                        tracing::info!(
-                            target: "relay_cache::shard",
-                            region,
-                            dashboard_port,
-                            "relay ready (upstream+stdb up, initial subscribe complete)"
-                        );
-                        return Ok(ReadyGate::Ready);
-                    }
-                    Ok(_) => {
-                        tracing::debug!(
-                            target: "relay_cache::shard",
-                            region,
-                            dashboard_port,
-                            "relay metrics not ready yet; waiting"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            target: "relay_cache::shard",
-                            region,
-                            error = %e,
-                            "metrics JSON decode failed; waiting"
-                        );
-                    }
+            Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
+                Ok(body) if metrics_indicate_ready(&body) => {
+                    tracing::info!(
+                        target: "relay_cache::shard",
+                        region,
+                        dashboard_port,
+                        "relay ready (upstream+stdb up, initial subscribe complete)"
+                    );
+                    return Ok(ReadyGate::Ready);
                 }
-            }
+                Ok(_) => {
+                    tracing::debug!(
+                        target: "relay_cache::shard",
+                        region,
+                        dashboard_port,
+                        "relay metrics not ready yet; waiting"
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        target: "relay_cache::shard",
+                        region,
+                        error = %e,
+                        "metrics JSON decode failed; waiting"
+                    );
+                }
+            },
             Ok(resp) => {
                 tracing::debug!(
                     target: "relay_cache::shard",
@@ -379,12 +379,7 @@ async fn wait_for_relay_ready(
 }
 
 fn metrics_indicate_ready(body: &serde_json::Value) -> bool {
-    let link_up = |key: &str| {
-        body.get(key)
-            .and_then(|v| v.get("state"))
-            .and_then(|s| s.as_str())
-            == Some("up")
-    };
+    let link_up = |key: &str| body.get(key).and_then(|v| v.get("state")).and_then(|s| s.as_str()) == Some("up");
     let complete = body
         .get("initial_subscribe_complete")
         .and_then(|v| v.as_bool())
@@ -403,36 +398,34 @@ async fn wait_for_mirror_ready(
     let mut backoff = READY_GATE_BACKOFF_MIN;
     loop {
         match http.get(mirrors_url).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                match resp.json::<serde_json::Value>().await {
-                    Ok(body) if mirror_row_indicates_ready(&body, database) => {
-                        tracing::info!(
-                            target: "relay_cache::shard",
-                            region,
-                            database,
-                            %mirrors_url,
-                            "public-mirror ready (connectivity live, all tables)"
-                        );
-                        return Ok(ReadyGate::Ready);
-                    }
-                    Ok(_) => {
-                        tracing::debug!(
-                            target: "relay_cache::shard",
-                            region,
-                            database,
-                            "mirror row not ready yet; waiting"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            target: "relay_cache::shard",
-                            region,
-                            error = %e,
-                            "/v1/mirrors JSON decode failed; waiting"
-                        );
-                    }
+            Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
+                Ok(body) if mirror_row_indicates_ready(&body, database) => {
+                    tracing::info!(
+                        target: "relay_cache::shard",
+                        region,
+                        database,
+                        %mirrors_url,
+                        "public-mirror ready (connectivity live, all tables)"
+                    );
+                    return Ok(ReadyGate::Ready);
                 }
-            }
+                Ok(_) => {
+                    tracing::debug!(
+                        target: "relay_cache::shard",
+                        region,
+                        database,
+                        "mirror row not ready yet; waiting"
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        target: "relay_cache::shard",
+                        region,
+                        error = %e,
+                        "/v1/mirrors JSON decode failed; waiting"
+                    );
+                }
+            },
             Ok(resp) => {
                 tracing::debug!(
                     target: "relay_cache::shard",
@@ -473,9 +466,7 @@ fn mirror_row_indicates_ready(body: &serde_json::Value, database: &str) -> bool 
         let connectivity = m.get("connectivity").and_then(|v| v.as_str());
         let tables_live = m.get("tables_live").and_then(|v| v.as_u64()).map(|n| n as u32);
         let tables_total = m.get("tables_total").and_then(|v| v.as_u64()).map(|n| n as u32);
-        return connectivity == Some("live")
-            && tables_live.is_some()
-            && tables_live == tables_total;
+        return connectivity == Some("live") && tables_live.is_some() && tables_live == tables_total;
     }
     false
 }
@@ -529,11 +520,10 @@ async fn session(
         "subscribing base query set"
     );
     wire::send_subscribe(&mut conn, 1, 1, base_queries, region, BASE_PHASE).await?;
-    let (sa_base, base_wire_bytes) =
-        wire::expect_subscribe_applied(&mut conn, region, BASE_PHASE, debug_mode, |tu| {
-            apply_transaction_to(&mut building, schema, meta, tu, None, None)
-        })
-        .await?;
+    let (sa_base, base_wire_bytes) = wire::expect_subscribe_applied(&mut conn, region, BASE_PHASE, debug_mode, |tu| {
+        apply_transaction_to(&mut building, schema, meta, tu, None, None)
+    })
+    .await?;
     let mut hexite_ids = collect_hexite_entity_ids(schema, meta, &sa_base)?;
     merge_subscribe_applied(&mut building, schema, meta, &sa_base)?;
     tracing::info!(
@@ -563,9 +553,7 @@ async fn session(
     if n_hexite > 0 {
         let loc_queries: Vec<String> = hexite_ids
             .iter()
-            .map(|entity_id| {
-                format!("SELECT * FROM {LOCATION_TABLE} WHERE entity_id = {entity_id}")
-            })
+            .map(|entity_id| format!("SELECT * FROM {LOCATION_TABLE} WHERE entity_id = {entity_id}"))
             .collect();
         const HEXITE_PHASE: &str = "hexite_locations_query_set";
         tracing::info!(
@@ -578,9 +566,9 @@ async fn session(
         );
         wire::send_subscribe(&mut conn, 2, 2, loc_queries, region, HEXITE_PHASE).await?;
         let (sa_loc, loc_wire_bytes) =
-                wire::expect_subscribe_applied(&mut conn, region, HEXITE_PHASE, debug_mode, |tu| {
-                    apply_transaction_to(&mut building, schema, meta, tu, None, None)
-                })
+            wire::expect_subscribe_applied(&mut conn, region, HEXITE_PHASE, debug_mode, |tu| {
+                apply_transaction_to(&mut building, schema, meta, tu, None, None)
+            })
             .await?;
         merge_subscribe_applied(&mut building, schema, meta, &sa_loc)?;
         tracing::info!(
@@ -750,12 +738,8 @@ fn base_subscribe_queries() -> Vec<String> {
         format!("SELECT * FROM {PASSIVE_CRAFT_TABLE}"),
         format!("SELECT * FROM {CRAFTING_RECIPE_DESC_TABLE}"),
         // Two equality filters — safer than OR for SpacetimeDB SQL.
-        format!(
-            "SELECT * FROM {RESOURCE_TABLE} WHERE resource_id = {HEXITE_DEPOSIT_RESOURCE_ID}"
-        ),
-        format!(
-            "SELECT * FROM {RESOURCE_TABLE} WHERE resource_id = {DEPLETED_HEXITE_DEPOSIT_RESOURCE_ID}"
-        ),
+        format!("SELECT * FROM {RESOURCE_TABLE} WHERE resource_id = {HEXITE_DEPOSIT_RESOURCE_ID}"),
+        format!("SELECT * FROM {RESOURCE_TABLE} WHERE resource_id = {DEPLETED_HEXITE_DEPOSIT_RESOURCE_ID}"),
         // Public growth countdowns (Hexite depleted→grown, Maker's Tree, …).
         // NOTE: `growth_state` is a near-empty legacy snapshot on current
         // builds; the authoritative respawn clock is `resource_growth_timer`
@@ -772,11 +756,7 @@ fn base_subscribe_queries() -> Vec<String> {
     ]
 }
 
-fn collect_hexite_entity_ids(
-    schema: &MirroredSchema,
-    meta: &TableMeta,
-    sa: &SubscribeApplied,
-) -> Result<Vec<u64>> {
+fn collect_hexite_entity_ids(schema: &MirroredSchema, meta: &TableMeta, sa: &SubscribeApplied) -> Result<Vec<u64>> {
     let mut ids = Vec::new();
     for table in sa.rows.tables.iter() {
         let name: &str = table.table.as_ref();
@@ -784,12 +764,7 @@ fn collect_hexite_entity_ids(
             continue;
         }
         for row in (&table.rows).into_iter() {
-            let decoded = decode::decode_resource_with_fields(
-                &row,
-                &meta.resource_fields,
-                meta.cols.resource,
-                schema,
-            )?;
+            let decoded = decode_resource_row(meta, &row, schema)?;
             ids.push(decoded.entity_id);
         }
     }
@@ -831,19 +806,10 @@ fn apply_transaction(
     tu: &TransactionUpdate,
     interest: &Arc<InterestHub>,
 ) -> Result<()> {
-    let mut touches = interest
-        .has_subscribers()
-        .then(|| TouchBatch::new(interest));
+    let mut touches = interest.has_subscribers().then(|| TouchBatch::new(interest));
     {
         let mut guard = store.write();
-        apply_transaction_to(
-            &mut guard,
-            schema,
-            meta,
-            tu,
-            Some(interest.as_ref()),
-            touches.as_mut(),
-        )?;
+        apply_transaction_to(&mut guard, schema, meta, tu, Some(interest.as_ref()), touches.as_mut())?;
     }
     if let Some(batch) = touches {
         batch.flush();
@@ -893,8 +859,26 @@ fn apply_transaction_to(
     Ok(())
 }
 
+/// Decode one `location_state` row: fixed-offset fast path when the layout
+/// allows, generic BSATN decoder otherwise.
+fn decode_location_row(meta: &TableMeta, row: &[u8], schema: &MirroredSchema) -> Result<decode::LocationRow> {
+    if let Some(decoded) = meta.location_fast.and_then(|fast| fast.decode(row)) {
+        return Ok(decoded);
+    }
+    decode::decode_location_with_fields(row, &meta.location_fields, meta.cols.location, schema)
+}
+
+/// Decode one `resource_state` row: fixed-offset fast path when the layout
+/// allows, generic BSATN decoder otherwise.
+fn decode_resource_row(meta: &TableMeta, row: &[u8], schema: &MirroredSchema) -> Result<decode::ResourceRow> {
+    if let Some(decoded) = meta.resource_fast.and_then(|fast| fast.decode(row)) {
+        return Ok(decoded);
+    }
+    decode::decode_resource_with_fields(row, &meta.resource_fields, meta.cols.resource, schema)
+}
+
 #[allow(clippy::too_many_arguments)]
-fn apply_rows(
+pub(crate) fn apply_rows(
     store: &mut RegionStore,
     schema: &MirroredSchema,
     meta: &TableMeta,
@@ -907,44 +891,26 @@ fn apply_rows(
     match table {
         CLAIM_TABLE => {
             for row in deletes {
-                let decoded = decode::decode_claim_with_fields(
-                    row,
-                    &meta.claim_fields,
-                    meta.cols.claim,
-                    schema,
-                )?;
+                let decoded = decode::decode_claim_with_fields(row, &meta.claim_fields, meta.cols.claim, schema)?;
                 store.claim.delete(decoded.entity_id);
             }
             for row in inserts {
-                let decoded = decode::decode_claim_with_fields(
-                    row,
-                    &meta.claim_fields,
-                    meta.cols.claim,
-                    schema,
-                )?;
+                let decoded = decode::decode_claim_with_fields(row, &meta.claim_fields, meta.cols.claim, schema)?;
                 store.claim.upsert(decoded);
             }
         }
         BUILDING_TABLE => {
             for row in deletes {
-                let decoded = decode::decode_building_with_fields(
-                    row,
-                    &meta.building_fields,
-                    meta.cols.building,
-                    schema,
-                )?;
+                let decoded =
+                    decode::decode_building_with_fields(row, &meta.building_fields, meta.cols.building, schema)?;
                 if let Some(t) = touches.as_deref_mut() {
                     touch_building(store, decoded.entity_id, decoded.claim_entity_id, t);
                 }
                 store.building.delete(decoded.entity_id);
             }
             for row in inserts {
-                let decoded = decode::decode_building_with_fields(
-                    row,
-                    &meta.building_fields,
-                    meta.cols.building,
-                    schema,
-                )?;
+                let decoded =
+                    decode::decode_building_with_fields(row, &meta.building_fields, meta.cols.building, schema)?;
                 store.building.upsert(decoded.clone());
                 if let Some(t) = touches.as_deref_mut() {
                     touch_building(store, decoded.entity_id, decoded.claim_entity_id, t);
@@ -953,12 +919,8 @@ fn apply_rows(
         }
         INVENTORY_TABLE => {
             for row in deletes {
-                let decoded = decode::decode_inventory_with_fields(
-                    row,
-                    &meta.inventory_fields,
-                    meta.cols.inventory,
-                    schema,
-                )?;
+                let decoded =
+                    decode::decode_inventory_with_fields(row, &meta.inventory_fields, meta.cols.inventory, schema)?;
                 if let Some(t) = touches.as_deref_mut() {
                     touch_inventory(
                         store,
@@ -971,12 +933,8 @@ fn apply_rows(
                 store.inventory.delete(decoded.entity_id);
             }
             for row in inserts {
-                let decoded = decode::decode_inventory_with_fields(
-                    row,
-                    &meta.inventory_fields,
-                    meta.cols.inventory,
-                    schema,
-                )?;
+                let decoded =
+                    decode::decode_inventory_with_fields(row, &meta.inventory_fields, meta.cols.inventory, schema)?;
                 if let Some(t) = touches.as_deref_mut() {
                     touch_inventory(
                         store,
@@ -1037,12 +995,7 @@ fn apply_rows(
         }
         LOCATION_TABLE => {
             for row in deletes {
-                let decoded = decode::decode_location_with_fields(
-                    row,
-                    &meta.location_fields,
-                    meta.cols.location,
-                    schema,
-                )?;
+                let decoded = decode_location_row(meta, row, schema)?;
                 if let Some(t) = touches.as_deref_mut() {
                     touch_location_entity(store, decoded.entity_id, decoded.dimension, t);
                 }
@@ -1050,21 +1003,14 @@ fn apply_rows(
                 store.resource.clear_location(decoded.entity_id);
             }
             for row in inserts {
-                let decoded = decode::decode_location_with_fields(
-                    row,
-                    &meta.location_fields,
-                    meta.cols.location,
-                    schema,
-                )?;
+                let decoded = decode_location_row(meta, row, schema)?;
                 store.location_dim.upsert(decode::LocationDimRow {
                     entity_id: decoded.entity_id,
                     dimension: decoded.dimension,
                 });
                 // Hexite PK location subscribes land here too; stash x/z
                 // onto the resource row (overworld deposits are dimension 1).
-                store
-                    .resource
-                    .set_location(decoded.entity_id, decoded.x, decoded.z);
+                store.resource.set_location(decoded.entity_id, decoded.x, decoded.z);
                 if let Some(t) = touches.as_deref_mut() {
                     touch_location_entity(store, decoded.entity_id, decoded.dimension, t);
                 }
@@ -1170,24 +1116,16 @@ fn apply_rows(
         }
         DEPLOYABLE_TABLE => {
             for row in deletes {
-                let decoded = decode::decode_deployable_with_fields(
-                    row,
-                    &meta.deployable_fields,
-                    meta.cols.deployable,
-                    schema,
-                )?;
+                let decoded =
+                    decode::decode_deployable_with_fields(row, &meta.deployable_fields, meta.cols.deployable, schema)?;
                 if let Some(t) = touches.as_deref_mut() {
                     t.player_inv(decoded.owner_id);
                 }
                 store.deployable.delete(decoded.entity_id);
             }
             for row in inserts {
-                let decoded = decode::decode_deployable_with_fields(
-                    row,
-                    &meta.deployable_fields,
-                    meta.cols.deployable,
-                    schema,
-                )?;
+                let decoded =
+                    decode::decode_deployable_with_fields(row, &meta.deployable_fields, meta.cols.deployable, schema)?;
                 if let Some(t) = touches.as_deref_mut() {
                     // Owner change: notify both old (if overwrite) and new.
                     if let Some(slot) = store.deployable.find(decoded.entity_id) {
@@ -1266,21 +1204,11 @@ fn apply_rows(
         }
         RENT_TABLE => {
             for row in deletes {
-                let decoded = decode::decode_rent_with_fields(
-                    row,
-                    &meta.rent_fields,
-                    meta.cols.rent,
-                    schema,
-                )?;
+                let decoded = decode::decode_rent_with_fields(row, &meta.rent_fields, meta.cols.rent, schema)?;
                 store.rent.delete(decoded.entity_id);
             }
             for row in inserts {
-                let decoded = decode::decode_rent_with_fields(
-                    row,
-                    &meta.rent_fields,
-                    meta.cols.rent,
-                    schema,
-                )?;
+                let decoded = decode::decode_rent_with_fields(row, &meta.rent_fields, meta.cols.rent, schema)?;
                 store.rent.upsert(decoded);
             }
         }
@@ -1327,8 +1255,7 @@ fn apply_rows(
                     meta.cols.claim_member,
                     schema,
                 )?;
-                if let Some((old_player, old_claim)) = store.claim_member.player_claim(decoded.entity_id)
-                {
+                if let Some((old_player, old_claim)) = store.claim_member.player_claim(decoded.entity_id) {
                     if let Some(hub) = interest {
                         hub.forget_member(old_player, old_claim);
                     }
@@ -1411,24 +1338,16 @@ fn apply_rows(
         }
         EXPERIENCE_TABLE => {
             for row in deletes {
-                let decoded = decode::decode_experience_with_fields(
-                    row,
-                    &meta.experience_fields,
-                    meta.cols.experience,
-                    schema,
-                )?;
+                let decoded =
+                    decode::decode_experience_with_fields(row, &meta.experience_fields, meta.cols.experience, schema)?;
                 if let Some(t) = touches.as_deref_mut() {
                     t.member_player(decoded.entity_id);
                 }
                 store.experience.delete(decoded.entity_id);
             }
             for row in inserts {
-                let decoded = decode::decode_experience_with_fields(
-                    row,
-                    &meta.experience_fields,
-                    meta.cols.experience,
-                    schema,
-                )?;
+                let decoded =
+                    decode::decode_experience_with_fields(row, &meta.experience_fields, meta.cols.experience, schema)?;
                 if let Some(t) = touches.as_deref_mut() {
                     t.member_player(decoded.entity_id);
                 }
@@ -1437,21 +1356,13 @@ fn apply_rows(
         }
         SKILL_DESC_TABLE => {
             for row in deletes {
-                let decoded = decode::decode_skill_desc_with_fields(
-                    row,
-                    &meta.skill_desc_fields,
-                    meta.cols.skill_desc,
-                    schema,
-                )?;
+                let decoded =
+                    decode::decode_skill_desc_with_fields(row, &meta.skill_desc_fields, meta.cols.skill_desc, schema)?;
                 store.skill_desc.delete(decoded.id);
             }
             for row in inserts {
-                let decoded = decode::decode_skill_desc_with_fields(
-                    row,
-                    &meta.skill_desc_fields,
-                    meta.cols.skill_desc,
-                    schema,
-                )?;
+                let decoded =
+                    decode::decode_skill_desc_with_fields(row, &meta.skill_desc_fields, meta.cols.skill_desc, schema)?;
                 store.skill_desc.upsert(decoded);
             }
         }
@@ -1464,12 +1375,7 @@ fn apply_rows(
                     schema,
                 )?;
                 if let Some(t) = touches.as_deref_mut() {
-                    touch_craft(
-                        store,
-                        decoded.owner_entity_id,
-                        decoded.building_entity_id,
-                        t,
-                    );
+                    touch_craft(store, decoded.owner_entity_id, decoded.building_entity_id, t);
                 }
                 store.progressive_action.delete(decoded.entity_id);
             }
@@ -1490,12 +1396,7 @@ fn apply_rows(
                             t,
                         );
                     }
-                    touch_craft(
-                        store,
-                        decoded.owner_entity_id,
-                        decoded.building_entity_id,
-                        t,
-                    );
+                    touch_craft(store, decoded.owner_entity_id, decoded.building_entity_id, t);
                 }
                 store.progressive_action.upsert(decoded);
             }
@@ -1512,12 +1413,7 @@ fn apply_rows(
                     schema,
                 )?;
                 if let Some(t) = touches.as_deref_mut() {
-                    touch_craft(
-                        store,
-                        decoded.owner_entity_id,
-                        decoded.building_entity_id,
-                        t,
-                    );
+                    touch_craft(store, decoded.owner_entity_id, decoded.building_entity_id, t);
                 }
                 store.public_progressive_action.delete(decoded.entity_id);
             }
@@ -1529,12 +1425,7 @@ fn apply_rows(
                     schema,
                 )?;
                 if let Some(t) = touches.as_deref_mut() {
-                    touch_craft(
-                        store,
-                        decoded.owner_entity_id,
-                        decoded.building_entity_id,
-                        t,
-                    );
+                    touch_craft(store, decoded.owner_entity_id, decoded.building_entity_id, t);
                 }
                 store.public_progressive_action.upsert(decoded.entity_id);
             }
@@ -1548,12 +1439,7 @@ fn apply_rows(
                     schema,
                 )?;
                 if let Some(t) = touches.as_deref_mut() {
-                    touch_craft(
-                        store,
-                        decoded.owner_entity_id,
-                        decoded.building_entity_id,
-                        t,
-                    );
+                    touch_craft(store, decoded.owner_entity_id, decoded.building_entity_id, t);
                 }
                 store.passive_craft.delete(decoded.entity_id);
             }
@@ -1574,12 +1460,7 @@ fn apply_rows(
                             t,
                         );
                     }
-                    touch_craft(
-                        store,
-                        decoded.owner_entity_id,
-                        decoded.building_entity_id,
-                        t,
-                    );
+                    touch_craft(store, decoded.owner_entity_id, decoded.building_entity_id, t);
                 }
                 store.passive_craft.upsert(decoded);
             }
@@ -1606,41 +1487,21 @@ fn apply_rows(
         }
         RESOURCE_TABLE => {
             for row in deletes {
-                let decoded = decode::decode_resource_with_fields(
-                    row,
-                    &meta.resource_fields,
-                    meta.cols.resource,
-                    schema,
-                )?;
+                let decoded = decode_resource_row(meta, row, schema)?;
                 store.resource.delete(decoded.entity_id);
             }
             for row in inserts {
-                let decoded = decode::decode_resource_with_fields(
-                    row,
-                    &meta.resource_fields,
-                    meta.cols.resource,
-                    schema,
-                )?;
+                let decoded = decode_resource_row(meta, row, schema)?;
                 store.resource.upsert(decoded);
             }
         }
         GROWTH_TABLE => {
             for row in deletes {
-                let decoded = decode::decode_growth_with_fields(
-                    row,
-                    &meta.growth_fields,
-                    meta.cols.growth,
-                    schema,
-                )?;
+                let decoded = decode::decode_growth_with_fields(row, &meta.growth_fields, meta.cols.growth, schema)?;
                 store.growth.delete(decoded.entity_id);
             }
             for row in inserts {
-                let decoded = decode::decode_growth_with_fields(
-                    row,
-                    &meta.growth_fields,
-                    meta.cols.growth,
-                    schema,
-                )?;
+                let decoded = decode::decode_growth_with_fields(row, &meta.growth_fields, meta.cols.growth, schema)?;
                 store.growth.upsert(decoded);
             }
         }
@@ -1707,13 +1568,7 @@ fn apply_rows(
     Ok(())
 }
 
-fn touch_inventory(
-    store: &RegionStore,
-    entity_id: u64,
-    owner: u64,
-    player_owner: u64,
-    touches: &mut TouchBatch,
-) {
+fn touch_inventory(store: &RegionStore, entity_id: u64, owner: u64, player_owner: u64, touches: &mut TouchBatch) {
     if player_owner != 0 {
         touches.player_inv(player_owner);
         touches.member_player(player_owner);
@@ -1724,12 +1579,7 @@ fn touch_inventory(
             touches.player_inv(dep_owner);
             touches.member_player(dep_owner);
         } else if let Some(b_slot) = store.building.find(owner) {
-            touch_building(
-                store,
-                owner,
-                store.building.claim_entity_id[b_slot as usize],
-                touches,
-            );
+            touch_building(store, owner, store.building.claim_entity_id[b_slot as usize], touches);
         } else {
             // Body bags: owner_entity_id == player.
             touches.player_inv(owner);
@@ -1743,12 +1593,7 @@ fn touch_inventory(
     }
 }
 
-fn touch_building(
-    store: &RegionStore,
-    building_entity_id: u64,
-    claim_entity_id: u64,
-    touches: &mut TouchBatch,
-) {
+fn touch_building(store: &RegionStore, building_entity_id: u64, claim_entity_id: u64, touches: &mut TouchBatch) {
     if claim_entity_id != 0 {
         touches.claim_inv(claim_entity_id);
         touches.claim_crafts(claim_entity_id);
@@ -1766,23 +1611,14 @@ fn touch_building(
     touch_housing_for_entity(store, building_entity_id, touches);
 }
 
-fn touch_craft(
-    store: &RegionStore,
-    owner_entity_id: u64,
-    building_entity_id: u64,
-    touches: &mut TouchBatch,
-) {
+fn touch_craft(store: &RegionStore, owner_entity_id: u64, building_entity_id: u64, touches: &mut TouchBatch) {
     touches.player_crafts(owner_entity_id);
     if let Some(b_slot) = store.building.find(building_entity_id) {
         touches.claim_crafts(store.building.claim_entity_id[b_slot as usize]);
     }
 }
 
-fn touch_building_entity(
-    store: &RegionStore,
-    building_entity_id: u64,
-    touches: &mut TouchBatch,
-) {
+fn touch_building_entity(store: &RegionStore, building_entity_id: u64, touches: &mut TouchBatch) {
     if let Some(b_slot) = store.building.find(building_entity_id) {
         touch_building(
             store,
@@ -1808,12 +1644,7 @@ fn touch_housing_for_entity(store: &RegionStore, entity_id: u64, touches: &mut T
     }
 }
 
-fn touch_location_entity(
-    store: &RegionStore,
-    entity_id: u64,
-    dimension: u32,
-    touches: &mut TouchBatch,
-) {
+fn touch_location_entity(store: &RegionStore, entity_id: u64, dimension: u32, touches: &mut TouchBatch) {
     if dimension == OVERWORLD_DIMENSION {
         return;
     }
@@ -1834,11 +1665,7 @@ fn touch_location_entity(
     }
 }
 
-fn touch_dimension_network(
-    store: &RegionStore,
-    network_entity_id: u64,
-    touches: &mut TouchBatch,
-) {
+fn touch_dimension_network(store: &RegionStore, network_entity_id: u64, touches: &mut TouchBatch) {
     if let Some(h_slot) = store.player_housing.by_network(network_entity_id) {
         touches.player_housing(store.player_housing.entity_id[h_slot as usize]);
     }

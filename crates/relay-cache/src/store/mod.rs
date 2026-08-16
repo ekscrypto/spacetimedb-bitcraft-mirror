@@ -55,9 +55,9 @@ pub use player_state::PlayerStateSoA;
 pub use player_username::PlayerUsernameSoA;
 pub use progressive_action::ProgressiveActionSoA;
 pub use public_progressive_action::PublicProgressiveActionStore;
-pub use resource_growth_timer::ResourceGrowthTimerStore;
 pub use rent::RentSoA;
 pub use resource::ResourceSoA;
+pub use resource_growth_timer::ResourceGrowthTimerStore;
 pub use skill_desc::SkillDescStore;
 pub use storage_log::StorageLogSoA;
 

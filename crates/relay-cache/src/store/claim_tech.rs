@@ -68,9 +68,7 @@ pub struct ClaimTechDescEntry {
 
 impl ClaimTechDescStore {
     pub fn new() -> Self {
-        Self {
-            by_id: HashMap::new(),
-        }
+        Self { by_id: HashMap::new() }
     }
 
     pub fn len(&self) -> usize {
@@ -113,9 +111,9 @@ pub fn claim_tier_from_descs<'a>(
 ) -> Option<i32> {
     (2..=10).rev().find(|&tier| {
         let label = format!("Tier {tier}");
-        learned.iter().any(|&id| {
-            descs(id).is_some_and(|d| d.name.as_ref() == label || d.description.as_ref() == label)
-        })
+        learned
+            .iter()
+            .any(|&id| descs(id).is_some_and(|d| d.name.as_ref() == label || d.description.as_ref() == label))
     })
 }
 
@@ -152,10 +150,7 @@ mod tests {
             area: 0,
             unlocks_techs: Box::from([]),
         });
-        assert_eq!(
-            claim_tier_from_descs(&[200, 700], |id| store.get(id)),
-            Some(7)
-        );
+        assert_eq!(claim_tier_from_descs(&[200, 700], |id| store.get(id)), Some(7));
         assert_eq!(claim_tier_from_descs(&[200], |id| store.get(id)), Some(2));
         assert_eq!(claim_tier_from_descs(&[], |id| store.get(id)), None);
     }

@@ -57,9 +57,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::watch;
 
-use crate::interest::{
-    unpack_dim_key, ConnectionGuard, InterestHub, Subscription, Topic, dim_key,
-};
+use crate::interest::{dim_key, unpack_dim_key, ConnectionGuard, InterestHub, Subscription, Topic};
 use crate::serve::{housing_building_ids, Fleet};
 
 /// Coalesce window between a watch bump and the re-scan/push. Matches the
@@ -81,10 +79,7 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// `GET /internal/dim-buildings/ws` — public housing-interior building-id push
 /// (nginx-proxied; `/internal/stats` stays unproxied).
-pub async fn dim_buildings_ws(
-    ws: WebSocketUpgrade,
-    State(fleet): State<Fleet>,
-) -> impl IntoResponse {
+pub async fn dim_buildings_ws(ws: WebSocketUpgrade, State(fleet): State<Fleet>) -> impl IntoResponse {
     let Some(conn) = fleet.interest.try_acquire_connection(MAX_CONNECTIONS) else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -134,11 +129,7 @@ async fn run_dim_stream(socket: WebSocket, fleet: Fleet, _conn: ConnectionGuard)
             match tokio::time::timeout(SUBSCRIBE_TIMEOUT, source.next()).await {
                 Ok(Some(Ok(Message::Text(t)))) => t,
                 _ => {
-                    let _ = send_text(
-                        &mut sink,
-                        r#"{"error":"expected subscribe JSON text frame"}"#,
-                    )
-                    .await;
+                    let _ = send_text(&mut sink, r#"{"error":"expected subscribe JSON text frame"}"#).await;
                     let _ = sink.send(Message::Close(None)).await;
                     return;
                 }
@@ -170,10 +161,7 @@ async fn run_dim_stream(socket: WebSocket, fleet: Fleet, _conn: ConnectionGuard)
     // added/removed. Seeded by the initial burst so the first live delta
     // is relative to the snapshot we just pushed.
     let mut last_sent: Vec<(u64, Vec<u64>)> = Vec::with_capacity(keys.len());
-    if push_snapshots(&mut sink, &fleet, &keys, &mut last_sent)
-        .await
-        .is_err()
-    {
+    if push_snapshots(&mut sink, &fleet, &keys, &mut last_sent).await.is_err() {
         return;
     }
 
@@ -271,8 +259,7 @@ async fn run_dim_stream(socket: WebSocket, fleet: Fleet, _conn: ConnectionGuard)
 
 /// Parse and validate a subscribe frame into a deduped `Vec<dim_key>`.
 fn parse_subscribe(text: &str) -> Result<Vec<u64>, String> {
-    let msg: SubscribeMsg =
-        serde_json::from_str(text).map_err(|e| format!("invalid subscribe JSON: {e}"))?;
+    let msg: SubscribeMsg = serde_json::from_str(text).map_err(|e| format!("invalid subscribe JSON: {e}"))?;
     let mut keys: Vec<u64> = Vec::with_capacity(msg.dims.len());
     for d in &msg.dims {
         if d.dimension == 0 {
@@ -289,10 +276,7 @@ fn parse_subscribe(text: &str) -> Result<Vec<u64>, String> {
         return Err("subscribe requires at least one {region, dimension} pair".into());
     }
     if keys.len() > MAX_DIM_KEYS {
-        return Err(format!(
-            "too many dimensions (max {MAX_DIM_KEYS}, got {})",
-            keys.len()
-        ));
+        return Err(format!("too many dimensions (max {MAX_DIM_KEYS}, got {})", keys.len()));
     }
     Ok(keys)
 }
@@ -312,10 +296,7 @@ fn bind_keys(hub: &std::sync::Arc<InterestHub>, keys: &[u64]) -> KeyWatches {
         leases.push(sub);
         rxs.push((key, rx));
     }
-    KeyWatches {
-        _leases: leases,
-        rxs,
-    }
+    KeyWatches { _leases: leases, rxs }
 }
 
 /// Wait until any watch receiver advances; returns the dirty packed key.
@@ -363,11 +344,7 @@ async fn push_snapshots(
         }
         last_sent.push((key, ids));
     }
-    send_text(
-        sink,
-        &format!(r#"{{"type":"subscribed","count":{}}}"#, keys.len()),
-    )
-    .await
+    send_text(sink, &format!(r#"{{"type":"subscribed","count":{}}}"#, keys.len())).await
 }
 
 /// Re-scan one dimension, diff against the last-sent set, and emit a
@@ -480,13 +457,8 @@ fn new_heartbeat_interval() -> tokio::time::Interval {
     interval
 }
 
-async fn send_text(
-    sink: &mut futures_util::stream::SplitSink<WebSocket, Message>,
-    text: &str,
-) -> Result<(), ()> {
-    sink.send(Message::Text(text.to_owned()))
-        .await
-        .map_err(|_| ())
+async fn send_text(sink: &mut futures_util::stream::SplitSink<WebSocket, Message>, text: &str) -> Result<(), ()> {
+    sink.send(Message::Text(text.to_owned())).await.map_err(|_| ())
 }
 
 #[cfg(test)]
@@ -515,19 +487,14 @@ mod tests {
     #[test]
     fn parse_subscribe_silently_skips_dimension_zero() {
         // dimension=0 is invalid per spec; skipped, not fatal.
-        let keys = parse_subscribe(
-            r#"{"dims":[{"region":14,"dimension":0},{"region":14,"dimension":99}]}"#,
-        )
-        .unwrap();
+        let keys = parse_subscribe(r#"{"dims":[{"region":14,"dimension":0},{"region":14,"dimension":99}]}"#).unwrap();
         assert_eq!(keys, vec![dim_key(14, 99)]);
     }
 
     #[test]
     fn parse_subscribe_dedups() {
-        let keys = parse_subscribe(
-            r#"{"dims":[{"region":14,"dimension":12345},{"region":14,"dimension":12345}]}"#,
-        )
-        .unwrap();
+        let keys =
+            parse_subscribe(r#"{"dims":[{"region":14,"dimension":12345},{"region":14,"dimension":12345}]}"#).unwrap();
         assert_eq!(keys, vec![dim_key(14, 12345)]);
     }
 
@@ -569,8 +536,7 @@ mod tests {
 
     #[test]
     fn unsubscribe_frame_parses() {
-        let msg: UnsubscribeMsg =
-            serde_json::from_str(r#"{"unsubscribe":[{"region":14,"dimension":12345}]}"#).unwrap();
+        let msg: UnsubscribeMsg = serde_json::from_str(r#"{"unsubscribe":[{"region":14,"dimension":12345}]}"#).unwrap();
         assert_eq!(msg.unsubscribe.len(), 1);
         assert_eq!(msg.unsubscribe[0].region, 14);
         assert_eq!(msg.unsubscribe[0].dimension, 12345);

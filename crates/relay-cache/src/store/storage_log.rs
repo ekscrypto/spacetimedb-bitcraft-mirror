@@ -58,27 +58,16 @@ impl StorageLogSoA {
     }
 
     pub fn by_storage(&self, storage: u64) -> &[u32] {
-        self.by_storage
-            .get(&storage)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+        self.by_storage.get(&storage).map(Vec::as_slice).unwrap_or(&[])
     }
 
     pub fn by_player(&self, player: u64) -> &[u32] {
-        self.by_player
-            .get(&player)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+        self.by_player.get(&player).map(Vec::as_slice).unwrap_or(&[])
     }
 
     /// Logs for `item_id` (optional `item_type` filter) whose storage is in
     /// `storage_ids`.
-    pub fn by_item_in_storages(
-        &self,
-        item_id: i32,
-        item_type: Option<u8>,
-        storage_ids: &HashSet<u64>,
-    ) -> Vec<u32> {
+    pub fn by_item_in_storages(&self, item_id: i32, item_type: Option<u8>, storage_ids: &HashSet<u64>) -> Vec<u32> {
         let mut out = Vec::new();
         for slot in self.item_slots(item_id, item_type) {
             let i = slot as usize;
@@ -126,12 +115,7 @@ impl StorageLogSoA {
             self.write_at(slot, &row);
             let new_item = (row.item_id, row.item_type);
             if old_storage != row.storage_entity_id {
-                reindex_u64(
-                    &mut self.by_storage,
-                    slot,
-                    old_storage,
-                    row.storage_entity_id,
-                );
+                reindex_u64(&mut self.by_storage, slot, old_storage, row.storage_entity_id);
             }
             if old_player != row.player_entity_id {
                 reindex_u64(&mut self.by_player, slot, old_player, row.player_entity_id);
@@ -144,18 +128,9 @@ impl StorageLogSoA {
         let slot = self.alloc_slot();
         self.write_at(slot, &row);
         self.pk.insert(row.id, slot);
-        self.by_storage
-            .entry(row.storage_entity_id)
-            .or_default()
-            .push(slot);
-        self.by_player
-            .entry(row.player_entity_id)
-            .or_default()
-            .push(slot);
-        self.by_item
-            .entry((row.item_id, row.item_type))
-            .or_default()
-            .push(slot);
+        self.by_storage.entry(row.storage_entity_id).or_default().push(slot);
+        self.by_player.entry(row.player_entity_id).or_default().push(slot);
+        self.by_item.entry((row.item_id, row.item_type)).or_default().push(slot);
     }
 
     pub fn delete(&mut self, id: u64) {
@@ -256,14 +231,7 @@ pub fn action_label(action: u8) -> &'static str {
 mod tests {
     use super::*;
 
-    fn row(
-        id: u64,
-        storage: u64,
-        player: u64,
-        action: u8,
-        item_id: i32,
-        item_type: u8,
-    ) -> StorageLogRow {
+    fn row(id: u64, storage: u64, player: u64, action: u8, item_id: i32, item_type: u8) -> StorageLogRow {
         StorageLogRow {
             id,
             storage_entity_id: storage,

@@ -20,9 +20,7 @@ pub struct SkillDescEntry {
 
 impl SkillDescStore {
     pub fn new() -> Self {
-        Self {
-            by_id: HashMap::new(),
-        }
+        Self { by_id: HashMap::new() }
     }
 
     pub fn len(&self) -> usize {

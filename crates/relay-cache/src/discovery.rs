@@ -93,8 +93,8 @@ fn discover_from_units(unit_dir: &Path) -> Result<Vec<DiscoveredRegion>> {
             );
             continue;
         };
-        let bind_url = Url::parse(&format!("ws://127.0.0.1:{}", src.frontend_port))
-            .context("build relay fleet bind URL")?;
+        let bind_url =
+            Url::parse(&format!("ws://127.0.0.1:{}", src.frontend_port)).context("build relay fleet bind URL")?;
         out.push(DiscoveredRegion {
             region,
             database: src.database,
@@ -130,10 +130,7 @@ async fn discover_from_mirrors(mirrors_url: &str, mirror_ws_host: Option<&str>) 
     Ok(out)
 }
 
-async fn discover_from_mirrors_one(
-    mirrors_url: &str,
-    mirror_ws_host: Option<&str>,
-) -> Result<Vec<DiscoveredRegion>> {
+async fn discover_from_mirrors_one(mirrors_url: &str, mirror_ws_host: Option<&str>) -> Result<Vec<DiscoveredRegion>> {
     let http = Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
@@ -156,11 +153,7 @@ async fn discover_from_mirrors_one(
 
     let mut out = Vec::new();
     for m in arr {
-        let database = m
-            .get("database")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        let database = m.get("database").and_then(|v| v.as_str()).unwrap_or("").to_string();
         if database.is_empty() || database == "bitcraft-live-global" {
             continue;
         }
@@ -177,8 +170,7 @@ async fn discover_from_mirrors_one(
             Some(h) => h.trim().to_string(),
             None => format!("127.0.0.1:{}", public_port_for_database(&database)),
         };
-        let bind_url =
-            Url::parse(&format!("ws://{host_port}")).context("build public-mirror bind URL")?;
+        let bind_url = Url::parse(&format!("ws://{host_port}")).context("build public-mirror bind URL")?;
         out.push(DiscoveredRegion {
             region,
             database,

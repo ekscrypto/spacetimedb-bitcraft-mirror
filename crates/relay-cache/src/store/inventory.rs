@@ -92,10 +92,7 @@ impl InventorySoA {
     /// `deployable.by_owner(player)` → `by_owner(deployable_entity_id)`
     /// instead. Body bags use `owner_entity_id == player`.
     pub fn by_player_owner(&self, player: u64) -> &[u32] {
-        self.by_player_owner
-            .get(&player)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+        self.by_player_owner.get(&player).map(Vec::as_slice).unwrap_or(&[])
     }
 
     /// Insert or replace a row. On replace, the `by_owner` /
@@ -201,10 +198,7 @@ impl InventorySoA {
             }
         }
         if new_player != 0 {
-            self.by_player_owner
-                .entry(new_player)
-                .or_default()
-                .push(slot);
+            self.by_player_owner.entry(new_player).or_default().push(slot);
         }
     }
 }

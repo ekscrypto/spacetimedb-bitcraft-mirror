@@ -40,8 +40,8 @@ use tower_http::cors::CorsLayer;
 use crate::decode::{is_player_skill_id, DeployableKind, OVERWORLD_DIMENSION};
 use crate::interest::InterestHub;
 use crate::shard::ShardHandle;
-use crate::stream;
 use crate::store::{Pocket, RegionStore};
+use crate::stream;
 
 mod pb {
     include!(concat!(env!("OUT_DIR"), "/relay_cache.rs"));
@@ -51,16 +51,10 @@ const PROTOBUF_MIME: &str = "application/x-protobuf";
 const PROTO_SOURCE_MIME: &str = "text/plain; charset=utf-8";
 
 /// Checked-in `.proto` schemas embedded at compile time (whitelist only).
-const PROTO_FILES: &[(&str, &str)] = &[(
-    "relay_cache.proto",
-    include_str!("../proto/relay_cache.proto"),
-)];
+const PROTO_FILES: &[(&str, &str)] = &[("relay_cache.proto", include_str!("../proto/relay_cache.proto"))];
 
 fn proto_body(name: &str) -> Option<&'static str> {
-    PROTO_FILES
-        .iter()
-        .find(|(n, _)| *n == name)
-        .map(|(_, body)| *body)
+    PROTO_FILES.iter().find(|(n, _)| *n == name).map(|(_, body)| *body)
 }
 
 /// Shared axum state: all region shards plus the memory-pressure flag.
@@ -112,9 +106,7 @@ pub async fn serve(
         %bind,
         "HTTP read API listening"
     );
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await?;
+    axum::serve(listener, app).with_graceful_shutdown(shutdown).await?;
     Ok(())
 }
 
@@ -148,10 +140,7 @@ fn no_store_status(status: StatusCode, body: Value) -> impl IntoResponse {
 fn no_store_protobuf(bytes: Vec<u8>) -> Response {
     let mut headers = HeaderMap::new();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static(PROTOBUF_MIME),
-    );
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(PROTOBUF_MIME));
     (headers, bytes).into_response()
 }
 
@@ -328,9 +317,7 @@ fn claim_from_store(s: &RegionStore, slot: usize) -> pb::Claim {
         .find(owner_player)
         .map(|us| s.player_username.username[us as usize].to_string());
     let tier = s.claim_tech_state.get(entity_id).and_then(|tech| {
-        crate::store::claim_tech::claim_tier_from_descs(&tech.learned, |id| {
-            s.claim_tech_desc.get(id)
-        })
+        crate::store::claim_tech::claim_tier_from_descs(&tech.learned, |id| s.claim_tech_desc.get(id))
     });
     pb::Claim {
         entity_id,
@@ -382,18 +369,13 @@ fn claim_detail_from_store(s: &RegionStore, slot: usize) -> pb::Claim {
         }
         if let Some(tile_cost) = s.claim_tile_cost.cost_per_tile(num_tiles) {
             claim.tile_cost = Some(tile_cost);
-            let upkeep = crate::store::claim_tile_cost::upkeep_cost(
-                num_tiles,
-                tile_cost,
-                building_maintenance,
-            );
+            let upkeep = crate::store::claim_tile_cost::upkeep_cost(num_tiles, tile_cost, building_maintenance);
             claim.upkeep_cost = Some(upkeep);
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
-            claim.supplies_run_out =
-                crate::store::claim_tile_cost::supplies_run_out_ms(now_ms, supplies, upkeep);
+            claim.supplies_run_out = crate::store::claim_tile_cost::supplies_run_out_ms(now_ms, supplies, upkeep);
         }
     }
 
@@ -421,9 +403,7 @@ fn claim_detail_from_store(s: &RegionStore, slot: usize) -> pb::Claim {
             })
             .collect();
         if claim.tier.is_none() {
-            claim.tier = crate::store::claim_tech::claim_tier_from_descs(&tech.learned, |id| {
-                s.claim_tech_desc.get(id)
-            });
+            claim.tier = crate::store::claim_tech::claim_tier_from_descs(&tech.learned, |id| s.claim_tech_desc.get(id));
         }
     }
 
@@ -446,19 +426,13 @@ async fn list_protos() -> impl IntoResponse {
 
 async fn get_proto(Path(name): Path<String>) -> Response {
     let Some(body) = proto_body(&name) else {
-        return no_store_status(
-            StatusCode::NOT_FOUND,
-            json!({"error": "proto not found", "name": name}),
-        )
-        .into_response();
+        return no_store_status(StatusCode::NOT_FOUND, json!({"error": "proto not found", "name": name}))
+            .into_response();
     };
 
     let mut headers = HeaderMap::new();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static(PROTO_SOURCE_MIME),
-    );
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(PROTO_SOURCE_MIME));
     if let Ok(cd) = HeaderValue::from_str(&format!("attachment; filename=\"{name}\"")) {
         headers.insert(header::CONTENT_DISPOSITION, cd);
     }
@@ -565,11 +539,7 @@ struct CompletedQuery {
     completed: Option<bool>,
 }
 
-async fn claim_by_name(
-    State(fleet): State<Fleet>,
-    headers: HeaderMap,
-    Query(q): Query<NameQuery>,
-) -> Response {
+async fn claim_by_name(State(fleet): State<Fleet>, headers: HeaderMap, Query(q): Query<NameQuery>) -> Response {
     let Some(needle) = q.name.as_deref().filter(|s| !s.is_empty()) else {
         return no_store_status(
             StatusCode::BAD_REQUEST,
@@ -591,17 +561,9 @@ async fn claim_by_name(
     respond_claim_list(&headers, hits)
 }
 
-async fn claim_by_pk(
-    State(fleet): State<Fleet>,
-    headers: HeaderMap,
-    Path(entity_id): Path<String>,
-) -> Response {
+async fn claim_by_pk(State(fleet): State<Fleet>, headers: HeaderMap, Path(entity_id): Path<String>) -> Response {
     let Ok(pk) = entity_id.parse::<u64>() else {
-        return no_store_status(
-            StatusCode::BAD_REQUEST,
-            json!({"error": "entity_id must be a u64"}),
-        )
-        .into_response();
+        return no_store_status(StatusCode::BAD_REQUEST, json!({"error": "entity_id must be a u64"})).into_response();
     };
 
     for shard in &fleet.shards {
@@ -616,23 +578,14 @@ async fn claim_by_pk(
     no_store_status(StatusCode::NOT_FOUND, json!({"error": "claim not found"})).into_response()
 }
 
-async fn claim_inventory(
-    State(fleet): State<Fleet>,
-    headers: HeaderMap,
-    Path(entity_id): Path<String>,
-) -> Response {
+async fn claim_inventory(State(fleet): State<Fleet>, headers: HeaderMap, Path(entity_id): Path<String>) -> Response {
     let Ok(pk) = entity_id.parse::<u64>() else {
-        return no_store_status(
-            StatusCode::BAD_REQUEST,
-            json!({"error": "entity_id must be a u64"}),
-        )
-        .into_response();
+        return no_store_status(StatusCode::BAD_REQUEST, json!({"error": "entity_id must be a u64"})).into_response();
     };
 
     match build_claim_inventory(&fleet, pk) {
         Some(inv) => respond_claim_inventory(&headers, inv),
-        None => no_store_status(StatusCode::NOT_FOUND, json!({"error": "claim not found"}))
-            .into_response(),
+        None => no_store_status(StatusCode::NOT_FOUND, json!({"error": "claim not found"})).into_response(),
     }
 }
 
@@ -658,20 +611,11 @@ pub(crate) fn build_claim_inventory(fleet: &Fleet, pk: u64) -> Option<pb::ClaimI
             let building_description_id = s.building.building_description_id[bi];
             // Skip walls/totems/crafting stations (no storage slots) and
             // Town Banks (personal storage — BitJita omits these too).
-            if !s
-                .building_desc
-                .include_in_claim_inventory(building_description_id)
-            {
+            if !s.building_desc.include_in_claim_inventory(building_description_id) {
                 continue;
             }
-            let name = s
-                .building_desc
-                .get(building_description_id)
-                .map(str::to_owned);
-            let nickname = s
-                .building_nickname
-                .get(building_entity_id)
-                .map(str::to_owned);
+            let name = s.building_desc.get(building_description_id).map(str::to_owned);
+            let nickname = s.building_nickname.get(building_entity_id).map(str::to_owned);
             let dimension_id = s.location_dim.get_or_overworld(building_entity_id);
 
             let mut agg: HashMap<(i32, u8), i64> = HashMap::new();
@@ -691,25 +635,17 @@ pub(crate) fn build_claim_inventory(fleet: &Fleet, pk: u64) -> Option<pb::ClaimI
                     quantity,
                 })
                 .collect();
-            items.sort_by(|a, b| {
-                a.item_id
-                    .cmp(&b.item_id)
-                    .then_with(|| a.item_type.cmp(&b.item_type))
-            });
+            items.sort_by(|a, b| a.item_id.cmp(&b.item_id).then_with(|| a.item_type.cmp(&b.item_type)));
 
-            by_dim
-                .entry(dimension_id)
-                .or_default()
-                .push(pb::BuildingInventory {
-                    entity_id: building_entity_id,
-                    name,
-                    nickname,
-                    items,
-                });
+            by_dim.entry(dimension_id).or_default().push(pb::BuildingInventory {
+                entity_id: building_entity_id,
+                name,
+                nickname,
+                items,
+            });
         }
 
-        let mut dimensions_out: Vec<(u32, String, pb::DimensionGroup)> =
-            Vec::with_capacity(by_dim.len());
+        let mut dimensions_out: Vec<(u32, String, pb::DimensionGroup)> = Vec::with_capacity(by_dim.len());
         for (dimension_id, mut buildings) in by_dim {
             buildings.sort_by(|a, b| a.entity_id.cmp(&b.entity_id));
 
@@ -735,13 +671,10 @@ pub(crate) fn build_claim_inventory(fleet: &Fleet, pk: u64) -> Option<pb::ClaimI
             // Overworld first, then by entrance name, then dimension_id.
             let a_ow = a.0 == OVERWORLD_DIMENSION;
             let b_ow = b.0 == OVERWORLD_DIMENSION;
-            b_ow.cmp(&a_ow)
-                .then_with(|| a.1.cmp(&b.1))
-                .then_with(|| a.0.cmp(&b.0))
+            b_ow.cmp(&a_ow).then_with(|| a.1.cmp(&b.1)).then_with(|| a.0.cmp(&b.0))
         });
 
-        let dimensions: Vec<pb::DimensionGroup> =
-            dimensions_out.into_iter().map(|(_, _, v)| v).collect();
+        let dimensions: Vec<pb::DimensionGroup> = dimensions_out.into_iter().map(|(_, _, v)| v).collect();
 
         return Some(pb::ClaimInventory {
             claim: Some(pb::ClaimSummary {
@@ -1043,13 +976,10 @@ fn parse_storage_logs_mode(q: &StorageLogsQuery) -> Result<StorageLogsMode, Stri
     let claim = q.claim_id.as_deref().filter(|s| !s.is_empty());
     let item = q.item_id;
 
-    const HINT: &str =
-        "use one of: storageId=… | playerId=… | itemId=…&claimId=… | itemId=…&playerId=…";
+    const HINT: &str = "use one of: storageId=… | playerId=… | itemId=…&claimId=… | itemId=…&playerId=…";
 
     if storage.is_some() && (player.is_some() || claim.is_some() || item.is_some()) {
-        return Err(format!(
-            "`storageId` cannot be combined with other filters; {HINT}"
-        ));
+        return Err(format!("`storageId` cannot be combined with other filters; {HINT}"));
     }
     if let Some(s) = storage {
         return Ok(StorageLogsMode::Storage {
@@ -1086,9 +1016,7 @@ fn parse_item_type_filter(raw: Option<&str>) -> Result<Option<u8>, String> {
         None => Ok(None),
         Some("Item") | Some("item") => Ok(Some(Pocket::ITEM)),
         Some("Cargo") | Some("cargo") => Ok(Some(Pocket::CARGO)),
-        Some(other) => Err(format!(
-            "invalid `itemType`: expected Item or Cargo, got `{other}`"
-        )),
+        Some(other) => Err(format!("invalid `itemType`: expected Item or Cargo, got `{other}`")),
     }
 }
 
@@ -1124,10 +1052,7 @@ fn respond_storage_logs(headers: &HeaderMap, body: pb::StorageLogList) -> Respon
                 } else {
                     map.insert("claim_name".into(), Value::Null);
                 }
-                map.insert(
-                    "player_entity_id".into(),
-                    json!(e.player_entity_id.to_string()),
-                );
+                map.insert("player_entity_id".into(), json!(e.player_entity_id.to_string()));
                 map.insert("player_username".into(), json!(e.player_username));
                 map.insert("action".into(), json!(e.action));
                 map.insert("item_id".into(), json!(e.item_id));
@@ -1184,11 +1109,7 @@ fn enrich_storage_log(s: &RegionStore, slot: u32) -> pb::StorageLogEntry {
     }
 }
 
-fn collect_storage_logs(
-    s: &RegionStore,
-    mode: &StorageLogsMode,
-    item_type: Option<u8>,
-) -> Vec<pb::StorageLogEntry> {
+fn collect_storage_logs(s: &RegionStore, mode: &StorageLogsMode, item_type: Option<u8>) -> Vec<pb::StorageLogEntry> {
     use hashbrown::HashSet;
 
     let slots: Vec<u32> = match *mode {
@@ -1199,18 +1120,14 @@ fn collect_storage_logs(
             for b_slot in s.building.by_claim(claim_id) {
                 storage_ids.insert(s.building.entity_id[*b_slot as usize]);
             }
-            s.storage_log
-                .by_item_in_storages(item_id, item_type, &storage_ids)
+            s.storage_log.by_item_in_storages(item_id, item_type, &storage_ids)
         }
-        StorageLogsMode::ItemPlayer { item_id, player_id } => s
-            .storage_log
-            .by_item_and_player(item_id, item_type, player_id),
+        StorageLogsMode::ItemPlayer { item_id, player_id } => {
+            s.storage_log.by_item_and_player(item_id, item_type, player_id)
+        }
     };
 
-    let mut logs: Vec<pb::StorageLogEntry> = slots
-        .into_iter()
-        .map(|slot| enrich_storage_log(s, slot))
-        .collect();
+    let mut logs: Vec<pb::StorageLogEntry> = slots.into_iter().map(|slot| enrich_storage_log(s, slot)).collect();
     // Newest first.
     logs.sort_by(|a, b| {
         // Compare via days then id as tiebreak; timestamp string is ISO so
@@ -1221,11 +1138,7 @@ fn collect_storage_logs(
     logs
 }
 
-async fn storage_logs(
-    State(fleet): State<Fleet>,
-    headers: HeaderMap,
-    Query(q): Query<StorageLogsQuery>,
-) -> Response {
+async fn storage_logs(State(fleet): State<Fleet>, headers: HeaderMap, Query(q): Query<StorageLogsQuery>) -> Response {
     let mode = match parse_storage_logs_mode(&q) {
         Ok(m) => m,
         Err(e) => {
@@ -1239,11 +1152,7 @@ async fn storage_logs(
         }
     };
     if let Some(0) = q.limit {
-        return no_store_status(
-            StatusCode::BAD_REQUEST,
-            json!({"error": "`limit` must be >= 1"}),
-        )
-        .into_response();
+        return no_store_status(StatusCode::BAD_REQUEST, json!({"error": "`limit` must be >= 1"})).into_response();
     }
     // itemType only applies to item-scoped modes.
     let item_type = match &mode {
@@ -1410,11 +1319,7 @@ fn civil_from_unix_secs(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
     (y as i32, m, d, hour, min, sec)
 }
 
-async fn hexite_deposits(
-    State(fleet): State<Fleet>,
-    headers: HeaderMap,
-    Query(q): Query<DepositsQuery>,
-) -> Response {
+async fn hexite_deposits(State(fleet): State<Fleet>, headers: HeaderMap, Query(q): Query<DepositsQuery>) -> Response {
     let mut deposits = Vec::new();
     for shard in &fleet.shards {
         let s = shard.store.read();
@@ -1443,23 +1348,13 @@ async fn hexite_deposits(
     respond_hexite_deposits(&headers, pb::HexiteDepositList { deposits, count })
 }
 
-async fn claim_members(
-    State(fleet): State<Fleet>,
-    headers: HeaderMap,
-    Path(entity_id): Path<String>,
-) -> Response {
+async fn claim_members(State(fleet): State<Fleet>, headers: HeaderMap, Path(entity_id): Path<String>) -> Response {
     let Ok(pk) = entity_id.parse::<u64>() else {
-        return no_store_status(
-            StatusCode::BAD_REQUEST,
-            json!({"error": "entity_id must be a u64"}),
-        )
-        .into_response();
+        return no_store_status(StatusCode::BAD_REQUEST, json!({"error": "entity_id must be a u64"})).into_response();
     };
     match build_claim_members(&fleet, pk) {
         Some(body) => respond_claim_members(&headers, body),
-        None => {
-            no_store_status(StatusCode::NOT_FOUND, json!({"error": "claim not found"})).into_response()
-        }
+        None => no_store_status(StatusCode::NOT_FOUND, json!({"error": "claim not found"})).into_response(),
     }
 }
 
@@ -1483,9 +1378,7 @@ fn citizen_skills_from_store(
             continue;
         }
         if let Some(name) = s.skill_desc.name(skill_id) {
-            skill_name_map
-                .entry(skill_id)
-                .or_insert_with(|| name.to_owned());
+            skill_name_map.entry(skill_id).or_insert_with(|| name.to_owned());
         }
         skills.push(pb::CitizenSkill {
             skill_id,
@@ -1523,8 +1416,7 @@ pub(crate) fn build_claim_members(fleet: &Fleet, pk: u64) -> Option<pb::ClaimMem
         for &slot in s.claim_member.by_claim(pk) {
             let i = slot as usize;
             let player_id = s.claim_member.player_entity_id[i];
-            let skills =
-                citizen_skills_from_store(&s, player_id, &mut skill_name_map).unwrap_or_default();
+            let skills = citizen_skills_from_store(&s, player_id, &mut skill_name_map).unwrap_or_default();
             members.push(pb::ClaimMember {
                 entity_id: s.claim_member.entity_id[i],
                 claim_entity_id: s.claim_member.claim_entity_id[i],
@@ -1553,8 +1445,7 @@ pub(crate) fn build_claim_members(fleet: &Fleet, pk: u64) -> Option<pb::ClaimMem
                 continue;
             }
             if m.skills.is_empty() {
-                if let Some(skills) = citizen_skills_from_store(&s, player_id, &mut skill_name_map)
-                {
+                if let Some(skills) = citizen_skills_from_store(&s, player_id, &mut skill_name_map) {
                     m.skills = skills;
                 }
             }
@@ -1584,23 +1475,14 @@ pub(crate) fn build_claim_members(fleet: &Fleet, pk: u64) -> Option<pb::ClaimMem
     })
 }
 
-async fn claim_citizens(
-    State(fleet): State<Fleet>,
-    headers: HeaderMap,
-    Path(entity_id): Path<String>,
-) -> Response {
+async fn claim_citizens(State(fleet): State<Fleet>, headers: HeaderMap, Path(entity_id): Path<String>) -> Response {
     // Deprecated alias of /members — projects the unified roster into the
     // legacy citizens shape so existing clients keep working.
     let Ok(pk) = entity_id.parse::<u64>() else {
-        return no_store_status(
-            StatusCode::BAD_REQUEST,
-            json!({"error": "entity_id must be a u64"}),
-        )
-        .into_response();
+        return no_store_status(StatusCode::BAD_REQUEST, json!({"error": "entity_id must be a u64"})).into_response();
     };
     let Some(full) = build_claim_members(&fleet, pk) else {
-        return no_store_status(StatusCode::NOT_FOUND, json!({"error": "claim not found"}))
-            .into_response();
+        return no_store_status(StatusCode::NOT_FOUND, json!({"error": "claim not found"})).into_response();
     };
     let citizens = full
         .members
@@ -1623,22 +1505,13 @@ async fn claim_citizens(
     )
 }
 
-async fn claim_hexcoins(
-    State(fleet): State<Fleet>,
-    headers: HeaderMap,
-    Path(entity_id): Path<String>,
-) -> Response {
+async fn claim_hexcoins(State(fleet): State<Fleet>, headers: HeaderMap, Path(entity_id): Path<String>) -> Response {
     // Deprecated alias of /members — projects hexcoin + storage access only.
     let Ok(pk) = entity_id.parse::<u64>() else {
-        return no_store_status(
-            StatusCode::BAD_REQUEST,
-            json!({"error": "entity_id must be a u64"}),
-        )
-        .into_response();
+        return no_store_status(StatusCode::BAD_REQUEST, json!({"error": "entity_id must be a u64"})).into_response();
     };
     let Some(full) = build_claim_members(&fleet, pk) else {
-        return no_store_status(StatusCode::NOT_FOUND, json!({"error": "claim not found"}))
-            .into_response();
+        return no_store_status(StatusCode::NOT_FOUND, json!({"error": "claim not found"})).into_response();
     };
     let mut members: Vec<pb::MemberHexcoins> = full
         .members
@@ -1681,21 +1554,12 @@ fn hexcoins_in_inventory(s: &RegionStore, inv_slot: u32) -> i64 {
     n
 }
 
-async fn player_skills(
-    State(fleet): State<Fleet>,
-    headers: HeaderMap,
-    Path(entity_id): Path<String>,
-) -> Response {
+async fn player_skills(State(fleet): State<Fleet>, headers: HeaderMap, Path(entity_id): Path<String>) -> Response {
     let Ok(pk) = entity_id.parse::<u64>() else {
-        return no_store_status(
-            StatusCode::BAD_REQUEST,
-            json!({"error": "entity_id must be a u64"}),
-        )
-        .into_response();
+        return no_store_status(StatusCode::BAD_REQUEST, json!({"error": "entity_id must be a u64"})).into_response();
     };
     let Some(player) = find_player(&fleet, pk) else {
-        return no_store_status(StatusCode::NOT_FOUND, json!({"error": "player not found"}))
-            .into_response();
+        return no_store_status(StatusCode::NOT_FOUND, json!({"error": "player not found"})).into_response();
     };
     for shard in &fleet.shards {
         let s = shard.store.read();
@@ -1836,11 +1700,7 @@ fn push_if_matches(out: &mut Vec<pb::Craft>, craft: pb::Craft, completed: Option
     }
 }
 
-fn collect_crafts_at_claim(
-    s: &RegionStore,
-    claim_pk: u64,
-    completed: Option<bool>,
-) -> Vec<pb::Craft> {
+fn collect_crafts_at_claim(s: &RegionStore, claim_pk: u64, completed: Option<bool>) -> Vec<pb::Craft> {
     let mut crafts = Vec::new();
     for &b_slot in s.building.by_claim(claim_pk) {
         let building_id = s.building.entity_id[b_slot as usize];
@@ -1855,11 +1715,7 @@ fn collect_crafts_at_claim(
     crafts
 }
 
-fn collect_crafts_for_player(
-    s: &RegionStore,
-    player_pk: u64,
-    completed: Option<bool>,
-) -> Vec<pb::Craft> {
+fn collect_crafts_for_player(s: &RegionStore, player_pk: u64, completed: Option<bool>) -> Vec<pb::Craft> {
     let mut crafts = Vec::new();
     for &slot in s.progressive_action.by_owner(player_pk) {
         push_if_matches(&mut crafts, craft_from_progressive(s, slot), completed);
@@ -1878,27 +1734,17 @@ async fn claim_crafts(
     Query(q): Query<CompletedQuery>,
 ) -> Response {
     let Ok(pk) = entity_id.parse::<u64>() else {
-        return no_store_status(
-            StatusCode::BAD_REQUEST,
-            json!({"error": "entity_id must be a u64"}),
-        )
-        .into_response();
+        return no_store_status(StatusCode::BAD_REQUEST, json!({"error": "entity_id must be a u64"})).into_response();
     };
     match build_claim_crafts(&fleet, pk, q.completed) {
         Some(body) => respond_claim_crafts(&headers, body),
-        None => {
-            no_store_status(StatusCode::NOT_FOUND, json!({"error": "claim not found"})).into_response()
-        }
+        None => no_store_status(StatusCode::NOT_FOUND, json!({"error": "claim not found"})).into_response(),
     }
 }
 
 /// Build claim crafts snapshot. `completed` filters like the HTTP query param;
 /// pass `None` for both in-progress and completed.
-pub(crate) fn build_claim_crafts(
-    fleet: &Fleet,
-    pk: u64,
-    completed: Option<bool>,
-) -> Option<pb::ClaimCrafts> {
+pub(crate) fn build_claim_crafts(fleet: &Fleet, pk: u64, completed: Option<bool>) -> Option<pb::ClaimCrafts> {
     for shard in &fleet.shards {
         let s = shard.store.read();
         if !s.ready {
@@ -1929,28 +1775,17 @@ async fn player_crafts(
     Query(q): Query<CompletedQuery>,
 ) -> Response {
     let Ok(pk) = entity_id.parse::<u64>() else {
-        return no_store_status(
-            StatusCode::BAD_REQUEST,
-            json!({"error": "entity_id must be a u64"}),
-        )
-        .into_response();
+        return no_store_status(StatusCode::BAD_REQUEST, json!({"error": "entity_id must be a u64"})).into_response();
     };
     match build_player_crafts(&fleet, pk, q.completed) {
         Some(body) => respond_player_crafts(&headers, body),
-        None => {
-            no_store_status(StatusCode::NOT_FOUND, json!({"error": "player not found"}))
-                .into_response()
-        }
+        None => no_store_status(StatusCode::NOT_FOUND, json!({"error": "player not found"})).into_response(),
     }
 }
 
 /// Build player crafts snapshot. `completed` filters like the HTTP query param;
 /// pass `None` for both in-progress and completed.
-pub(crate) fn build_player_crafts(
-    fleet: &Fleet,
-    pk: u64,
-    completed: Option<bool>,
-) -> Option<pb::PlayerCrafts> {
+pub(crate) fn build_player_crafts(fleet: &Fleet, pk: u64, completed: Option<bool>) -> Option<pb::PlayerCrafts> {
     let player = find_player(fleet, pk)?;
     for shard in &fleet.shards {
         let s = shard.store.read();
@@ -2007,10 +1842,7 @@ fn item_type_label(t: u8) -> &'static str {
     }
 }
 
-fn aggregate_pockets(
-    s: &RegionStore,
-    inv_slots: impl Iterator<Item = u32>,
-) -> Vec<pb::InventoryItem> {
+fn aggregate_pockets(s: &RegionStore, inv_slots: impl Iterator<Item = u32>) -> Vec<pb::InventoryItem> {
     let mut agg: HashMap<(i32, u8), i64> = HashMap::new();
     for inv_slot in inv_slots {
         for p in s.inventory.pockets[inv_slot as usize].iter() {
@@ -2027,11 +1859,7 @@ fn aggregate_pockets(
             quantity,
         })
         .collect();
-    items.sort_by(|a, b| {
-        a.item_id
-            .cmp(&b.item_id)
-            .then_with(|| a.item_type.cmp(&b.item_type))
-    });
+    items.sort_by(|a, b| a.item_id.cmp(&b.item_id).then_with(|| a.item_type.cmp(&b.item_type)));
     items
 }
 
@@ -2085,11 +1913,7 @@ fn player_to_json(p: &pb::Player) -> Value {
     Value::Object(map)
 }
 
-fn player_from_store(
-    s: &crate::store::RegionStore,
-    entity_id: u64,
-    username: String,
-) -> pb::Player {
+fn player_from_store(s: &crate::store::RegionStore, entity_id: u64, username: String) -> pb::Player {
     let (last_login_timestamp, signed_in) = match s.player_state.find(entity_id) {
         Some(slot) => {
             let i = slot as usize;
@@ -2202,11 +2026,7 @@ fn find_player(fleet: &Fleet, pk: u64) -> Option<pb::Player> {
     None
 }
 
-async fn player_by_name(
-    State(fleet): State<Fleet>,
-    headers: HeaderMap,
-    Query(q): Query<NameQuery>,
-) -> Response {
+async fn player_by_name(State(fleet): State<Fleet>, headers: HeaderMap, Query(q): Query<NameQuery>) -> Response {
     let Some(needle) = q.name.as_deref().filter(|s| !s.is_empty()) else {
         return no_store_status(
             StatusCode::BAD_REQUEST,
@@ -2237,22 +2057,13 @@ async fn player_by_name(
     respond_player_list(&headers, hits)
 }
 
-async fn player_by_pk(
-    State(fleet): State<Fleet>,
-    headers: HeaderMap,
-    Path(entity_id): Path<String>,
-) -> Response {
+async fn player_by_pk(State(fleet): State<Fleet>, headers: HeaderMap, Path(entity_id): Path<String>) -> Response {
     let Ok(pk) = entity_id.parse::<u64>() else {
-        return no_store_status(
-            StatusCode::BAD_REQUEST,
-            json!({"error": "entity_id must be a u64"}),
-        )
-        .into_response();
+        return no_store_status(StatusCode::BAD_REQUEST, json!({"error": "entity_id must be a u64"})).into_response();
     };
     match find_player(&fleet, pk) {
         Some(player) => respond_player(&headers, player),
-        None => no_store_status(StatusCode::NOT_FOUND, json!({"error": "player not found"}))
-            .into_response(),
+        None => no_store_status(StatusCode::NOT_FOUND, json!({"error": "player not found"})).into_response(),
     }
 }
 
@@ -2285,24 +2096,14 @@ fn player_inventory_slots(s: &RegionStore, player_id: u64) -> Vec<u32> {
 fn deployable_bag_fields(
     s: &RegionStore,
     d_slot: u32,
-) -> (
-    &'static str,
-    String,
-    Option<String>,
-    Option<u64>,
-    Option<String>,
-) {
+) -> (&'static str, String, Option<String>, Option<u64>, Option<String>) {
     let desc_id = s.deployable.deployable_description_id[d_slot as usize];
     let (desc_name, kind) = s
         .deployable_desc
         .get(desc_id)
         .unwrap_or(("Deployable", DeployableKind::Other));
     let nick = s.deployable.nickname[d_slot as usize].as_ref();
-    let nickname = if nick.is_empty() {
-        None
-    } else {
-        Some(nick.to_owned())
-    };
+    let nickname = if nick.is_empty() { None } else { Some(nick.to_owned()) };
     let name = nickname.clone().unwrap_or_else(|| desc_name.to_owned());
     let category = match kind {
         DeployableKind::Cart => "wagon",
@@ -2311,10 +2112,7 @@ fn deployable_bag_fields(
         _ => "deployable",
     };
     let claim_id = s.deployable.claim_entity_id[d_slot as usize];
-    let claim_name = s
-        .claim
-        .find(claim_id)
-        .map(|cs| s.claim.name[cs as usize].to_string());
+    let claim_name = s.claim.find(claim_id).map(|cs| s.claim.name[cs as usize].to_string());
     (
         category,
         name,
@@ -2326,11 +2124,7 @@ fn deployable_bag_fields(
 
 /// Classify one inventory row for a player. Returns `None` for
 /// unrecognized owners / unknown body-bag indexes.
-fn classify_player_bag(
-    s: &RegionStore,
-    inv_slot: u32,
-    player_id: u64,
-) -> Option<pb::PlayerInventoryBag> {
+fn classify_player_bag(s: &RegionStore, inv_slot: u32, player_id: u64) -> Option<pb::PlayerInventoryBag> {
     let i = inv_slot as usize;
     let entity_id = s.inventory.entity_id[i];
     let owner = s.inventory.owner_entity_id[i];
@@ -2361,10 +2155,7 @@ fn classify_player_bag(
         let desc_id = s.building.building_description_id[b_slot as usize];
         let building_name = s.building_desc.get(desc_id).unwrap_or("Storage").to_owned();
         let claim_id = s.building.claim_entity_id[b_slot as usize];
-        let claim_name = s
-            .claim
-            .find(claim_id)
-            .map(|cs| s.claim.name[cs as usize].to_string());
+        let claim_name = s.claim.find(claim_id).map(|cs| s.claim.name[cs as usize].to_string());
         let category = categorize_building_bag(&building_name)?;
         Some((
             category,
@@ -2378,10 +2169,7 @@ fn classify_player_bag(
     // Deployable storage: inventory.owner_entity_id == deployable.entity_id
     // (or shared entity_id). Does not require player_owner_entity_id.
     let (category, name, nickname, claim_entity_id, claim_name) = building.or_else(|| {
-        let d_slot = s
-            .deployable
-            .find(owner)
-            .or_else(|| s.deployable.find(entity_id))?;
+        let d_slot = s.deployable.find(owner).or_else(|| s.deployable.find(entity_id))?;
         if s.deployable.owner_id[d_slot as usize] != player_id {
             return None;
         }
@@ -2433,31 +2221,18 @@ fn collect_player_bags(fleet: &Fleet, player_id: u64) -> Vec<pb::PlayerInventory
             bags.push(bag);
         }
     }
-    bags.sort_by(|a, b| {
-        a.category
-            .cmp(&b.category)
-            .then_with(|| a.entity_id.cmp(&b.entity_id))
-    });
+    bags.sort_by(|a, b| a.category.cmp(&b.category).then_with(|| a.entity_id.cmp(&b.entity_id)));
     bags
 }
 
-async fn player_inventory(
-    State(fleet): State<Fleet>,
-    headers: HeaderMap,
-    Path(entity_id): Path<String>,
-) -> Response {
+async fn player_inventory(State(fleet): State<Fleet>, headers: HeaderMap, Path(entity_id): Path<String>) -> Response {
     let Ok(pk) = entity_id.parse::<u64>() else {
-        return no_store_status(
-            StatusCode::BAD_REQUEST,
-            json!({"error": "entity_id must be a u64"}),
-        )
-        .into_response();
+        return no_store_status(StatusCode::BAD_REQUEST, json!({"error": "entity_id must be a u64"})).into_response();
     };
 
     match build_player_inventory(&fleet, pk) {
         Some(inv) => respond_player_inventory(&headers, inv),
-        None => no_store_status(StatusCode::NOT_FOUND, json!({"error": "player not found"}))
-            .into_response(),
+        None => no_store_status(StatusCode::NOT_FOUND, json!({"error": "player not found"})).into_response(),
     }
 }
 
@@ -2484,10 +2259,7 @@ pub(crate) fn build_player_inventory(fleet: &Fleet, pk: u64) -> Option<pb::Playe
     })
 }
 
-fn collect_housing_buildings(
-    s: &RegionStore,
-    entrance_dimension_id: u32,
-) -> Vec<pb::BuildingInventory> {
+fn collect_housing_buildings(s: &RegionStore, entrance_dimension_id: u32) -> Vec<pb::BuildingInventory> {
     // Player-housing interiors often have claim_entity_id = 0, so we
     // enumerate by location dimension rather than claim.
     let mut buildings = Vec::new();
@@ -2497,20 +2269,11 @@ fn collect_housing_buildings(
         };
         let bi = b_slot as usize;
         let building_description_id = s.building.building_description_id[bi];
-        if !s
-            .building_desc
-            .include_in_claim_inventory(building_description_id)
-        {
+        if !s.building_desc.include_in_claim_inventory(building_description_id) {
             continue;
         }
-        let name = s
-            .building_desc
-            .get(building_description_id)
-            .map(str::to_owned);
-        let nickname = s
-            .building_nickname
-            .get(building_entity_id)
-            .map(str::to_owned);
+        let name = s.building_desc.get(building_description_id).map(str::to_owned);
+        let nickname = s.building_nickname.get(building_entity_id).map(str::to_owned);
         let items = aggregate_pockets(s, s.inventory.by_owner(building_entity_id).iter().copied());
         buildings.push(pb::BuildingInventory {
             entity_id: building_entity_id,
@@ -2549,11 +2312,7 @@ pub(crate) fn housing_building_ids(s: &RegionStore, entrance_dimension_id: u32) 
 /// Human-readable house label: prefer a player nickname on the entrance,
 /// otherwise "{username}'s House", always annotated with the catalog type.
 fn house_display_name(username: &str, catalog: &str, nickname: Option<&str>) -> String {
-    let catalog = if catalog.is_empty() {
-        "Player Housing"
-    } else {
-        catalog
-    };
+    let catalog = if catalog.is_empty() { "Player Housing" } else { catalog };
     match nickname.map(str::trim).filter(|n| !n.is_empty()) {
         Some(nick) => format!("{nick} ({catalog})"),
         None if username.is_empty() => catalog.to_owned(),
@@ -2561,10 +2320,7 @@ fn house_display_name(username: &str, catalog: &str, nickname: Option<&str>) -> 
     }
 }
 
-fn entrance_catalog_and_nickname(
-    s: &RegionStore,
-    entrance_building_id: u64,
-) -> (String, Option<String>) {
+fn entrance_catalog_and_nickname(s: &RegionStore, entrance_building_id: u64) -> (String, Option<String>) {
     let catalog = s
         .building
         .find(entrance_building_id)
@@ -2580,23 +2336,14 @@ fn entrance_catalog_and_nickname(
     (catalog, nickname)
 }
 
-async fn player_housing(
-    State(fleet): State<Fleet>,
-    headers: HeaderMap,
-    Path(entity_id): Path<String>,
-) -> Response {
+async fn player_housing(State(fleet): State<Fleet>, headers: HeaderMap, Path(entity_id): Path<String>) -> Response {
     let Ok(pk) = entity_id.parse::<u64>() else {
-        return no_store_status(
-            StatusCode::BAD_REQUEST,
-            json!({"error": "entity_id must be a u64"}),
-        )
-        .into_response();
+        return no_store_status(StatusCode::BAD_REQUEST, json!({"error": "entity_id must be a u64"})).into_response();
     };
 
     match build_player_housing(&fleet, pk) {
         Some(housing) => respond_player_housing(&headers, housing),
-        None => no_store_status(StatusCode::NOT_FOUND, json!({"error": "player not found"}))
-            .into_response(),
+        None => no_store_status(StatusCode::NOT_FOUND, json!({"error": "player not found"})).into_response(),
     }
 }
 
@@ -2678,8 +2425,8 @@ pub(crate) fn build_player_housing(fleet: &Fleet, pk: u64) -> Option<pb::PlayerH
 mod tests {
     use super::*;
     use crate::decode::{
-        BuildingDescRow, BuildingRow, DeployableDescRow, DeployableKind, DeployableRow,
-        DimensionNetworkRow, LocationDimRow, PlayerUsernameRow, OVERWORLD_DIMENSION,
+        BuildingDescRow, BuildingRow, DeployableDescRow, DeployableKind, DeployableRow, DimensionNetworkRow,
+        LocationDimRow, PlayerUsernameRow, OVERWORLD_DIMENSION,
     };
     use crate::store::RegionStore;
     use prost::Message;
@@ -2712,9 +2459,7 @@ mod tests {
     async fn cache_health_exposes_only_ready_shape() {
         let fleet = fleet_with(true);
         let resp = cache_health(State(fleet)).await.into_response();
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
         // Public shape: top-level ready + per-region ready. No internals.
         assert_eq!(v["ready"], json!(true));
@@ -2730,9 +2475,7 @@ mod tests {
     async fn internal_stats_exposes_internals() {
         let fleet = fleet_with(true);
         let resp = internal_stats(State(fleet)).await.into_response();
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["memory_pressure"], json!(false));
         assert_eq!(v["streams"]["active_connections"], json!(0));
@@ -2752,9 +2495,7 @@ mod tests {
 
     #[test]
     fn deposit_from_claim_slot_uses_claim_coords_and_growth() {
-        use crate::decode::{
-            ClaimLocalRow, ClaimRow, GrowthRow, ResourceRow, DEPLETED_HEXITE_DEPOSIT_RESOURCE_ID,
-        };
+        use crate::decode::{ClaimLocalRow, ClaimRow, GrowthRow, ResourceRow, DEPLETED_HEXITE_DEPOSIT_RESOURCE_ID};
 
         let mut s = RegionStore::empty(14);
         s.claim.upsert(ClaimRow {
@@ -2860,8 +2601,7 @@ mod tests {
     #[test]
     fn deposit_from_claim_slot_uses_growth_timer_when_no_growth_state() {
         use crate::decode::{
-            ClaimLocalRow, ClaimRow, ResourceGrowthTimerRow, ResourceRow,
-            DEPLETED_HEXITE_DEPOSIT_RESOURCE_ID,
+            ClaimLocalRow, ClaimRow, ResourceGrowthTimerRow, ResourceRow, DEPLETED_HEXITE_DEPOSIT_RESOURCE_ID,
         };
 
         let mut s = RegionStore::empty(14);
@@ -3040,9 +2780,7 @@ mod tests {
     #[test]
     fn accept_selects_protobuf() {
         assert!(accept_wants_protobuf("application/x-protobuf"));
-        assert!(accept_wants_protobuf(
-            "application/json, application/x-protobuf"
-        ));
+        assert!(accept_wants_protobuf("application/json, application/x-protobuf"));
         assert!(accept_wants_protobuf("application/x-protobuf;q=0.9"));
         assert!(accept_wants_protobuf("APPLICATION/X-PROTOBUF"));
         assert!(!accept_wants_protobuf("*/*"));
@@ -3136,10 +2874,7 @@ mod tests {
         assert_eq!(json["dimensions"][0]["kind"], "overworld");
         assert_eq!(json["dimensions"][0]["entrance"], Value::Null);
         assert_eq!(json["dimensions"][0]["buildings"][0]["entity_id"], "1");
-        assert_eq!(
-            json["dimensions"][0]["buildings"][0]["items"][0]["item_id"],
-            42
-        );
+        assert_eq!(json["dimensions"][0]["buildings"][0]["items"][0]["item_id"], 42);
     }
 
     #[test]
@@ -3153,9 +2888,7 @@ mod tests {
             region: 3,
             ..Default::default()
         }];
-        let list = pb::ClaimList {
-            claims: claims.clone(),
-        };
+        let list = pb::ClaimList { claims: claims.clone() };
         let decoded = pb::ClaimList::decode(list.encode_to_vec().as_slice()).unwrap();
         assert_eq!(decoded.claims.len(), 1);
         assert_eq!(decoded.claims[0].name, "A");
@@ -3268,15 +3001,9 @@ mod tests {
         assert_eq!(wallet.category, "wallet");
         assert_eq!(wallet.name, "Wallet");
         assert_eq!(wallet.items.len(), 2);
-        assert!(wallet
-            .items
-            .iter()
-            .any(|i| i.item_id == 1 && i.quantity == 50));
+        assert!(wallet.items.iter().any(|i| i.item_id == 1 && i.quantity == 50));
         // Checkpoint shape matches live Maplesugar wallet (27488 / 180).
-        assert!(wallet
-            .items
-            .iter()
-            .any(|i| i.item_id == 828972621 && i.quantity == 180));
+        assert!(wallet.items.iter().any(|i| i.item_id == 828972621 && i.quantity == 180));
         let bank = classify_player_bag(&s, s.inventory.find(3).unwrap(), 7).unwrap();
         assert_eq!(bank.category, "bank");
         assert_eq!(bank.claim_name.as_deref(), Some("Concordia"));
@@ -3477,10 +3204,7 @@ mod tests {
         assert_eq!(buildings[0].entity_id, 300);
         assert_eq!(buildings[0].items[0].item_type, "Cargo");
         assert_eq!(buildings[0].items[0].quantity, 2);
-        assert_eq!(
-            s.player_housing_desc.name_for_rank(1),
-            Some("Player Housing Catacombs")
-        );
+        assert_eq!(s.player_housing_desc.name_for_rank(1), Some("Player Housing Catacombs"));
     }
 
     #[test]
@@ -3496,14 +3220,8 @@ mod tests {
         let decoded = pb::Player::decode(player.encode_to_vec().as_slice()).unwrap();
         assert_eq!(decoded, player);
         assert_eq!(player_to_json(&player)["entity_id"], "7");
-        assert_eq!(
-            player_to_json(&player)["last_login_timestamp"],
-            1_700_000_000
-        );
+        assert_eq!(player_to_json(&player)["last_login_timestamp"], 1_700_000_000);
         assert_eq!(player_to_json(&player)["signed_in"], true);
-        assert_eq!(
-            player_to_json(&player)["last_active_timestamp"],
-            1_700_000_100
-        );
+        assert_eq!(player_to_json(&player)["last_active_timestamp"], 1_700_000_100);
     }
 }

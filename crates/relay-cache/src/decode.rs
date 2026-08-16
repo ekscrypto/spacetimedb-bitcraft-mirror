@@ -465,11 +465,7 @@ fn resolve_claim_local_cols(schema: &MirroredSchema) -> Result<ClaimLocalCols> {
         num_tiles: find_field(f, "num_tiles", CLAIM_LOCAL_TABLE)?,
         location: find_field(f, "location", CLAIM_LOCAL_TABLE)?,
         treasury: find_field(f, "treasury", CLAIM_LOCAL_TABLE)?,
-        supplies_purchase_threshold: find_field(
-            f,
-            "supplies_purchase_threshold",
-            CLAIM_LOCAL_TABLE,
-        )?,
+        supplies_purchase_threshold: find_field(f, "supplies_purchase_threshold", CLAIM_LOCAL_TABLE)?,
         supplies_purchase_price: find_field(f, "supplies_purchase_price", CLAIM_LOCAL_TABLE)?,
     })
 }
@@ -553,17 +549,11 @@ fn resolve_progressive_action_cols(schema: &MirroredSchema) -> Result<Progressiv
     })
 }
 
-fn resolve_public_progressive_action_cols(
-    schema: &MirroredSchema,
-) -> Result<PublicProgressiveActionCols> {
+fn resolve_public_progressive_action_cols(schema: &MirroredSchema) -> Result<PublicProgressiveActionCols> {
     let f = fields_of(schema, PUBLIC_PROGRESSIVE_ACTION_TABLE)?;
     Ok(PublicProgressiveActionCols {
         entity_id: find_field(f, "entity_id", PUBLIC_PROGRESSIVE_ACTION_TABLE)?,
-        building_entity_id: find_field(
-            f,
-            "building_entity_id",
-            PUBLIC_PROGRESSIVE_ACTION_TABLE,
-        )?,
+        building_entity_id: find_field(f, "building_entity_id", PUBLIC_PROGRESSIVE_ACTION_TABLE)?,
         owner_entity_id: find_field(f, "owner_entity_id", PUBLIC_PROGRESSIVE_ACTION_TABLE)?,
     })
 }
@@ -737,11 +727,7 @@ fn resolve_player_housing_cols(schema: &MirroredSchema) -> Result<PlayerHousingC
     let f = fields_of(schema, PLAYER_HOUSING_TABLE)?;
     Ok(PlayerHousingCols {
         entity_id: find_field(f, "entity_id", PLAYER_HOUSING_TABLE)?,
-        entrance_building_entity_id: find_field(
-            f,
-            "entrance_building_entity_id",
-            PLAYER_HOUSING_TABLE,
-        )?,
+        entrance_building_entity_id: find_field(f, "entrance_building_entity_id", PLAYER_HOUSING_TABLE)?,
         network_entity_id: find_field(f, "network_entity_id", PLAYER_HOUSING_TABLE)?,
         rank: find_field(f, "rank", PLAYER_HOUSING_TABLE)?,
         is_empty: find_field(f, "is_empty", PLAYER_HOUSING_TABLE)?,
@@ -1090,14 +1076,8 @@ pub fn decode_claim_with_fields(
     let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
     Ok(ClaimRow {
         entity_id: cell_u64(&cells[cols.entity_id], "claim.entity_id")?,
-        owner_player_entity_id: cell_u64(
-            &cells[cols.owner_player_entity_id],
-            "claim.owner_player_entity_id",
-        )?,
-        owner_building_entity_id: cell_u64(
-            &cells[cols.owner_building_entity_id],
-            "claim.owner_building_entity_id",
-        )?,
+        owner_player_entity_id: cell_u64(&cells[cols.owner_player_entity_id], "claim.owner_player_entity_id")?,
+        owner_building_entity_id: cell_u64(&cells[cols.owner_building_entity_id], "claim.owner_building_entity_id")?,
         name: cell_string(&cells[cols.name], "claim.name")?,
         neutral: cell_bool(&cells[cols.neutral], "claim.neutral")?,
     })
@@ -1113,10 +1093,7 @@ pub fn decode_building_with_fields(
     Ok(BuildingRow {
         entity_id: cell_u64(&cells[cols.entity_id], "building.entity_id")?,
         claim_entity_id: cell_u64(&cells[cols.claim_entity_id], "building.claim_entity_id")?,
-        building_description_id: cell_i32(
-            &cells[cols.building_description_id],
-            "building.building_description_id",
-        )?,
+        building_description_id: cell_i32(&cells[cols.building_description_id], "building.building_description_id")?,
     })
 }
 
@@ -1146,10 +1123,7 @@ fn functions_is_storage(cell: &Cell) -> Result<bool> {
         let Value::Object(obj) = entry else {
             continue;
         };
-        let storage = obj
-            .get("storage_slots")
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
+        let storage = obj.get("storage_slots").and_then(Value::as_i64).unwrap_or(0);
         let cargo = obj.get("cargo_slots").and_then(Value::as_i64).unwrap_or(0);
         if storage > 0 || cargo > 0 {
             return Ok(true);
@@ -1184,10 +1158,7 @@ pub fn decode_inventory_with_fields(
         inventory_index: cell_i32(&cells[cols.inventory_index], "inventory.inventory_index")?,
         cargo_index: cell_i32(&cells[cols.cargo_index], "inventory.cargo_index")?,
         owner_entity_id: cell_u64(&cells[cols.owner_entity_id], "inventory.owner_entity_id")?,
-        player_owner_entity_id: cell_u64(
-            &cells[cols.player_owner_entity_id],
-            "inventory.player_owner_entity_id",
-        )?,
+        player_owner_entity_id: cell_u64(&cells[cols.player_owner_entity_id], "inventory.player_owner_entity_id")?,
     })
 }
 
@@ -1228,10 +1199,7 @@ pub fn decode_growth_with_fields(
     let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
     Ok(GrowthRow {
         entity_id: cell_u64(&cells[cols.entity_id], "growth.entity_id")?,
-        end_timestamp_micros: decode_timestamp_micros(
-            &cells[cols.end_timestamp],
-            "growth.end_timestamp",
-        )?,
+        end_timestamp_micros: decode_timestamp_micros(&cells[cols.end_timestamp], "growth.end_timestamp")?,
         growth_recipe_id: cell_i32(&cells[cols.growth_recipe_id], "growth.growth_recipe_id")?,
     })
 }
@@ -1245,14 +1213,8 @@ pub fn decode_resource_growth_timer_with_fields(
     let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
     Ok(ResourceGrowthTimerRow {
         entity_id: cell_u64(&cells[cols.entity_id], "growth_timer.entity_id")?,
-        scheduled_at_micros: decode_schedule_at_timestamp(
-            &cells[cols.scheduled_at],
-            "growth_timer.scheduled_at",
-        )?,
-        growth_recipe_id: cell_i32(
-            &cells[cols.growth_recipe_id],
-            "growth_timer.growth_recipe_id",
-        )?,
+        scheduled_at_micros: decode_schedule_at_timestamp(&cells[cols.scheduled_at], "growth_timer.scheduled_at")?,
+        growth_recipe_id: cell_i32(&cells[cols.growth_recipe_id], "growth_timer.growth_recipe_id")?,
     })
 }
 
@@ -1266,24 +1228,15 @@ pub fn decode_storage_log_with_fields(
     let (action, item_id, item_type, quantity) = decode_action_log_data(&cells[cols.data])?;
     Ok(StorageLogRow {
         id: cell_u64(&cells[cols.id], "storage_log.id")?,
-        storage_entity_id: cell_u64(
-            &cells[cols.object_entity_id],
-            "storage_log.object_entity_id",
-        )?,
-        player_entity_id: cell_u64(
-            &cells[cols.subject_entity_id],
-            "storage_log.subject_entity_id",
-        )?,
+        storage_entity_id: cell_u64(&cells[cols.object_entity_id], "storage_log.object_entity_id")?,
+        player_entity_id: cell_u64(&cells[cols.subject_entity_id], "storage_log.subject_entity_id")?,
         player_username: cell_string(&cells[cols.subject_name], "storage_log.subject_name")?,
         action,
         item_id,
         item_type,
         quantity,
         timestamp_micros: decode_timestamp_micros(&cells[cols.timestamp], "storage_log.timestamp")?,
-        days_since_epoch: cell_i32(
-            &cells[cols.days_since_epoch],
-            "storage_log.days_since_epoch",
-        )?,
+        days_since_epoch: cell_i32(&cells[cols.days_since_epoch], "storage_log.days_since_epoch")?,
     })
 }
 
@@ -1341,14 +1294,8 @@ pub fn decode_dimension_network_with_fields(
     Ok(DimensionNetworkRow {
         entity_id: cell_u64(&cells[cols.entity_id], "dimension_network.entity_id")?,
         building_id: cell_u64(&cells[cols.building_id], "dimension_network.building_id")?,
-        claim_entity_id: cell_u64(
-            &cells[cols.claim_entity_id],
-            "dimension_network.claim_entity_id",
-        )?,
-        rent_entity_id: cell_u64(
-            &cells[cols.rent_entity_id],
-            "dimension_network.rent_entity_id",
-        )?,
+        claim_entity_id: cell_u64(&cells[cols.claim_entity_id], "dimension_network.claim_entity_id")?,
+        rent_entity_id: cell_u64(&cells[cols.rent_entity_id], "dimension_network.rent_entity_id")?,
         entrance_dimension_id: cell_u32(
             &cells[cols.entrance_dimension_id],
             "dimension_network.entrance_dimension_id",
@@ -1379,10 +1326,7 @@ pub fn decode_player_state_with_fields(
     let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
     Ok(PlayerStateRow {
         entity_id: cell_u64(&cells[cols.entity_id], "player_state.entity_id")?,
-        sign_in_timestamp: cell_i32(
-            &cells[cols.sign_in_timestamp],
-            "player_state.sign_in_timestamp",
-        )?,
+        sign_in_timestamp: cell_i32(&cells[cols.sign_in_timestamp], "player_state.sign_in_timestamp")?,
         session_start_timestamp: cell_i32(
             &cells[cols.session_start_timestamp],
             "player_state.session_start_timestamp",
@@ -1469,10 +1413,7 @@ pub fn decode_player_housing_with_fields(
             &cells[cols.entrance_building_entity_id],
             "player_housing.entrance_building_entity_id",
         )?,
-        network_entity_id: cell_u64(
-            &cells[cols.network_entity_id],
-            "player_housing.network_entity_id",
-        )?,
+        network_entity_id: cell_u64(&cells[cols.network_entity_id], "player_housing.network_entity_id")?,
         rank: cell_i32(&cells[cols.rank], "player_housing.rank")?,
         is_empty: cell_bool(&cells[cols.is_empty], "player_housing.is_empty")?,
         region_index: cell_u8(&cells[cols.region_index], "player_housing.region_index")?,
@@ -1505,10 +1446,7 @@ pub fn decode_rent_with_fields(
     let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
     Ok(RentRow {
         entity_id: cell_u64(&cells[cols.entity_id], "rent.entity_id")?,
-        dimension_network_id: cell_u64(
-            &cells[cols.dimension_network_id],
-            "rent.dimension_network_id",
-        )?,
+        dimension_network_id: cell_u64(&cells[cols.dimension_network_id], "rent.dimension_network_id")?,
         claim_entity_id: cell_u64(&cells[cols.claim_entity_id], "rent.claim_entity_id")?,
         white_list: decode_u64_array(&cells[cols.white_list], "rent.white_list")?,
         active: cell_bool(&cells[cols.active], "rent.active")?,
@@ -1522,15 +1460,11 @@ pub fn decode_claim_local_with_fields(
     schema: &MirroredSchema,
 ) -> Result<ClaimLocalRow> {
     let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
-    let (has_location, location_x, location_z, location_dimension) =
-        decode_optional_location(&cells[cols.location])?;
+    let (has_location, location_x, location_z, location_dimension) = decode_optional_location(&cells[cols.location])?;
     Ok(ClaimLocalRow {
         entity_id: cell_u64(&cells[cols.entity_id], "claim_local.entity_id")?,
         supplies: cell_i32(&cells[cols.supplies], "claim_local.supplies")?,
-        building_maintenance: cell_f32(
-            &cells[cols.building_maintenance],
-            "claim_local.building_maintenance",
-        )?,
+        building_maintenance: cell_f32(&cells[cols.building_maintenance], "claim_local.building_maintenance")?,
         num_tiles: cell_i32(&cells[cols.num_tiles], "claim_local.num_tiles")?,
         treasury: cell_u32(&cells[cols.treasury], "claim_local.treasury")?,
         supplies_purchase_threshold: cell_u32(
@@ -1558,27 +1492,12 @@ pub fn decode_claim_member_with_fields(
     Ok(ClaimMemberRow {
         entity_id: cell_u64(&cells[cols.entity_id], "claim_member.entity_id")?,
         claim_entity_id: cell_u64(&cells[cols.claim_entity_id], "claim_member.claim_entity_id")?,
-        player_entity_id: cell_u64(
-            &cells[cols.player_entity_id],
-            "claim_member.player_entity_id",
-        )?,
+        player_entity_id: cell_u64(&cells[cols.player_entity_id], "claim_member.player_entity_id")?,
         user_name: cell_string(&cells[cols.user_name], "claim_member.user_name")?,
-        inventory_permission: cell_bool(
-            &cells[cols.inventory_permission],
-            "claim_member.inventory_permission",
-        )?,
-        build_permission: cell_bool(
-            &cells[cols.build_permission],
-            "claim_member.build_permission",
-        )?,
-        officer_permission: cell_bool(
-            &cells[cols.officer_permission],
-            "claim_member.officer_permission",
-        )?,
-        co_owner_permission: cell_bool(
-            &cells[cols.co_owner_permission],
-            "claim_member.co_owner_permission",
-        )?,
+        inventory_permission: cell_bool(&cells[cols.inventory_permission], "claim_member.inventory_permission")?,
+        build_permission: cell_bool(&cells[cols.build_permission], "claim_member.build_permission")?,
+        officer_permission: cell_bool(&cells[cols.officer_permission], "claim_member.officer_permission")?,
+        co_owner_permission: cell_bool(&cells[cols.co_owner_permission], "claim_member.co_owner_permission")?,
     })
 }
 
@@ -1618,10 +1537,7 @@ pub fn decode_claim_tech_desc_with_fields(
         requirements: decode_i32_array(&cells[cols.requirements], "claim_tech_desc.requirements")?,
         members: cell_i32(&cells[cols.members], "claim_tech_desc.members")?,
         area: cell_i32(&cells[cols.area], "claim_tech_desc.area")?,
-        unlocks_techs: decode_i32_array(
-            &cells[cols.unlocks_techs],
-            "claim_tech_desc.unlocks_techs",
-        )?,
+        unlocks_techs: decode_i32_array(&cells[cols.unlocks_techs], "claim_tech_desc.unlocks_techs")?,
     })
 }
 
@@ -1675,17 +1591,11 @@ pub fn decode_progressive_action_with_fields(
     let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
     Ok(ProgressiveActionRow {
         entity_id: cell_u64(&cells[cols.entity_id], "progressive_action.entity_id")?,
-        building_entity_id: cell_u64(
-            &cells[cols.building_entity_id],
-            "progressive_action.building_entity_id",
-        )?,
+        building_entity_id: cell_u64(&cells[cols.building_entity_id], "progressive_action.building_entity_id")?,
         progress: cell_i32(&cells[cols.progress], "progressive_action.progress")?,
         recipe_id: cell_i32(&cells[cols.recipe_id], "progressive_action.recipe_id")?,
         craft_count: cell_i32(&cells[cols.craft_count], "progressive_action.craft_count")?,
-        owner_entity_id: cell_u64(
-            &cells[cols.owner_entity_id],
-            "progressive_action.owner_entity_id",
-        )?,
+        owner_entity_id: cell_u64(&cells[cols.owner_entity_id], "progressive_action.owner_entity_id")?,
     })
 }
 
@@ -1718,15 +1628,9 @@ pub fn decode_passive_craft_with_fields(
     let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
     Ok(PassiveCraftRow {
         entity_id: cell_u64(&cells[cols.entity_id], "passive_craft.entity_id")?,
-        owner_entity_id: cell_u64(
-            &cells[cols.owner_entity_id],
-            "passive_craft.owner_entity_id",
-        )?,
+        owner_entity_id: cell_u64(&cells[cols.owner_entity_id], "passive_craft.owner_entity_id")?,
         recipe_id: cell_i32(&cells[cols.recipe_id], "passive_craft.recipe_id")?,
-        building_entity_id: cell_u64(
-            &cells[cols.building_entity_id],
-            "passive_craft.building_entity_id",
-        )?,
+        building_entity_id: cell_u64(&cells[cols.building_entity_id], "passive_craft.building_entity_id")?,
         status: decode_passive_craft_status(&cells[cols.status])?,
     })
 }
@@ -1740,10 +1644,7 @@ pub fn decode_crafting_recipe_desc_with_fields(
     let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
     Ok(CraftingRecipeDescRow {
         id: cell_i32(&cells[cols.id], "crafting_recipe_desc.id")?,
-        actions_required: cell_i32(
-            &cells[cols.actions_required],
-            "crafting_recipe_desc.actions_required",
-        )?,
+        actions_required: cell_i32(&cells[cols.actions_required], "crafting_recipe_desc.actions_required")?,
         crafted_item: decode_crafted_item_stacks(&cells[cols.crafted_item_stacks])?,
     })
 }
@@ -1775,14 +1676,8 @@ fn decode_crafted_item_stacks(cell: &Cell) -> Result<Box<[CraftedItemStack]>> {
         let Value::Object(obj) = entry else {
             bail!("crafted_item_stacks[{i}] is not an object: {entry}");
         };
-        let item_id = json_i32(
-            obj.get("item_id"),
-            &format!("crafted_item_stacks[{i}].item_id"),
-        )?;
-        let quantity = json_i32(
-            obj.get("quantity"),
-            &format!("crafted_item_stacks[{i}].quantity"),
-        )?;
+        let item_id = json_i32(obj.get("item_id"), &format!("crafted_item_stacks[{i}].item_id"))?;
+        let quantity = json_i32(obj.get("quantity"), &format!("crafted_item_stacks[{i}].quantity"))?;
         let item_type = match obj.get("item_type") {
             Some(Value::Object(t)) if t.contains_key("Item") => Pocket::ITEM,
             Some(Value::Object(t)) if t.contains_key("Cargo") => Pocket::CARGO,
@@ -1847,40 +1742,32 @@ fn decode_pockets(cell: &Cell) -> Result<Box<[Pocket]>> {
             bail!("pocket is not an object: {pocket_val}");
         };
         let volume = json_i32(obj.get("volume"), "pocket.volume")?;
-        let (has_contents, item_id, quantity, item_type, has_durability, durability) =
-            match obj.get("contents") {
-                // `relay_protocol::bsatn` renders Option<T> as a one-key
-                // object: `{"some": payload}` or `{"none": {}}`.
-                Some(Value::Object(c)) if c.contains_key("some") => {
-                    let inner = &c["some"];
-                    let Value::Object(contents) = inner else {
-                        bail!("contents.some is not an object: {inner}");
-                    };
-                    let item_id = json_i32(contents.get("item_id"), "contents.item_id")?;
-                    let quantity = json_i32(contents.get("quantity"), "contents.quantity")?;
-                    let item_type = match contents.get("item_type") {
-                        Some(Value::Object(t)) if t.contains_key("Item") => Pocket::ITEM,
-                        Some(Value::Object(t)) if t.contains_key("Cargo") => Pocket::CARGO,
-                        other => bail!("contents.item_type unexpected: {other:?}"),
-                    };
-                    let (has_durability, durability) = match contents.get("durability") {
-                        Some(Value::Object(d)) if d.contains_key("some") => {
-                            let v = d["some"].as_i64().and_then(|n| i32::try_from(n).ok());
-                            (true, v.unwrap_or(0))
-                        }
-                        _ => (false, 0),
-                    };
-                    (
-                        true,
-                        item_id,
-                        quantity,
-                        item_type,
-                        has_durability,
-                        durability,
-                    )
-                }
-                _ => (false, 0, 0, Pocket::ITEM, false, 0),
-            };
+        let (has_contents, item_id, quantity, item_type, has_durability, durability) = match obj.get("contents") {
+            // `relay_protocol::bsatn` renders Option<T> as a one-key
+            // object: `{"some": payload}` or `{"none": {}}`.
+            Some(Value::Object(c)) if c.contains_key("some") => {
+                let inner = &c["some"];
+                let Value::Object(contents) = inner else {
+                    bail!("contents.some is not an object: {inner}");
+                };
+                let item_id = json_i32(contents.get("item_id"), "contents.item_id")?;
+                let quantity = json_i32(contents.get("quantity"), "contents.quantity")?;
+                let item_type = match contents.get("item_type") {
+                    Some(Value::Object(t)) if t.contains_key("Item") => Pocket::ITEM,
+                    Some(Value::Object(t)) if t.contains_key("Cargo") => Pocket::CARGO,
+                    other => bail!("contents.item_type unexpected: {other:?}"),
+                };
+                let (has_durability, durability) = match contents.get("durability") {
+                    Some(Value::Object(d)) if d.contains_key("some") => {
+                        let v = d["some"].as_i64().and_then(|n| i32::try_from(n).ok());
+                        (true, v.unwrap_or(0))
+                    }
+                    _ => (false, 0),
+                };
+                (true, item_id, quantity, item_type, has_durability, durability)
+            }
+            _ => (false, 0, 0, Pocket::ITEM, false, 0),
+        };
         out.push(Pocket {
             volume,
             has_contents,
@@ -1959,9 +1846,7 @@ fn decode_i32_array(cell: &Cell, ctx: &str) -> Result<Box<[i32]>> {
     };
     let mut out = Vec::with_capacity(arr.len());
     for (i, v) in arr.iter().enumerate() {
-        let n = v
-            .as_i64()
-            .ok_or_else(|| anyhow!("{ctx}[{i}]: expected i64, got {v}"))?;
+        let n = v.as_i64().ok_or_else(|| anyhow!("{ctx}[{i}]: expected i64, got {v}"))?;
         out.push(i32::try_from(n).map_err(|_| anyhow!("{ctx}[{i}]: i32 overflow"))?);
     }
     Ok(out.into())
@@ -1972,9 +1857,7 @@ fn decode_timestamp_micros(cell: &Cell, ctx: &str) -> Result<i64> {
         Cell::Bigint(Some(n)) => Ok(*n),
         Cell::Jsonb(Value::Object(obj)) => {
             if let Some(v) = obj.get("__timestamp_micros_since_unix_epoch__") {
-                return v
-                    .as_i64()
-                    .ok_or_else(|| anyhow!("{ctx}: timestamp not i64"));
+                return v.as_i64().ok_or_else(|| anyhow!("{ctx}: timestamp not i64"));
             }
             bail!("{ctx}: unexpected timestamp object {obj:?}")
         }
@@ -2018,10 +1901,7 @@ fn decode_schedule_at_timestamp(cell: &Cell, ctx: &str) -> Result<Option<i64>> {
     };
     // Presence of the micros key distinguishes the Time arm from Interval.
     if let Some(v) = obj.get("__timestamp_micros_since_unix_epoch__") {
-        return Ok(Some(
-            v.as_i64()
-                .ok_or_else(|| anyhow!("{ctx}: timestamp not i64"))?,
-        ));
+        return Ok(Some(v.as_i64().ok_or_else(|| anyhow!("{ctx}: timestamp not i64"))?));
     }
     Ok(None)
 }
@@ -2032,10 +1912,7 @@ fn sum_variant_snake(cell: &Cell, ctx: &str) -> Result<String> {
     let Value::Object(obj) = json else {
         bail!("{ctx}: expected object, got {json}");
     };
-    let key = obj
-        .keys()
-        .next()
-        .ok_or_else(|| anyhow!("{ctx}: empty sum object"))?;
+    let key = obj.keys().next().ok_or_else(|| anyhow!("{ctx}: empty sum object"))?;
     Ok(pascal_to_snake(key))
 }
 
@@ -2097,9 +1974,7 @@ fn cell_i32(cell: &Cell, ctx: &str) -> Result<i32> {
 /// U32 is mapped to `Cell::Bigint` by relay-protocol.
 fn cell_u32(cell: &Cell, ctx: &str) -> Result<u32> {
     match cell {
-        Cell::Bigint(Some(n)) => {
-            u32::try_from(*n).map_err(|_| anyhow!("{ctx}: Bigint {n} out of u32 range"))
-        }
+        Cell::Bigint(Some(n)) => u32::try_from(*n).map_err(|_| anyhow!("{ctx}: Bigint {n} out of u32 range")),
         _ => bail!("{ctx}: expected Bigint, got {cell:?}"),
     }
 }
@@ -2114,9 +1989,7 @@ fn cell_string(cell: &Cell, ctx: &str) -> Result<String> {
 /// U8 is mapped to `Cell::Smallint` by relay-protocol.
 fn cell_u8(cell: &Cell, ctx: &str) -> Result<u8> {
     match cell {
-        Cell::Smallint(Some(n)) => {
-            u8::try_from(*n).map_err(|_| anyhow!("{ctx}: Smallint {n} out of u8 range"))
-        }
+        Cell::Smallint(Some(n)) => u8::try_from(*n).map_err(|_| anyhow!("{ctx}: Smallint {n} out of u8 range")),
         Cell::Smallint(None) => bail!("{ctx}: Smallint is NULL"),
         other => bail!("{ctx}: expected Smallint, got {other:?}"),
     }
@@ -2126,6 +1999,116 @@ fn cell_bool(cell: &Cell, ctx: &str) -> Result<bool> {
     match cell {
         Cell::Bool(Some(b)) => Ok(*b),
         _ => bail!("{ctx}: expected Bool, got {cell:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fixed-offset fast readers
+//
+// BSATN product rows are concatenated little-endian fields with no padding or
+// tags, so a row whose leading fields are all fixed-width primitives can be
+// read by offset instead of the generic [`bsatn::decode_row`] path (which
+// allocates a `Vec<Cell>` per row). `location_state` (~13M rows per region
+// seed) and `resource_state` qualify: every field is a fixed primitive, and
+// the generic path is the hot cost of a seed. When the layout does not fit
+// (schema drift, reordered columns, a variable-width field preceding the
+// target), `try_from_fields` yields `None` and callers fall back to the
+// generic decoder — the fast readers are an optimization, never a semantic
+// change.
+// ---------------------------------------------------------------------------
+
+/// Fixed byte width of a BSATN primitive, or `None` for variable-width kinds.
+fn fixed_width(ty: &MirroredType) -> Option<usize> {
+    Some(match ty {
+        MirroredType::Bool | MirroredType::U8 | MirroredType::I8 => 1,
+        MirroredType::U16 | MirroredType::I16 => 2,
+        MirroredType::U32 | MirroredType::I32 | MirroredType::F32 => 4,
+        MirroredType::U64 | MirroredType::I64 | MirroredType::F64 => 8,
+        MirroredType::U128 | MirroredType::I128 => 16,
+        MirroredType::U256 | MirroredType::I256 => 32,
+        _ => return None,
+    })
+}
+
+/// Byte offset of `name` in a row whose preceding fields (and `name` itself)
+/// are all fixed-width primitives; `None` otherwise.
+fn fixed_field_offset(fields: &[MirroredField], schema: &MirroredSchema, name: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    for field in fields {
+        let width = fixed_width(schema.resolve(&field.ty))?;
+        if field.name.as_deref() == Some(name) {
+            return Some(offset);
+        }
+        offset += width;
+    }
+    None
+}
+
+fn read_u64(row: &[u8], off: usize) -> Option<u64> {
+    let b: [u8; 8] = row.get(off..off + 8)?.try_into().ok()?;
+    Some(u64::from_le_bytes(b))
+}
+
+fn read_i32(row: &[u8], off: usize) -> Option<i32> {
+    let b: [u8; 4] = row.get(off..off + 4)?.try_into().ok()?;
+    Some(i32::from_le_bytes(b))
+}
+
+fn read_u32(row: &[u8], off: usize) -> Option<u32> {
+    read_i32(row, off).map(|v| v as u32)
+}
+
+/// Fixed-offset reader for `location_state` rows.
+#[derive(Debug, Clone, Copy)]
+pub struct LocationFast {
+    entity_id: usize,
+    x: usize,
+    z: usize,
+    dimension: usize,
+}
+
+impl LocationFast {
+    pub fn try_from_fields(fields: &[MirroredField], schema: &MirroredSchema) -> Option<Self> {
+        Some(Self {
+            entity_id: fixed_field_offset(fields, schema, "entity_id")?,
+            x: fixed_field_offset(fields, schema, "x")?,
+            z: fixed_field_offset(fields, schema, "z")?,
+            dimension: fixed_field_offset(fields, schema, "dimension")?,
+        })
+    }
+
+    #[inline]
+    pub fn decode(&self, row: &[u8]) -> Option<LocationRow> {
+        Some(LocationRow {
+            entity_id: read_u64(row, self.entity_id)?,
+            x: read_i32(row, self.x)?,
+            z: read_i32(row, self.z)?,
+            dimension: read_u32(row, self.dimension)?,
+        })
+    }
+}
+
+/// Fixed-offset reader for `resource_state` rows.
+#[derive(Debug, Clone, Copy)]
+pub struct ResourceFast {
+    entity_id: usize,
+    resource_id: usize,
+}
+
+impl ResourceFast {
+    pub fn try_from_fields(fields: &[MirroredField], schema: &MirroredSchema) -> Option<Self> {
+        Some(Self {
+            entity_id: fixed_field_offset(fields, schema, "entity_id")?,
+            resource_id: fixed_field_offset(fields, schema, "resource_id")?,
+        })
+    }
+
+    #[inline]
+    pub fn decode(&self, row: &[u8]) -> Option<ResourceRow> {
+        Some(ResourceRow {
+            entity_id: read_u64(row, self.entity_id)?,
+            resource_id: read_i32(row, self.resource_id)?,
+        })
     }
 }
 
@@ -2144,10 +2127,7 @@ mod tests {
     #[test]
     fn decode_optional_location_accepts_bare_and_wrapped() {
         let bare = Cell::Jsonb(json!({"x": 24521, "z": 18473, "dimension": 1}));
-        assert_eq!(
-            decode_optional_location(&bare).unwrap(),
-            (true, 24521, 18473, 1)
-        );
+        assert_eq!(decode_optional_location(&bare).unwrap(), (true, 24521, 18473, 1));
         let wrapped = Cell::Jsonb(json!({"some": {"x": 1, "z": 2, "dimension": 1}}));
         assert_eq!(decode_optional_location(&wrapped).unwrap(), (true, 1, 2, 1));
         assert_eq!(

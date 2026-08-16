@@ -34,18 +34,12 @@ impl LocationDimStore {
 
     /// Dimension for `entity_id`, or overworld when unknown.
     pub fn get_or_overworld(&self, entity_id: u64) -> u32 {
-        self.by_entity
-            .get(&entity_id)
-            .copied()
-            .unwrap_or(OVERWORLD_DIMENSION)
+        self.by_entity.get(&entity_id).copied().unwrap_or(OVERWORLD_DIMENSION)
     }
 
     /// All entity ids currently mapped to `dimension` (interior only).
     pub fn entities_in(&self, dimension: u32) -> &[u64] {
-        self.by_dimension
-            .get(&dimension)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+        self.by_dimension.get(&dimension).map(Vec::as_slice).unwrap_or(&[])
     }
 
     pub fn upsert(&mut self, row: LocationDimRow) {
@@ -56,17 +50,11 @@ impl LocationDimStore {
         if let Some(old_dim) = self.by_entity.insert(row.entity_id, row.dimension) {
             if old_dim != row.dimension {
                 remove_from_dim(&mut self.by_dimension, old_dim, row.entity_id);
-                self.by_dimension
-                    .entry(row.dimension)
-                    .or_default()
-                    .push(row.entity_id);
+                self.by_dimension.entry(row.dimension).or_default().push(row.entity_id);
             }
             return;
         }
-        self.by_dimension
-            .entry(row.dimension)
-            .or_default()
-            .push(row.entity_id);
+        self.by_dimension.entry(row.dimension).or_default().push(row.entity_id);
     }
 
     pub fn delete(&mut self, entity_id: u64) {
@@ -97,10 +85,7 @@ mod tests {
     use super::*;
 
     fn row(entity_id: u64, dimension: u32) -> LocationDimRow {
-        LocationDimRow {
-            entity_id,
-            dimension,
-        }
+        LocationDimRow { entity_id, dimension }
     }
 
     #[test]
