@@ -1,8 +1,7 @@
 # relay-cache
 
-Same-host in-memory read cache over the relay fleet. Subscribes to each
-regional frontend on loopback (`ws://127.0.0.1:<port>`, v2), holds claim /
-building / inventory / player tables in columnar memory, and serves HTTP
+Same-host in-memory read cache over the BitCraft mirror fleet. Holds claim /
+building / inventory / player tables in columnar memory and serves HTTP
 queries on `127.0.0.1:8089` (JSON by default; protobuf via
 `Accept: application/x-protobuf`). A public WebSocket
 (`/internal/dim-buildings/ws`, nginx-proxied) pushes housing-interior
@@ -11,10 +10,22 @@ payload is non-PII u64 ids so other clients may use it. Only
 `/internal/stats` stays unproxied. Public clients use the HTTP read API
 or the dim-buildings WS.
 
-Replaces the cross-host polling model of `bitcraft-relay-sync` for
-hot-path reads — no 5-minute snapshot staleness, no Postgres round-trip.
+The crate runs in **two modes** with identical stores, HTTP API, and
+dim-buildings WS:
 
-## Run
+1. **Standalone WebSocket mode** (the `relay-cache` binary, unchanged
+   behavior): discovers the regional mirror frontends (`/v1/mirrors` or
+   systemd units) and subscribes to each over `ws://127.0.0.1:<port>` (v2),
+   decoding the BSATN subscription stream per region.
+2. **Embedded mode** (`--bitcraft-cache` on this workspace's
+   `spacetimedb-standalone`): the mirror's already-decoded upstream batches
+   feed the stores in-process via the `public-mirror` observer seam
+   (`src/feed.rs`) — no WebSocket hop, no re-encode/re-decode of the
+   subscription stream, no second subscription evaluation, and no
+   per-hexite follow-up subscription set. See the repo's
+   [`BITCRAFT-FORK.md`](../../BITCRAFT-FORK.md).
+
+## Run (standalone WebSocket mode)
 
 ```sh
 cargo run -p relay-cache --release
