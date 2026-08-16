@@ -27,6 +27,7 @@ members = [
   "crates/physical-plan",
   "crates/primitives",
   "crates/public-mirror",
+  "crates/relay-cache",
   "crates/query",
   "crates/runtime",
   "crates/sats",
@@ -341,6 +342,12 @@ unicode-normalization = "0.1.23"
 url = "2.3.1"
 urlencoding = "2.1.2"
 uuid = { version = "1.18.1", default-features = false }
+
+# relay-cache (BitCraft embedded read cache) dependencies.
+dashmap = "6"
+prost = "0.13"
+rustls = { version = "0.23", features = ["ring"] }
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 
 # Pinned to a specific version rather than allowing SemVer fuzzy resolution
 # because our flake references the specific version of this library.

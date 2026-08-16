@@ -1,0 +1,61 @@
+[package]
+name = "relay-cache"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/ekscrypto/spacetimedb-bitcraft-mirror"
+description = "BitCraft read cache: standalone WebSocket-mode binary + embedded in-process mode for spacetimedb-bitcraft-mirror"
+
+[lib]
+name = "relay_cache"
+path = "src/lib.rs"
+
+[[bin]]
+name = "relay-cache"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
+futures-util = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+url = { workspace = true }
+rustls = { workspace = true }
+
+axum = { workspace = true, features = ["ws", "macros"] }
+tower-http = { workspace = true, features = ["trace"] }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+prost = { workspace = true }
+
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+anyhow = { workspace = true }
+
+clap = { workspace = true, features = ["env"] }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+sysinfo = { workspace = true }
+hashbrown = { workspace = true, features = ["default-hasher"] }
+hex = { workspace = true }
+reqwest = { workspace = true }
+
+# SpacetimeDB in-repo crates (this workspace's v2.7.1) — the mirror this crate
+# talks to (or embeds into) speaks exactly these wire formats.
+spacetimedb-sats = { workspace = true }
+spacetimedb-client-api-messages = { workspace = true }
+
+# Shared relay crates from the sibling spacetimedb-relay repo (schema parsing +
+# BSATN row decode, and legacy systemd-unit discovery for the WS-mode binary).
+relay-protocol = { path = "../../../spacetimedb-relay/crates/relay-protocol" }
+relay-coordinator = { path = "../../../spacetimedb-relay/crates/relay-coordinator" }
+
+[build-dependencies]
+prost-build = "0.13"
+
+[dev-dependencies]
+tempfile = "3"

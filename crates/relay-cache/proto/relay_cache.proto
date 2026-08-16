@@ -1,0 +1,316 @@
+syntax = "proto3";
+
+package relay_cache;
+
+// Mirrors the JSON claim object from GET /claim/:entity_id and name-search hits.
+message Claim {
+  uint64 entity_id = 1;
+  string name = 2;
+  uint64 owner_player_entity_id = 3;
+  uint64 owner_building_entity_id = 4;
+  bool neutral = 5;
+  uint32 region = 6;
+  // Enrichment fields (populated on PK lookup; search may set tier + owner username).
+  optional string owner_player_username = 7;
+  optional int32 supplies = 8;
+  optional uint32 treasury = 9;
+  optional float building_maintenance = 10;
+  optional int32 num_tiles = 11;
+  optional float tile_cost = 12;
+  optional double upkeep_cost = 13;
+  // Unix milliseconds.
+  optional int64 supplies_run_out = 14;
+  optional uint32 supplies_purchase_threshold = 15;
+  optional float supplies_purchase_price = 16;
+  optional int32 location_x = 17;
+  optional int32 location_z = 18;
+  optional uint32 location_dimension = 19;
+  optional int32 tier = 20;
+  optional int32 tech_researching = 21;
+  optional int64 tech_start_timestamp = 22;
+  repeated ResearchedTech researched_techs = 23;
+}
+
+message ResearchedTech {
+  int32 id = 1;
+  string name = 2;
+  string description = 3;
+  int32 tier = 4;
+  string tech_type = 5;
+  int32 supplies_cost = 6;
+  int32 research_time = 7;
+  repeated int32 requirements = 8;
+  int32 members = 9;
+  int32 area = 10;
+  repeated int32 unlocks_techs = 11;
+}
+
+// Wrapper for GET /claim?name=… (JSON returns a bare array).
+message ClaimList {
+  repeated Claim claims = 1;
+}
+
+message ClaimSummary {
+  uint64 entity_id = 1;
+  string name = 2;
+  uint32 region = 3;
+}
+
+message InventoryItem {
+  int32 item_id = 1;
+  // "Item" | "Cargo"
+  string item_type = 2;
+  int64 quantity = 3;
+}
+
+message BuildingInventory {
+  uint64 entity_id = 1;
+  optional string name = 2;
+  optional string nickname = 3;
+  repeated InventoryItem items = 4;
+}
+
+message Entrance {
+  uint64 entity_id = 1;
+  optional string name = 2;
+  optional string nickname = 3;
+}
+
+message DimensionGroup {
+  uint32 dimension_id = 1;
+  // "overworld" | "building_interior" | "unknown"
+  string kind = 2;
+  optional Entrance entrance = 3;
+  repeated BuildingInventory buildings = 4;
+}
+
+message ClaimInventory {
+  ClaimSummary claim = 1;
+  repeated DimensionGroup dimensions = 2;
+}
+
+message ClaimMember {
+  uint64 entity_id = 1;
+  uint64 claim_entity_id = 2;
+  uint64 player_entity_id = 3;
+  string user_name = 4;
+  // Roles (upstream claim_member_state booleans).
+  bool inventory_permission = 5; // storage access
+  bool build_permission = 6;
+  bool officer_permission = 7;   // admin
+  bool co_owner_permission = 8;
+  // Unix seconds from player_state.sign_in_timestamp (BitJita lastLogin).
+  optional int64 last_login_timestamp = 9;
+  // Unix seconds from mobile_entity_state.timestamp (ms → s). Survives logout.
+  optional int64 last_active_timestamp = 10;
+  // Skill levels (same source as former /citizens).
+  repeated CitizenSkill skills = 11;
+  // Hex Coin total across personal bags (item_id == 1).
+  int64 hexcoins = 12;
+}
+
+message ClaimMemberList {
+  ClaimSummary claim = 1;
+  repeated ClaimMember members = 2;
+  int32 count = 3;
+  // Shared skill id → name map (same shape as former /citizens).
+  repeated SkillNameEntry skill_names = 4;
+}
+
+message CitizenSkill {
+  int32 skill_id = 1;
+  int64 level = 2;
+  int64 xp = 3;
+}
+
+message ClaimCitizen {
+  uint64 entity_id = 1;
+  string user_name = 2;
+  repeated CitizenSkill skills = 3;
+  optional int64 last_login_timestamp = 4;
+  optional int64 last_active_timestamp = 5;
+}
+
+message SkillNameEntry {
+  int32 skill_id = 1;
+  string name = 2;
+}
+
+message ClaimCitizens {
+  ClaimSummary claim = 1;
+  repeated ClaimCitizen citizens = 2;
+  repeated SkillNameEntry skill_names = 3;
+}
+
+message PlayerSkill {
+  int32 skill_id = 1;
+  string name = 2;
+  int64 level = 3;
+  int64 xp = 4;
+}
+
+message PlayerSkills {
+  Player player = 1;
+  repeated PlayerSkill skills = 2;
+}
+
+message MemberHexcoins {
+  uint64 player_entity_id = 1;
+  string user_name = 2;
+  int64 hexcoins = 3;
+  bool has_storage_access = 4;
+}
+
+message ClaimHexcoins {
+  ClaimSummary claim = 1;
+  repeated MemberHexcoins members = 2;
+}
+
+// Mirrors GET /player/:entity_id and name-search hits.
+message Player {
+  uint64 entity_id = 1;
+  string username = 2;
+  uint32 region = 3;
+  // Unix seconds from player_state.sign_in_timestamp.
+  optional int64 last_login_timestamp = 4;
+  optional bool signed_in = 5;
+  // Unix seconds from mobile_entity_state.timestamp (ms → s). Survives logout;
+  // approximates in-game "last active" (private player_timestamp_state).
+  optional int64 last_active_timestamp = 6;
+}
+
+message PlayerList {
+  repeated Player players = 1;
+}
+
+message PlayerInventoryBag {
+  uint64 entity_id = 1;
+  string name = 2;
+  optional string nickname = 3;
+  // "pockets" | "toolbelt" | "wallet" | "bank" | "wagon" | "cache" |
+  // "boat" | "recovery" | "deployable"
+  string category = 4;
+  optional uint64 claim_entity_id = 5;
+  optional string claim_name = 6;
+  repeated InventoryItem items = 7;
+}
+
+message PlayerInventory {
+  Player player = 1;
+  repeated PlayerInventoryBag inventories = 2;
+}
+
+message HouseSummary {
+  uint64 entity_id = 1;
+  string name = 2;
+  uint32 region = 3;
+}
+
+message PlayerHousing {
+  // "ok" | "noHouse"
+  string status = 1;
+  Player player = 2;
+  optional HouseSummary house = 3;
+  repeated BuildingInventory buildings = 4;
+}
+
+// Output stack from crafting_recipe_desc.crafted_item_stacks.
+message CraftedItem {
+  int32 item_id = 1;
+  int64 quantity = 2;
+  // "Item" | "Cargo"
+  string item_type = 3;
+}
+
+// Unified craft row from progressive_action_state + passive_craft_state,
+// enriched with recipe outputs and building/owner labels.
+message Craft {
+  uint64 entity_id = 1;
+  int32 recipe_id = 2;
+  int64 craft_count = 3;
+  int64 progress = 4;
+  int64 total_actions_required = 5;
+  bool completed = 6;
+  uint64 owner_entity_id = 7;
+  string owner_username = 8;
+  uint64 building_entity_id = 9;
+  string building_name = 10;
+  uint64 claim_entity_id = 11;
+  repeated CraftedItem crafted_item = 12;
+  bool is_passive = 13;
+  bool is_public = 14;
+}
+
+message ClaimCrafts {
+  ClaimSummary claim = 1;
+  repeated Craft crafts = 2;
+  int32 count = 3;
+}
+
+message PlayerCrafts {
+  Player player = 1;
+  repeated Craft crafts = 2;
+  int32 count = 3;
+}
+
+// Hexite Deposit from unowned claim_state rows (owner_player_entity_id=0,
+// name prefix "{0} (N: {1}, E: {2})|~Hexite Deposit|"; coords in claim.name).
+// Respawn via claim_local world x/z ⋈ resource_state location ⋈
+// resource_growth_timer (authoritative scheduled reducer row), falling back
+// to legacy growth_state when no timer row exists.
+// Active deposits omit respawn_at (and status). Depleted deposits set
+// respawn_at from resource_growth_timer.scheduled_at (Depleted → Hexite).
+// status="unknown" when the claim→resource join misses (not harvestable).
+message HexiteDeposit {
+  int32 north = 1;
+  int32 east = 2;
+  optional uint64 entity_id = 3;
+  optional string name = 4;
+  // ISO-8601 UTC from resource_growth_timer.scheduled_at (preferred) or
+  // growth_state.end_timestamp (legacy fallback); absent when harvestable
+  // or when status is set.
+  optional string respawn_at = 5;
+  // "respawning" = depleted, no growth timer/state row visible (rare).
+  // "unknown" = claim→resource location join failed (do not treat as harvestable).
+  // Prefer respawn_at when present.
+  optional string status = 6;
+  optional uint32 region = 7;
+}
+
+message HexiteDepositList {
+  repeated HexiteDeposit deposits = 1;
+  int32 count = 2;
+}
+
+// Building labels attached to a storage log entry.
+message StorageLogBuilding {
+  uint64 entity_id = 1;
+  optional string name = 2;
+  optional string nickname = 3;
+}
+
+// One storage_log_state row, enriched for forensics.
+message StorageLogEntry {
+  uint64 id = 1;
+  uint32 region = 2;
+  // Storage building that was deposited to / withdrawn from.
+  StorageLogBuilding building = 3;
+  optional uint64 claim_entity_id = 4;
+  optional string claim_name = 5;
+  uint64 player_entity_id = 6;
+  string player_username = 7;
+  // "deposit" | "withdraw" | "reserved"
+  string action = 8;
+  int32 item_id = 9;
+  // "Item" | "Cargo"
+  string item_type = 10;
+  int32 quantity = 11;
+  // ISO-8601 UTC from timestamp micros.
+  string timestamp = 12;
+  int32 days_since_epoch = 13;
+}
+
+message StorageLogList {
+  repeated StorageLogEntry logs = 1;
+  int32 count = 2;
+}
