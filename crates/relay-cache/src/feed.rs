@@ -10,10 +10,14 @@
 //! re-encoding the subscription stream, and without a second subscription
 //! evaluation:
 //!
-//! - seed batches build a staging [`RegionStore`] off-lock; the first live
-//!   batch (or the `on_live` dispatch, for a region with no live traffic yet)
-//!   swaps it in under the write lock, marks it ready, and re-indexes the
-//!   interest members — the same lifecycle as `shard.rs`'s bulk load;
+//! - seed batches (and live updates interleaved among them — a region with
+//!   ambient traffic always has some) build a staging [`RegionStore`]
+//!   off-lock; the `on_live` dispatch — which the mirror sends strictly
+//!   after every seed has been dispatched, before it accepts clients — swaps
+//!   it in under the write lock, marks it ready, and re-indexes the interest
+//!   members. `on_live` is the **only** finalize trigger: a live batch while
+//!   still seeding is an interleaved post-snapshot update, not a go-live
+//!   signal;
 //! - live batches take the write lock per batch and run the same
 //!   `apply_rows` path (decode → touch hooks → columnar upsert) with the
 //!   same `TouchBatch` semantics for the dim-buildings WS;
@@ -209,7 +213,8 @@ impl MirrorObserver for FeedManager {
 }
 
 enum Phase {
-    /// Accumulating seed rows into a fresh store, not yet serving.
+    /// Accumulating seed rows (plus interleaved live updates) into a fresh
+    /// store, not yet serving. Only `on_live` promotes it.
     Seeding(Box<RegionStore>),
     /// Staging swapped in; live updates apply under the write lock.
     Live,
@@ -289,11 +294,23 @@ async fn run_worker(feed: Arc<RegionFeed>, mut rx: mpsc::Receiver<FeedMsg>) {
                                 "seed batch apply failed; snapshot may be incomplete"
                             );
                         }
-                    } else {
-                        if let Phase::Seeding(staging) = phase {
-                            finalize(&feed, staging);
-                            phase = Phase::Live;
+                    } else if let Phase::Seeding(staging) = &mut phase {
+                        // Interleaved live update while seeds still apply (a
+                        // region with ambient traffic always has some). The
+                        // applier is FIFO, so this update lands after its
+                        // table's seed; apply it into the staging store —
+                        // exactly what WS-mode's `expect_subscribe_applied`
+                        // forwarding does with pre-Applied transactions. Only
+                        // `on_live` finalizes.
+                        if let Err(e) = apply_update(&feed, staging, &update) {
+                            tracing::error!(
+                                target: "relay_cache::feed",
+                                region,
+                                error = %e,
+                                "interleaved live batch apply failed during seeding"
+                            );
                         }
+                    } else {
                         apply_live_update(&feed, &update);
                     }
                 }

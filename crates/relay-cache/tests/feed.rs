@@ -174,6 +174,19 @@ async fn feed_seed_live_lifecycle_marks_ready_and_attaches_hexite() {
         .await
         .expect("dispatch seed");
 
+    // A live update arriving while seeds are still applying (regions with
+    // ambient traffic always interleave some) must NOT finalize the snapshot —
+    // it belongs after its table's seed and applies into staging.
+    let interleaved = live_update(vec![ops(
+        "resource_state",
+        vec![],
+        vec![resource_row(503, HEXITE_RESOURCE_ID)],
+    )]);
+    manager
+        .on_updates(Arc::from("bitcraft-live-7"), 1, vec![interleaved])
+        .await
+        .expect("dispatch interleaved live update");
+
     // Not ready before live.
     settle().await;
     assert!(!handle.store.read().ready, "no readiness before on_live");
@@ -193,11 +206,14 @@ async fn feed_seed_live_lifecycle_marks_ready_and_attaches_hexite() {
     {
         let store = handle.store.read();
         assert!(store.ready, "ready after on_live");
-        // Only the tracked hexite resource is stored (the untracked one is
-        // dropped by ResourceSoA, matching the SQL-filter semantics).
-        assert_eq!(store.resource.len(), 1);
-        // Its overworld location attached x/z from the dimension-1 row.
-        assert!(!store.resource.any_missing_location());
+        // Tracked hexite resources only: 501 from the seed plus 503 from the
+        // interleaved pre-live update; the untracked one is dropped by
+        // ResourceSoA, matching the SQL-filter semantics.
+        assert_eq!(store.resource.len(), 2);
+        // 501's overworld location attached x/z from the dimension-1 row
+        // (503 has no location row yet — its location TU hasn't arrived).
+        let slot = store.resource.find_by_location(30, 40).expect("501 located");
+        assert_eq!(store.resource.entity_id[slot as usize], 501);
         // The interior location row is indexed; the untracked overworld row
         // is not (LocationDimStore skips overworld).
         assert_eq!(store.location_dim.len(), 1);
