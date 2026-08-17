@@ -1,337 +1,217 @@
-> **Unofficial fork.** This is [`ekscrypto/spacetimedb-public-mirror`](https://github.com/ekscrypto/spacetimedb-public-mirror),
-> a public BSL fork of Clockwork Labs SpacetimeDB **v2.7.1**. Not affiliated with
-> Clockwork Labs; not intended for upstream merge. Deep dive: [`FORK.md`](FORK.md).
+# spacetimedb-bitcraft-mirror
 
-## Why this fork exists
+A custom fork of **SpacetimeDB built specifically for mirroring BitCraft game
+servers** — all `bitcraft-live-*` region databases in **one process**, with a
+read-cache API for game tools embedded in that same process.
 
-Upstream SpacetimeDB is a module host: you publish WASM, clients call reducers,
-and the engine owns durable state. This fork adds **`--public-mirror-v1`**: an
-in-memory mode that **mirrors a remote v1 BSATN database** and fans out committed
-`TransactionUpdate`s to local subscribers **with the original upstream reducer
-call stack / provenance** (`reducer_call`, caller identity/connection, timestamp).
+This is not a generic SpacetimeDB deployment. It is a purpose-built mirroring
+appliance: point it at the BitCraft upstream, and it gives your community a
+low-latency, self-hosted copy of the live game data — both as the native
+SpacetimeDB WebSocket protocol and as plain HTTP/protobuf endpoints for
+claims, players, deposits and more.
 
-That provenance exists on the wire **only in protocol v1**, so mirroring is
-intentionally v1-scoped. The goal is a drop-in local SpacetimeDB endpoint that
-looks like the upstream shard to downstream `v1.bsatn.spacetimedb` clients,
-without re-applying mutations through synthetic reducers.
+> **Not affiliated.** BitCraft and SpacetimeDB are products of Clockwork
+> Labs, Inc. This is an unofficial community project operating a public
+> mirror; the upstream data and schema remain theirs. The reference
+> deployment serves [relay.bitcraftsync.app](https://relay.bitcraftsync.app).
 
-## Mirroring controls
+## Fork lineage
 
-Enable with `spacetimedb-standalone start --public-mirror-v1` plus one or more
-`--mirror` targets. Key flags (all require `--public-mirror-v1`):
+```
+clockworklabs/SpacetimeDB              official repository, pinned at v2.7.1
+        │  (BSL 1.1)
+        ▼
+ekscrypto/spacetimedb-public-mirror    adds --public-mirror-v1: in-memory
+        │                              mirroring of upstream v1 BSATN
+        │                              databases, preserving reducer
+        │                              call-stack provenance for subscribers
+        ▼
+ekscrypto/spacetimedb-bitcraft-mirror  ← you are here
+                                       BitCraft tuning: 14-region production
+                                       hardening, serialized seeding, async
+                                       lossy logging, and relay-cache
+                                       embedded behind --bitcraft-cache
+```
+
+- **Expect this fork to lag mainline SpacetimeDB.** The upstream pin is
+  deliberate (v2.7.1 is what the BitCraft early-access edge speaks), and
+  fixes are pulled in by cherry-pick from the parent fork rather than by
+  tracking `main` — see the merge policy in
+  [`BITCRAFT-FORK.md`](BITCRAFT-FORK.md). New upstream features may arrive
+  late or never here; security-relevant fixes are prioritized.
+- Both fork layers keep SpacetimeDB's Business Source License 1.1
+  ([`LICENSE.txt`](LICENSE.txt)). `crates/relay-cache` is MIT.
+
+## Topology
+
+```
+                 ┌──────────────────────────────────────────┐
+                 │     BitCraft upstream (Clockwork Labs)   │
+                 │     wss://bitcraft-early-access.         │
+                 │          spacetimedb.com                 │
+                 │                                          │
+                 │  bitcraft-live-global, -3, -7, -8, -9,   │
+                 │  -11, -12, -13, -14, -15, -17, -18,      │
+                 │  -19, -23          (14 databases)        │
+                 └────────────┬────────────────┬────────────┘
+                              │ 14 × mirrored WebSocket sessions
+                              │ (Brotli-compressed BSATN subscribe)
+                              ▼
+ ┌────────────────────────────────────────────────────────────────┐
+ │  spacetimedb-standalone — this fork, ONE process               │
+ │                                                                │
+ │   mirror sessions ──► in-memory relational store               │
+ │          │               (per-database, client-gated)          │
+ │          │                                                     │
+ │          └────────► relay-cache, embedded in-process           │
+ │                     (--bitcraft-cache: fed the mirror's        │
+ │                      already-decoded rows directly)            │
+ │                                                                │
+ │   loopback listeners:                                          │
+ │     127.0.0.1:3100   WS/HTTP for downstream subscribers        │
+ │     127.0.0.1:3130   /v1/mirrors status sidecar                │
+ │     127.0.0.1:8090   cache HTTP API + dim-buildings WebSocket  │
+ └──────────┬──────────────────────────────────┬──────────────────┘
+            │                                  │
+            ▼                                  ▼
+ ┌────────────────────────────────────────────────────────────────┐
+ │  nginx (TLS termination)                                       │
+ │                                                                │
+ │   wss://host:3000–3025/v1/database/<db>/subscribe → :3100      │
+ │   https://host/claim /player /deposits …         → :8090       │
+ └──────────┬─────────────────────────────────────────────────────┘
+            │
+            ▼
+   downstream clients: explorer UIs, claim/player tools,
+   dashboards, bots — native SpacetimeDB WS or plain HTTP
+```
+
+Any port in the 3000–3025 band serves **any** mirrored database — clients
+select a region by database name, not by port.
+
+## The read-cache endpoints (relay-cache)
+
+SpacetimeDB's WebSocket protocol is great for game clients, awkward for a
+quick "show me this claim's members" tool. The embedded cache keeps a
+query-shaped index of the interesting tables and serves them over plain
+HTTP (protobuf-encoded bodies; the `.proto` sources self-describe the API):
+
+| Endpoint | Serves |
+|---|---|
+| `/cache-health` | readiness: `{ready, regions[]}` |
+| `/claim?name=` · `/claim/:id` | claim lookup / detail |
+| `/claim/:id/inventory` | claim storage contents |
+| `/claim/:id/members` · `/citizens` | member list; citizens with skills + activity |
+| `/claim/:id/hexcoins` | per-member hexcoin totals |
+| `/claim/:id/crafts` | claim craft jobs |
+| `/player?name=` · `/player/:id` | player lookup / detail |
+| `/player/:id/inventory` · `/housing` · `/skills` · `/crafts` | per-player data |
+| `/deposits` | hexite deposit locations |
+| `/storage-logs` | storage chest access logs |
+| `/proto` · `/proto/:name` | protobuf schema sources |
+| `/internal/dim-buildings/ws` | WebSocket push: housing-interior building entity IDs per (region, dimension) — see [`crates/relay-cache/DIM-BUILDINGS-WS.md`](crates/relay-cache/DIM-BUILDINGS-WS.md) |
+| `/internal/stats` | loopback-only diagnostics (memory, row counts) — deliberately not proxied publicly |
+
+Full endpoint documentation: [`crates/relay-cache/README.md`](crates/relay-cache/README.md).
+
+### Why the cache runs inside the mirror process
+
+Previously the cache was a **separate `relay-cache` process** that opened its
+own WebSocket subscriptions against the mirrors. That meant, for every
+region: a mirror→cache WebSocket hop, a BSATN **re-encode** for the
+fan-out and a **re-decode** on ingest, and a **second full subscription
+evaluation** — every row was decoded twice and serialized over a socket in
+between.
+
+With `--bitcraft-cache`, the mirror's already-decoded upstream batches feed
+the cache stores **in-process**: each row is decoded once, nothing crosses a
+socket, and one process replaces N mirrors + 1 cache. Co-locating them also
+let the retention rules move to where the rows arrive (for example, keeping
+`location_state` rows for tracked hexite deposits directly at ingest), which
+removed the standalone cache's second per-deposit subscription set and its
+`HexiteLocationsMissing` reconnect failure class entirely.
+
+The standalone `relay-cache` binary still builds from `crates/relay-cache`
+(WebSocket mode, unchanged) — it remains the rollback/legacy deployment
+shape.
+
+## Quick start
+
+```sh
+cargo build -p spacetimedb-standalone --release
+
+./target/release/spacetimedb-standalone start \
+  --data-dir /tmp/bitcraft-mirror-data \
+  --listen-addr 127.0.0.1:3000 \
+  --jwt-pub-key-path /path/to/id_ecdsa.pub \
+  --jwt-priv-key-path /path/to/id_ecdsa \
+  --public-mirror-v1 \
+  --mirror-token-file /path/to/.developer-token \
+  --mirror wss://bitcraft-early-access.spacetimedb.com/bitcraft-live-7 \
+  --mirror wss://bitcraft-early-access.spacetimedb.com/bitcraft-live-8 \
+  --bitcraft-cache \
+  --cache-bind 127.0.0.1:8089
+```
+
+Add one `--mirror` per region database you want (production runs all 14).
+
+**Before deploying to real hardware**, read
+[`OVH-CLOUD-K5.md`](OVH-CLOUD-K5.md): the full 14-region mirror is
+memory-heavy (~36 GiB RSS) and extremely sensitive to storage stalls and
+mis-sized cgroup limits. That guide lists every host-level change
+(async-lossy logging already in this fork, vmtouch page pinning, nginx log
+buffering, swap removal, `MemoryHigh` sizing) that production required —
+with the diagnostics that catch each failure mode.
+
+## Mirroring mode reference
+
+Enable with `spacetimedb-standalone start --public-mirror-v1` plus one or
+more `--mirror` targets. Key flags (all require `--public-mirror-v1`):
 
 | Flag | Role |
 |------|------|
 | `--mirror <url>/<db>` | Upstream to mirror (repeatable). Local clients select by database name. |
 | `--mirror-token` / `--mirror-token-file` | Upstream bearer JWT (also `BITCRAFT_TOKEN`, `MIRROR_TOKEN`, `RELAY_UPSTREAM_TOKEN`, `MIRROR_TOKEN_FILE`). Shared across all mirrors. |
 | `--mirror-table <name>` | Limit upstream subscribe set (repeatable; default: all public user tables). Shared across all mirrors. |
-| `--mirror-subscribe-concurrency <n>` | Max mirrors that may run initial setup at once (default **1**). Slot held for connect + every table seed + local apply; released when that mirror goes `live`. |
-| `--coordinator-socket <path>` | Optional relay-coordinator Unix socket for cross-process subscribe serialization. |
+| `--mirror-subscribe-concurrency <n>` | Max mirrors that may run initial setup at once (default **1**; production keeps it at 1 — serialized seeding is a stability requirement, not a suggestion, on slower hosts). Slot held for connect + every table seed + local apply; released when that mirror goes `live`. |
 | `--mirror-status-listen-addr <addr>` | Isolated readiness listener (default `127.0.0.1:<main-port+1>`). |
 | `--reject-one-off-query` | Also reject `OneOffQuery` (allowed by default). `CallReducer` / `CallProcedure` are always rejected. |
+| `--bitcraft-cache` | Embed the relay-cache (this fork). Adds `--cache-bind` and `--cache-mem-ceiling-bytes`. |
 
-Status and per-table seed progress: `GET /v1/mirrors` (main port and the status
-sidecar). Example command line and seed/reconnect behavior: [`FORK.md`](FORK.md).
+Status and per-table seed progress: `GET /v1/mirrors` (main port and the
+status sidecar).
 
-## Caveat: clients stay offline until every mirror is live
+**Clients stay offline until every mirror is live.** Downstream WebSocket
+subscribe is rejected with HTTP 503 until **every** configured mirror
+reports `live`. This is intentional — clients must never see a half-seeded
+database or miss updates. A later disconnect on any mirror re-closes the
+gate until that mirror is `live` again. Poll the **status sidecar** during
+large seeds; the main HTTP port may not respond until seed apply finishes.
 
-In `--public-mirror-v1` mode, **downstream WebSocket subscribe is rejected with
-HTTP 503** until **every** configured mirror reports connectivity `live` on
-`GET /v1/mirrors`. Partial readiness is not enough — if any mirror is still
-`waiting` / `connecting` / `subscribing` / `disconnected`, all client connects
-fail with a message pointing at `/v1/mirrors`.
-
-This is intentional: seed apply can skip subscription eval / broadcast while
-catching up, without risk that a client sees a half-seeded database or misses
-updates. Poll the **status sidecar** during large seeds — the main HTTP port may
-not respond until seed apply finishes. Once all mirrors are `live`, clients are
-accepted; a later disconnect on any mirror closes the gate again until that
-mirror is back to `live`.
-
-## Provisioning differences (mirror vs normal standalone)
-
-| Normal standalone | `--public-mirror-v1` |
-|-------------------|----------------------|
-| You `spacetime publish` a module / schema | Schema is **fetched from upstream** at bootstrap; databases are registered as `HostType::Mirror` |
-| Durable disk storage by default | **Forced in-memory** storage (no durable mirror state across restarts) |
-| You choose database names / identities | Local DB name is the upstream database name; identity is derived (`public-mirror-v1` claims) |
-| Clients may connect as soon as the process listens | Clients **blocked until all mirrors are `live`** (see above) |
-| Full reducer / procedure surface | **Read-only fan-out**: `CallReducer` / `CallProcedure` rejected; optional `OneOffQuery` reject |
-
-You do not provision by publishing WASM into this process. You start with
-`--mirror` URLs, a token, optional `--mirror-table` filters, JWT key paths for
-local client auth, and a data dir (control metadata / logs — not the mirrored
-row store).
-
-## Operational differences in mirroring mode
-
-- **One process, many DBs.** Repeat `--mirror`; one `--listen-addr` serves all
-  mirrored names. Each DB has its own JobCores worker.
-- **Subscribe gate.** Initial connect/seed is serialized by
-  `--mirror-subscribe-concurrency` (and optionally `--coordinator-socket`). Live
-  mirrors do not hold a slot; reconnect must reacquire one.
-- **Readiness plane.** Prefer the isolated `/v1/mirrors` sidecar for orchestration
-  and load-balancer health while seeds are in progress.
-- **Reconnect / re-seed.** Seeds are idempotent (table truncate + insert in one
-  transaction). Large Brotli-compressed seeds use a stall-based subscribe timeout;
-  see [`FORK.md`](FORK.md).
-- **Not a general SpacetimeDB replacement.** No upstream merge path; BSL terms
-  still apply. For BitCraft relay fleet context and sibling checkouts, see
-  [`FORK.md`](FORK.md).
-
----
-
-<p align="center">
-    <a href="https://spacetimedb.com#gh-dark-mode-only" target="_blank">
-	<img width="320" src="./images/dark/logo.svg" alt="SpacetimeDB Logo">
-    </a>
-    <a href="https://spacetimedb.com#gh-light-mode-only" target="_blank">
-	<img width="320" src="./images/light/logo.svg" alt="SpacetimeDB Logo">
-    </a>
-</p>
-<p align="center">
-    <a href="https://spacetimedb.com#gh-dark-mode-only" target="_blank">
-        <img width="250" src="./images/dark/logo-text.svg" alt="SpacetimeDB">
-    </a>
-    <a href="https://spacetimedb.com#gh-light-mode-only" target="_blank">
-        <img width="250" src="./images/light/logo-text.svg" alt="SpacetimeDB">
-    </a>
-    <h3 align="center">
-        Development at the speed of light.
-    </h3>
-</p>
-<p align="center">
-    <a href="https://github.com/clockworklabs/spacetimedb"><img src="https://img.shields.io/github/v/release/clockworklabs/spacetimedb?color=%23ff00a0&include_prereleases&label=version&sort=semver&style=flat-square"></a>
-    &nbsp;
-    <a href="https://github.com/clockworklabs/spacetimedb"><img src="https://img.shields.io/badge/built_with-Rust-dca282.svg?style=flat-square"></a>
-    &nbsp;
-	<a href="https://github.com/clockworklabs/spacetimedb/actions"><img src="https://img.shields.io/github/actions/workflow/status/clockworklabs/spacetimedb/ci.yml?style=flat-square&branch=master"></a>
-    &nbsp;
-    <a href="https://status.spacetimedb.com"><img src="https://img.shields.io/uptimerobot/ratio/7/m784409192-e472ca350bb615372ededed7?label=cloud%20uptime&style=flat-square"></a>
-    &nbsp;
-    <a href="https://hub.docker.com/r/clockworklabs/spacetimedb"><img src="https://img.shields.io/docker/pulls/clockworklabs/spacetimedb?style=flat-square"></a>
-    &nbsp;
-    <a href="https://github.com/clockworklabs/spacetimedb/blob/master/LICENSE.txt"><img src="https://img.shields.io/badge/license-BSL_1.1-00bfff.svg?style=flat-square"></a>
-</p>
-<p align="center">
-    <a href="https://crates.io/crates/spacetimedb"><img src="https://img.shields.io/crates/d/spacetimedb?color=e45928&label=Rust%20Crate&style=flat-square"></a>
-    &nbsp;
-    <a href="https://www.nuget.org/packages/SpacetimeDB.Runtime"><img src="https://img.shields.io/nuget/dt/spacetimedb.runtime?color=0b6cff&label=NuGet%20Package&style=flat-square"></a>
-    &nbsp;
-    <a href="https://www.npmjs.com/package/spacetimedb"><img src="https://img.shields.io/npm/dm/spacetimedb?color=cb0000&label=npm&style=flat-square"></a>
-</p>
-<p align="center">
-    <a href="https://discord.gg/spacetimedb"><img src="https://img.shields.io/discord/1037340874172014652?label=discord&style=flat-square&color=5a66f6"></a>
-    &nbsp;
-    <a href="https://twitter.com/spacetime_db"><img src="https://img.shields.io/badge/twitter-Follow_us-1d9bf0.svg?style=flat-square"></a>
-    &nbsp;
-    <a href="https://clockworklabs.io/join"><img src="https://img.shields.io/badge/careers-Join_us-86f7b7.svg?style=flat-square"></a>
-    &nbsp;
-    <a href="https://www.linkedin.com/company/clockworklabs/"><img src="https://img.shields.io/badge/linkedin-Connect_with_us-0a66c2.svg?style=flat-square"></a>
-</p>
-
-<p align="center">
-    <a href="https://discord.gg/spacetimedb"><img height="25" src="./images/social/discord.svg" alt="Discord"></a>
-    &nbsp;
-    <a href="https://twitter.com/spacetime_db"><img height="25" src="./images/social/twitter.svg" alt="Twitter"></a>
-    &nbsp;
-    <a href="https://github.com/clockworklabs/spacetimedb"><img height="25" src="./images/social/github.svg" alt="GitHub"></a>
-    &nbsp;
-    <a href="https://twitch.tv/SpacetimeDB"><img height="25" src="./images/social/twitch.svg" alt="Twitch"></a>
-    &nbsp;
-    <a href="https://youtube.com/@SpacetimeDB"><img height="25" src="./images/social/youtube.svg" alt="YouTube"></a>
-    &nbsp;
-    <a href="https://www.linkedin.com/company/clockwork-labs/"><img height="25" src="./images/social/linkedin.svg" alt="LinkedIn"></a>
-    &nbsp;
-    <a href="https://stackoverflow.com/questions/tagged/spacetimedb"><img height="25" src="./images/social/stackoverflow.svg" alt="StackOverflow"></a>
-</p>
-
-<br>
-
-## What is SpacetimeDB?
-
-SpacetimeDB is a relational database that is also a server. You upload your application logic directly into the database, and clients connect to it without any server in between.
-
-Write your schema and business logic as a **module** in [Rust](https://spacetimedb.com/docs/quickstarts/rust), [C#](https://spacetimedb.com/docs/quickstarts/c-sharp), [TypeScript](https://spacetimedb.com/docs/quickstarts/typescript), or [C++](https://spacetimedb.com/docs/quickstarts/c-plus-plus). SpacetimeDB compiles it, runs it inside the database, and automatically synchronizes state to connected clients in real-time.
-
-Instead of deploying a web or game server that sits in between your clients and your database, your clients connect directly to the database and execute your application logic in your module. You can write all of your permission and authorization logic right inside your module just as you would in a normal server.
-
-This means that you can write your entire application in a single language and deploy it as a single binary. No more separate webserver, no more containers, no more Kubernetes, no more VMs, no more DevOps, no more caching later. Zero infrastructure to manage.
-
-<figure>
-    <img src="./images/basic-architecture-diagram.png" alt="SpacetimeDB Architecture" style="width:100%">
-    <figcaption align="center">
-        <p align="center"><b>SpacetimeDB application architecture</b><br /><sup><sub>(elements in white are provided by SpacetimeDB)</sub></sup></p>
-    </figcaption>
-</figure>
-
-SpacetimeDB is optimized for maximum speed and minimum latency. SpacetimeDB provides all the ACID guarantees of a traditional RDBMS, with all the speed of an optimized web server. All application state is held in memory for fast access, while a commit log on disk provides durability and crash recovery. The entire backend of our MMORPG [BitCraft Online](https://bitcraftonline.com) runs as a single SpacetimeDB module: chat, items, terrain, player positions, everything, synchronized to thousands of players in real-time.
-
-## Quick Start
-
-### 1. Install
-
-```bash
-# macOS / Linux
-curl -sSf https://install.spacetimedb.com | sh
-
-# Windows (PowerShell)
-iwr https://windows.spacetimedb.com -useb | iex
-```
-
-### 2. Log in
-
-```bash
-spacetime login
-```
-
-This opens a browser to authenticate with GitHub. Your identity is linked to your account so you can publish databases.
-
-### 3. Start developing
-
-```bash
-spacetime dev --template chat-react-ts
-```
-
-That is it. This creates a project from a template, publishes it to [Maincloud](https://spacetimedb.com/docs/how-to/deploy/maincloud), and watches for file changes, automatically rebuilding and republishing on save. See [pricing](https://spacetimedb.com/pricing) for details.
-
-## How It Works
-
-SpacetimeDB modules define **tables** (your data) and **reducers** (your logic). Clients connect, call reducers, and subscribe to tables. When data changes, SpacetimeDB pushes updates to subscribed clients automatically.
-
-```rust
-// Define a table
-#[spacetimedb::table(accessor = messages, public)]
-pub struct Message {
-    #[primary_key]
-    #[auto_inc]
-    id: u64,
-    sender: Identity,
-    text: String,
-}
-
-// Define a reducer (your API endpoint)
-#[spacetimedb::reducer]
-pub fn send_message(ctx: &ReducerContext, text: String) {
-    ctx.db.messages().insert(Message {
-        id: 0,
-        sender: ctx.sender,
-        text,
-    });
-}
-```
-
-On the client side, subscribe and get live updates:
-
-```typescript
-const [messages] = useTable(tables.message);
-// messages updates automatically when the server state changes.
-// No polling. No refetching.
-```
-
-## Language Support
-
-### Server Modules
-
-Write your database logic in any of these languages:
-
-| Language | Quickstart |
-|----------|-----------|
-| **Rust** | [Get started](https://spacetimedb.com/docs/quickstarts/rust) |
-| **C#** | [Get started](https://spacetimedb.com/docs/quickstarts/c-sharp) |
-| **TypeScript** | [Get started](https://spacetimedb.com/docs/quickstarts/typescript) |
-| **C++** | [Get started](https://spacetimedb.com/docs/quickstarts/c-plus-plus) |
-
-### Client SDKs
-
-Connect from any of these platforms:
-
-| SDK | Quickstart |
-|-----|-----------|
-| **TypeScript** (React, Next.js, Vue, Svelte, Angular, Node.js, Bun, Deno) | [Get started](https://spacetimedb.com/docs/quickstarts/react) |
-| **Rust** | [Get started](https://spacetimedb.com/docs/quickstarts/rust) |
-| **C#** (standalone and Unity) | [Get started](https://spacetimedb.com/docs/quickstarts/c-sharp) |
-| **C++** (Unreal Engine) | [Get started](https://spacetimedb.com/docs/quickstarts/c-plus-plus) |
-
-## Running with Docker
-
-```bash
-docker run --rm --pull always -p 3000:3000 clockworklabs/spacetime start
-```
-
-## Building from Source
-
-If you need features from `master` that have not been released yet:
-
-```bash
-# Prerequisites: Rust toolchain with wasm32-unknown-unknown target
-curl https://sh.rustup.rs -sSf | sh
-
-git clone https://github.com/clockworklabs/SpacetimeDB
-cd SpacetimeDB
-cargo build --locked --release -p spacetimedb-standalone -p spacetimedb-update -p spacetimedb-cli
-```
-
-Then install the binaries:
-
-<details>
-<summary>macOS / Linux</summary>
-
-```bash
-mkdir -p ~/.local/bin
-STDB_VERSION="$(./target/release/spacetimedb-cli --version | sed -n 's/.*spacetimedb tool version \([0-9.]*\);.*/\1/p')"
-mkdir -p ~/.local/share/spacetime/bin/$STDB_VERSION
-
-cp target/release/spacetimedb-update ~/.local/bin/spacetime
-cp target/release/spacetimedb-cli ~/.local/share/spacetime/bin/$STDB_VERSION
-cp target/release/spacetimedb-standalone ~/.local/share/spacetime/bin/$STDB_VERSION
-
-# Add to your shell config if not already present:
-export PATH="$HOME/.local/bin:$PATH"
-
-# Set the active version:
-spacetime version use $STDB_VERSION
-```
-</details>
-
-<details>
-<summary>Windows (PowerShell)</summary>
-
-```powershell
-$stdbDir = "$HOME\AppData\Local\SpacetimeDB"
-$stdbVersion = & ".\target\release\spacetimedb-cli" --version |
-    Select-String -Pattern 'spacetimedb tool version ([0-9.]+);' |
-    ForEach-Object { $_.Matches.Groups[1].Value }
-New-Item -ItemType Directory -Path "$stdbDir\bin\$stdbVersion" -Force | Out-Null
-
-Copy-Item "target\release\spacetimedb-update.exe" "$stdbDir\spacetime.exe"
-Copy-Item "target\release\spacetimedb-cli.exe" "$stdbDir\bin\$stdbVersion\"
-Copy-Item "target\release\spacetimedb-standalone.exe" "$stdbDir\bin\$stdbVersion\"
-
-# Add to your system PATH: %USERPROFILE%\AppData\Local\SpacetimeDB
-# Then in a new shell:
-spacetime version use $stdbVersion
-```
-</details>
-
-Verify with `spacetime --version`.
+Provisioning is nothing like a normal standalone: the schema is fetched
+from upstream at bootstrap, storage is forced in-memory (no durable mirror
+state across restarts), local database names/identities are derived from
+upstream, and the surface is read-only fan-out (`CallReducer` /
+`CallProcedure` rejected). You never `spacetime publish` into this process.
+Details, seed/reconnect behavior, and the coordinator socket:
+[`FORK.md`](FORK.md) and [`BITCRAFT-FORK.md`](BITCRAFT-FORK.md).
 
 ## Documentation
 
-Full documentation is available at **[spacetimedb.com/docs](https://spacetimedb.com/docs)**, including:
-
-- [Quickstart guides](https://spacetimedb.com/docs) for every supported language and framework
-- [Core concepts](https://spacetimedb.com/docs/core-concepts): tables, reducers, subscriptions, authentication
-- [Tutorials](https://spacetimedb.com/docs/tutorials/chat-app): chat app, Unity multiplayer, Unreal Engine multiplayer
-- [Deployment guide](https://spacetimedb.com/docs/how-to/deploy/maincloud): publishing to Maincloud
-- [CLI reference](https://spacetimedb.com/docs/reference/cli-reference)
-- [SQL reference](https://spacetimedb.com/docs/reference/sql-reference)
+- [`BITCRAFT-FORK.md`](BITCRAFT-FORK.md) — this fork's design decisions,
+  merge policy vs the parent fork, and what `--bitcraft-cache` adds
+- [`FORK.md`](FORK.md) — the parent fork's `--public-mirror-v1` mechanics
+- [`MULTI-MIRROR-UPSTREAM-RESETS.md`](MULTI-MIRROR-UPSTREAM-RESETS.md) and
+  [`MULTI-MIRROR-STARVATION.md`](MULTI-MIRROR-STARVATION.md) — the full
+  production incident post-mortems (why the hardening exists)
+- [`OVH-CLOUD-K5.md`](OVH-CLOUD-K5.md) — operator guide: running the
+  mirror on spinning-disk/legacy hardware
+- [`crates/relay-cache/README.md`](crates/relay-cache/README.md) — cache
+  API reference
+- Upstream's own README: [clockworklabs/SpacetimeDB](https://github.com/clockworklabs/SpacetimeDB)
 
 ## License
 
-SpacetimeDB is licensed under the [Business Source License 1.1 (BSL)](LICENSE.txt). It converts to the AGPL v3.0 with a linking exception after a few years. The linking exception means you are **not** required to open-source your own code if you use SpacetimeDB. You only need to contribute back changes to SpacetimeDB itself.
-
-**Why did we choose this license?**
-We chose to license SpacetimeDB under the MariaDB Business Source License for 4 years because we can't compete with AWS while also building our products for them.
-
-We chose GPLv3 with linking exception as the open source license because we want contributions merged back into mainline (just like Linux), but we don't want to make anyone else open source their own code (i.e. linking exception). 
+SpacetimeDB source in this repository is licensed under the **Business
+Source License 1.1** ([`LICENSE.txt`](LICENSE.txt)), © Clockwork Labs, Inc.
+`crates/relay-cache` is MIT. Both notices must stay conspicuous.
