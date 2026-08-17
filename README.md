@@ -132,8 +132,7 @@ removed the standalone cache's second per-deposit subscription set and its
 `HexiteLocationsMissing` reconnect failure class entirely.
 
 The standalone `relay-cache` binary still builds from `crates/relay-cache`
-(WebSocket mode, unchanged) — it remains the rollback/legacy deployment
-shape.
+(WebSocket mode) — the one-process topology above is the final shape.
 
 ## Quick start
 

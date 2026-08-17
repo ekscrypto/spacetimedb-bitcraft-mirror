@@ -22,7 +22,8 @@ process**, eliminating per region:
 the cache's ingestion path in-process (`RegionFeed`), so rows are decoded once
 per row by the cache instead of serialized over a socket and re-decoded.
 `bitcraft-relay` still builds the standalone `relay-cache` binary (WebSocket
-mode) from this crate via a path dependency until the fleet cuts over.
+mode) from this crate via a path dependency. Production cut over to the
+one-process topology on 2026-08-17; it is the final shape.
 
 ## Target topology
 
