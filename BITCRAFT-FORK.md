@@ -29,8 +29,11 @@ mode) from this crate via a path dependency until the fleet cuts over.
 One process, `--mirror` per region database, single `--listen-addr` for
 WebSocket clients, embedded cache on `--cache-bind` (default `127.0.0.1:8089`
 — same contract as the standalone `relay-cache`, so nginx and the explorer
-keep working unchanged). See `MULTI-MIRROR-STARVATION.md` (inherited) for why
-per-database client gating matters in this topology.
+keep working unchanged). See [`MULTI-MIRROR-STARVATION.md`](MULTI-MIRROR-STARVATION.md) (inherited) for why
+per-database client gating matters in this topology, and
+[`MULTI-MIRROR-UPSTREAM-RESETS.md`](MULTI-MIRROR-UPSTREAM-RESETS.md) (OPEN,
+2026-08-17) for the remaining upstream-initiated disconnect mode observed
+when the full fleet shares one process on the production host.
 
 ## Quick start (mirror + embedded cache)
 

@@ -1,5 +1,10 @@
 # Multi-mirror starvation analysis (single instance, N upstreams)
 
+> **Follow-up (2026-08-17):** after the fixes below, a *distinct* failure
+> mode remains where the upstream edge itself kills our connections
+> (RSTs + probe timeouts) once many mirrors share one process — tracked in
+> [`MULTI-MIRROR-UPSTREAM-RESETS.md`](MULTI-MIRROR-UPSTREAM-RESETS.md).
+
 > Analysis date: 2026-08-16. Line references are against fork HEAD `99972d1dd`
 > ("Fix silent live stalls: cold-reset on reconnect and probe upstream liveness").
 >
