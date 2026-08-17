@@ -2,12 +2,11 @@
 
 > First hard evidence: 2026-08-17 production switch attempt (01:13–01:26 UTC).
 > Status: **OPEN** — mechanism confirmed in the calibrated local repro
-> 2026-08-17; **mitigations 1–3 implemented 2026-08-17 and validated in the
-> same repro** (fleet converged 14/14 and held, vs baseline cascade that never
-> recovered; false-probe self-kills 6 → 0, probe kills 14 → 8, poll-gap
-> warnings 145 → 83 at the harsh `--cpus=1` end of the host-equivalent
-> band). Production-side confirmation (deploy + `pidstat` capture on the
-> next switch attempt) still pending.
+> 2026-08-17; mitigations 1–3 validated locally but the **2026-08-17 second
+> production attempt (10:22–10:31 UTC, mitigated build) still cascaded during
+> the unpaced cold-start tail** — death profile changed completely (6×
+> upstream EOF, zero self-inflicted probe/RST kills) but 37–51 s poll gaps
+> exceeded what the local repro modeled. See "Production attempt #2" below.
 > Sibling analysis: [`MULTI-MIRROR-STARVATION.md`](MULTI-MIRROR-STARVATION.md)
 > (fixed 2026-08-16) — that failure was *self-inflicted* (process-wide client
 > gate + internal cascade). This one originates **upstream of us**: the
@@ -72,6 +71,58 @@ not "socket silent" — **confirmed** (6 false vs 1 silent, repro);
 the `--cpus=4` control ran clean, matching the fast-laptop soak);
 (4) on the next production attempt with `pidstat`/`vmstat` capturing, CPU is
 pegged during the cascade — pending.
+
+## Production attempt #2 (2026-08-17 10:22–10:31 UTC, mitigated build `56de7e806`)
+
+Operator ran `switch-to-bitcraft-mirror.sh`; green started clean and reached
+11/14 live in ~7 min with zero deaths. Then, during the cold-start tail
+(regions 18/19/23 still seeding, 11 mirrors ingesting), six busy regions
+(7, 8, 9, 12, 14, 17) died within ~2.5 min; operator rolled back at 7/14
+live.
+
+**What the mitigations changed** (vs attempt #1 at 01:13):
+
+| | Attempt #1 (unmitigated) | Attempt #2 (mitigated) |
+|---|---|---|
+| Deaths | 9 | 6 |
+| Modes | 4 RST-without-close + 4 probe timeout + 1 EOF | **6× unexpected EOF only** |
+| Self-inflicted (probe) kills | 4 | **0** |
+| Attribution | correlate timestamps | instant (`database=` tags) |
+
+M1 (silence-aware probe) eliminated every self-inflicted death — no probe
+kills occurred despite poll gaps that would have false-killed sessions under
+the old logic. The deaths that remain are upstream-initiated closes under
+genuine deep starvation: **event-loop gaps hit 37.5 s (r18) and 51.3 s
+(r12)** — 6–8× the local mitigated repro's maximum (~6 s).
+
+**M3 (re-seed pacing) never engaged**: the cascade ran entirely inside the
+cold-start tail, where session 1 is unpaced by design. The dying regions
+never reached their (paced) reconnects before the rollback.
+
+**Telemetry gap (operator error):** the CPU capture died at 10:25:45 (the
+restart's `pkill` self-matched its own ssh session), so there is no
+CPU/iowait data for the cascade window, and post-rollback the cumulative
+`/proc` counters cannot isolate it. Consequently the deepest question is
+**unresolved**: whether the 37–51 s worker stalls were deeper CPU starvation
+than the 1-quota repro models, or **disk iowait inside task polls** (seed
+applies hitting the on-disk store — which would explain long gaps at modest
+CPU). The local repro cannot distinguish these: Docker's CFS quota produces
+full-speed bursts between throttles rather than a slow host's sustained
+queueing, and the container's page cache hides disk behavior.
+
+**Next steps specific to this attempt:**
+
+1. Pace seeding whenever any other mirror is live (not just reconnect
+   sessions) — directly targets the cold-start tail where both production
+   cascades occurred.
+2. Fixed capture for the next attempt: CPU **and iowait split** +
+   `/proc/diskstats` + per-process IO bytes, started from a pidfile-guarded
+   script (no `pkill` self-match), before green starts.
+3. If iowait confirms: the fix family changes from CPU scheduling to IO
+   (batch/relax durability for mirror stores, or keep mirror DBs on
+   tmpfs-style storage).
+4. The embedded-cache observer dispatch on workers remains the next CPU
+   lever if CPU (not IO) is confirmed.
 
 ## Symptom
 
