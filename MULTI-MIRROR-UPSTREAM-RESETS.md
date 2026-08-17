@@ -1,4 +1,4 @@
-# Upstream connection resets in one-process multi-mirror mode (ROOT CAUSE IDENTIFIED — fix pending deployment)
+# Upstream connection resets in one-process multi-mirror mode (log-stall root cause FIXED + VALIDATED in #4; residual: ~3 MB/s HDD read-starvation — fix list pending)
 
 > First hard evidence: 2026-08-17 production switch attempt (01:13–01:26 UTC).
 > Status: attempts #1–#3 all lost busy regions to upstream closes.
@@ -8,9 +8,14 @@
 > iowait 20–95 % through the cascade — the first telemetry reading of
 > "~0 disk" was a minute-average artifact). A slow journald/pipe froze every
 > session process-wide; upstream RST'd Pong-deadline violators; re-seeds
-> amplified. Fix implemented and validated locally (non-blocking log writers
-> + honored `RUST_LOG` + quieter seed progress); awaiting the next cutover
-> attempt.
+> amplified. That fix landed (`93f259007`), was deployed for attempt #4
+> (14:31–14:55 UTC), and **eliminated the log-stall mechanism** — but the
+> busy regions still died, and the attempt-#4 telemetry measured the layer
+> underneath end-to-end: the host's ~3 MB/s legacy HDD (no SSD) starves the
+> process's page-fault reads whenever host-side writeback bursts (this time:
+> nginx's own logging of the outage), stalling `Future::poll` past the pong
+> deadline. See "Production attempt #4" for the evidence and the ranked fix
+> list.
 > Sibling analysis: [`MULTI-MIRROR-STARVATION.md`](MULTI-MIRROR-STARVATION.md)
 > (fixed 2026-08-16) — that failure was *self-inflicted* (process-wide client
 > gate + internal cascade). This one is a feedback loop between our own
@@ -242,7 +247,7 @@ processes each get their own runtime and their own small pipe to journald;
 no single process's cold start multiplies fourteen regions' log storm, and
 the fleet's steady state never re-seeds everything at once.
 
-### Fix (commit pending, validated locally)
+### Fix (landed as `93f259007`; deployed and validated in attempt #4)
 
 1. **Non-blocking writers** (`crates/core/src/startup.rs`): both fmt writers
    (stdout and the rolling file) are wrapped in
@@ -282,24 +287,127 @@ telemetry review.
 
 **Next steps (revised):**
 
-1. ✅ Logging fix landed (above) — deploy with the next attempt.
+1. ✅ Logging fix landed (above) — deployed for attempt #4 and validated (see
+   the scorecard there).
 2. Recommend `Environment="SPACETIMEDB_DISABLE_DISK_LOGGING=1"` in
    `bitcraft-mirror.service`: journald already captures stdout; the rolling
    file double-writes every line to the same slow disk.
 3. Watch **iowait**, not just CPU, in the attempt telemetry (the sampler
    already records `/proc/stat` — decode it per-interval; minute averages
    hid the onset for two analysis rounds).
-4. Identify the 11:42:26 whole-host 32–53 MB/s write burst (journald
-   flushing the accumulated cold-start log volume? page-cache writeback of
-   the same? another unit?) — a storage-rate check on the host
-   (`iostat -x 5`, `journalctl --disk-usage`) before the next attempt
-   would settle it.
+4. ✅ Settled by attempt #4's per-interval disk decode (see "Production
+   attempt #4"): the burst class is dirty-page writeback of host-side
+   logging — #4's 180 MB flush traced to nginx's unrotated 14.9 GB
+   access.log plus the error-log 502-storm; #3's own burst additionally
+   included the then-unfixed debug firehose.
 5. Swap: 1 GiB nearly exhausted, dormant through #3 — still no cushion.
 6. Status granularity (flushing / backoff / gate-queued) — still worth
    doing for operator legibility, now decoupled from the incident.
 7. Report upstream to Clockwork Labs the RSTs that arrive *after* the
    pong-deadline stalls — those stalls were self-inflicted, but the edge's
    response (RST vs close) remains their side.
+
+## Production attempt #4 (2026-08-17 14:31–14:55 UTC, logging-fix build `93f259007`)
+
+First attempt on the fixed build. **The log-stall root cause is confirmed
+eliminated — and the layer underneath is now measured end-to-end: the host's
+~3 MB/s legacy HDD (no SSD) starves the process's page-fault reads whenever
+host-side writeback bursts, and this attempt's burster was nginx's own
+logging of the outage.** Operator rolled back at ~14:55; blue fleet was 14/14
+again by ~15:08 UTC.
+
+**Fix scorecard (all three deployed fixes verifiably worked):**
+
+| | #1 | #2 | #3 | #4 (fix build) |
+|---|---|---|---|---|
+| Deaths | 9 | 6 | 5 | 8 |
+| Log-stall signature (≈18 s journal silences, waves) | yes | yes | yes | **none** — journal flowed continuously; 234 KB total |
+| DEBUG firehose despite unit `RUST_LOG` | yes | yes | yes | **0 DEBUG lines** (env honored) |
+| Self-inflicted probe kills | 4 | 0 | 0 | 0 — ≥6 saves ("probe late 30–35 s but socket receiving MBs": r8, r9, r11, r13, r14, r18) |
+| Cold start | pipelined | pipelined | serialized | serialized + healthy: 40–70 s per seed, 12/14 live by 14:41:18, 0 errors until 14:46 |
+| Green's own disk writes | — | — | 32–53 MB/s burst (11:42) | **815 KB total** (`write_bytes`; stdb.log 5.5 MB; 1 612 journal lines in the whole window) |
+
+**Deaths — 8, all upstream-initiated, again exactly the busy set (plus r13):**
+
+| UTC | region | mode | lived |
+|---|---|---|---|
+| 14:46:29 | 19 | RST without close handshake | **0 ns** (connect refused — 2nd rate-policing occurrence) |
+| 14:46:34 | 7 | RST without close handshake | 845 s |
+| 14:48:23 | 9 | unexpected EOF | 797 s |
+| 14:48:23 | 18 | unexpected EOF | 302 s |
+| 14:48:42 | 17 | unexpected EOF | 449 s |
+| 14:48:51 | 14 | unexpected EOF | 565 s |
+| 14:50:14 | 13 | unexpected EOF | 749 s |
+| 14:52:52 | 12 | unexpected EOF | 945 s |
+
+Quiet regions held (global, 3, 8, 11, 15 live at rollback; r23 mid-seed).
+95 event-loop-gap warnings; the stall-correlated maxes were 20–25 s (r19
+23.1 s, global 24.8 s — matching the two wave windows below), r11 reached
+56 s; a few 195–220 s maxes (r11/r12) likely span reconnect/gate-queue
+boundaries rather than single worker stalls — worth a look at
+`note_event_gap`'s bookkeeping across session instances.
+
+**Telemetry (5 s samples, full window — first attempt with the per-interval
+disk split + loadavg in the raw log):**
+
+1. **180 MB host write burst at 14:41:10–25 (38–72 MB/s)** — not green
+   (green `write_bytes` 815 KB total; control-db touched only at start; no
+   journald rotation; journald volume 1 612 lines/15 min). Attributed to
+   **nginx log writeback**: `/var/log/nginx/access.log` is **14.9 GB,
+   unrotated since 13 Jul** (`logrotate.timer` is *not-found* on this host —
+   rotation never ran), plus 102 MB error.log. nginx measured writing
+   74 KiB/s in steady state with blue serving; during the dark band the
+   502-storm (public retries + coordinator probes + dashboard) multiplies
+   that, and dirty-page writeback flushed ~180 MB at once.
+2. **Two read-starvation waves**: 14:42:16–36 and 14:44:06–26 — iowait
+   93–97 %, CPU 1–2 %, and **reads completing at 0.00 MB/s**: green's page
+   faults queued behind the platter drain (wave 2 shows writes crawling at
+   2.5–3.2 MB/s — the platter rate). Green's baseline reads between waves:
+   0.7–1.1 MB/s = the 140 MB binary + libs faulting in lazily
+   (`read_bytes` 224 MB over the run ≈ binary + runtime).
+3. **Load decomposition (preempts the "CPU 13.24/8" misread):** 1-min load
+   10→14.5 from 14:48:02 until green stopped (14:55:15) — but runnable
+   threads were 1–3 of 8 logical CPUs in every 5 s sample (one spike of
+   11), and 64 % of the CPU in use was *niced* (the offloaded decode
+   pool). The load is D-state (uninterruptible IO-blocked), not a
+   run-queue. Reconciliation with the local `--cpus=1` repro: CFS
+   throttling starves via runnable pileup, production via D-state —
+   different mechanisms, same kill condition: **any whole-process stall
+   past the 10–30 s session deadlines**.
+4. **Ruled out:** THP compaction (counters flat), dmesg IO errors (none),
+   OOM/direct reclaim (flat, 26 GB available), swap (1023/1023 full and
+   net-static through the window — no pressure; green never paged out; it
+   drained ~1 GiB back in during blue's post-rollback re-seed, adding
+   hostile reads to the *recovery*).
+5. RSS 33.7→35.3 GiB climbing through re-seeds (watch item, not causal).
+
+**Why the per-instance fleet survives this host:** its processes faulted
+their text pages weeks ago, each instance's log volume is small, and nothing
+in steady state write-bursts. A green first-run faults its 140 MB binary
+during the highest-pressure window, and any host write burst turns the
+single platter read-hostile for a minute at a time.
+
+### Fix list for attempt #5 (ranked by leverage)
+
+1. **nginx logging hygiene** (host ops): install/enable logrotate, rotate +
+   truncate the 14.9 GB access.log, `access_log … buffer=64k flush=5s`, and
+   `error_log … warn` on the WS-band vhosts so a dark band cannot
+   self-inflict an IO storm during the mirror's most fragile window.
+2. **Pre-fault + lock the binary** so green needs no disk reads after
+   startup (`vmtouch -l` in `ExecStartPre`, or an in-code mlock warmup).
+3. `Environment="SPACETIMEDB_DISABLE_DISK_LOGGING=1"` in
+   `bitcraft-mirror.service` (kills the 5.5 MB/run double-write).
+4. Aggregate the per-table `cleared N stale rows` INFO line
+   (`crates/core/src/host/public_mirror.rs:198`, 274 lines per cold reset)
+   into one summary line per flush.
+5. **Swap off** (`swapoff -a` + `/etc/fstab`): exonerated for #4, but
+   all-downside here — full for weeks (no cushion) and its swap-in reads
+   land on the same platter. Costs seconds while nearly empty.
+6. Keep the telemetry capture; add **per-thread kernel stacks of D-state
+   threads during a stall** (`/proc/PID/task/*/stack`, or perf) — the one
+   measurement still missing to name the exact blocked syscalls.
+7. Report upstream: RST-after-pong-stall, plus the second `lived 0ns`
+   connect refusal (edge connection-rate policing now twice-observed).
 
 ## Symptom
 
@@ -379,7 +487,10 @@ dependent — not deterministic in the process itself.
    path, per-interval iowait correlation, journal-silence signatures, and a
    local single-region repro through a wedged stdout pipe: pre-fix parks at
    0 % CPU with a 42 s event-loop gap; fixed runs at ~97 % CPU to live).
-   Fixed 2026-08-17.
+   Fixed 2026-08-17. Attempt #4 validated the fix in production (no log
+   stalls, no firehose) — and exposed the residual layer below: HDD
+   read-starvation of page faults during host writeback bursts (see
+   "Production attempt #4").
 1. **Upstream edge throttling / anti-abuse on bursty multi-connection
    patterns.** 14 WebSocket connections established within ~5 minutes plus
    multi-hundred-MB Brotli seed downloads from one IP, then sustained
@@ -387,7 +498,8 @@ dependent — not deterministic in the process itself.
    aggressively than the residential IP used in the passing local test.
    Best match for the one `lived 0ns` instantly-refused connect, which CPU
    starvation does not explain (connect-time RST = likely connection-rate
-   policing; secondary, distinct mechanism).
+   policing; secondary, distinct mechanism). A second `lived 0ns` connect
+   refusal occurred in attempt #4 (r19, 14:46:29) — twice-observed now.
 2. **Shared-DNS edge variance.** `bitcraft-early-access.spacetimedb.com` is
    a shared DNS name with multiple A records; sessions land on different
    edge nodes. Some nodes/paths may reset long-lived or heavy connections.
@@ -494,3 +606,7 @@ Open:
 | CPU-capped repro (aggregate-starvation test) | `scripts/local-full-fleet-test-cpu-capped.sh` |
 | Stable per-instance fleet for comparison | `bitcraft-relay/tools/public-mirror@.service` |
 | Host: 4C/8T Xeon E3-1270 v6, no CPU sampler | `ns518212` (measurements 2026-08-17 in Leading hypothesis) |
+| Logging fix (non-blocking writers, `RUST_LOG`, quieter seeds) | commit `93f259007`; deployed and validated in attempt #4 |
+| Attempt-#4 artifacts (host) | `/tmp/cutover-telemetry/{telemetry-attempt4.log, green-journal-attempt4.log}` |
+| The #4 write-burst writer | nginx `/var/log/nginx/access.log` (14.9 GB, unrotated since 13 Jul — `logrotate.timer` not-found) + `error.log` (102 MB) |
+| Host storage | legacy HDD, ~3 MB/s sustained (no NVMe/SSD) — the "stalled storage" of #3/#4 is arithmetic, not device failure |
