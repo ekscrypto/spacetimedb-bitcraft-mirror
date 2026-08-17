@@ -31,9 +31,11 @@ WebSocket clients, embedded cache on `--cache-bind` (default `127.0.0.1:8089`
 — same contract as the standalone `relay-cache`, so nginx and the explorer
 keep working unchanged). See [`MULTI-MIRROR-STARVATION.md`](MULTI-MIRROR-STARVATION.md) (inherited) for why
 per-database client gating matters in this topology, and
-[`MULTI-MIRROR-UPSTREAM-RESETS.md`](MULTI-MIRROR-UPSTREAM-RESETS.md) (OPEN,
-2026-08-17) for the remaining upstream-initiated disconnect mode observed
-when the full fleet shares one process on the production host.
+[`MULTI-MIRROR-UPSTREAM-RESETS.md`](MULTI-MIRROR-UPSTREAM-RESETS.md) (resolved
+2026-08-17: all four failure layers were local — logging, disk, swap, memory
+cap) for the incident history. Deploying on modest/legacy hardware (e.g. an
+OVH K-5 with spinning disks)? Read [`OVH-CLOUD-K5.md`](OVH-CLOUD-K5.md)
+first — it lists every host-level change production required.
 
 ## Quick start (mirror + embedded cache)
 
