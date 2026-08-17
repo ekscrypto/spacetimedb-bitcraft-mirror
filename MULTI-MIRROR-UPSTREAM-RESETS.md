@@ -413,11 +413,16 @@ single platter read-hostile for a minute at a time.
    commented, backup `/etc/fstab.relay-backup-2026-08-17`): exonerated for
    #4, but all-downside here — full for weeks (no cushion) and its swap-in
    reads land on the same platter.
-6. Keep the telemetry capture; add **per-thread kernel stacks of D-state
-   threads during a stall** (`/proc/PID/task/*/stack`, or perf) — the one
-   measurement still missing to name the exact blocked syscalls.
-7. Report upstream: RST-after-pong-stall, plus the second `lived 0ns`
-   connect refusal (edge connection-rate policing now twice-observed).
+6. ✅ Telemetry now captures **per-thread kernel stacks of D-state
+   (uninterruptible-IO) threads** on every sample while any exist
+   (`dstack` lines in telemetry.log: `/proc/PID/task/TID/stack` with an
+   always-readable wchan line as corroboration/fallback; zero output in
+   steady state). The next stall names its exact blocked syscalls.
+7. ~~Report upstream~~ — **not sending** (decided 2026-08-17): blue is
+   stable on the same edge/IP with the same 14 connections, so the RSTs
+   and both `lived 0ns` refusals only ever followed our own stalls.
+   Revisit only if a future attempt shows deaths with no preceding local
+   stall.
 
 ## Symptom
 
