@@ -198,8 +198,9 @@ deaths (regions 12, 8, 9, 7 — the last live 23 min — plus region 19, whose
 serialized re-seed died mid-subscribe at `lived 0ns`, confirming that a
 region whose apply loop stalls past the pong deadline may never complete a
 re-seed). Fleet held 10/14 throughout; no collapse. Full telemetry and the
-green journal are archived in `artifacts-attempt3/` (telemetry log committed;
-journal also on the host at `/tmp/cutover-telemetry/`).
+green journal are kept operator-side (never published; scrubbed from the
+public repo history 2026-08-17 — they contain production hostnames and
+peer IPs). Journal also on the host at `/tmp/cutover-telemetry/`.
 
 **Recovery-path observation:** a disconnected region takes minutes before it
 visibly re-attempts — cold-reset (flushing all 274 in-memory tables), then
