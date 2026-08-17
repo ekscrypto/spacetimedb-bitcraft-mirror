@@ -14,7 +14,8 @@ endpoint is safe to expose publicly. The primary consumer is
 ## Endpoint
 
 ```
-ws://127.0.0.1:8089/internal/dim-buildings/ws                 (loopback)
+ws://127.0.0.1:8090/internal/dim-buildings/ws                 (loopback, production: embedded cache since 2026-08-17)
+ws://127.0.0.1:8089/internal/dim-buildings/ws                 (loopback, standalone default — rollback-only)
 wss://relay.bitcraftsync.app/internal/dim-buildings/ws        (public, TLS)
 ```
 

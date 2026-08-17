@@ -490,8 +490,11 @@ every attempt ran green permanently over the soft limit once seeded. The
 prior layers remain real and measured (logging storm, disk read
 starvation, writeback bursts) — and they compound: memcg reclaim pressure
 drives page-cache writeback/eviction, which on ~3 MB/s platters is exactly
-the read-starvation seen in #4. With the cap fixed at 48G, the soak is
-clean so far; decommission-blue decision pending that soak.
+the read-starvation seen in #4. With the cap fixed at 48G, the soak stayed
+clean; blue was decommissioned at 20:29 UTC the same day
+(`decommission-public-mirror-fleet.sh --apply`: `relay-cache.service`
+stopped + disabled, `public-mirror.target` disabled, after re-verifying
+14/14 live + cache ready on `:8090`).
 
 ## Symptom
 

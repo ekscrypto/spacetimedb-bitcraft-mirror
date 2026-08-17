@@ -10,6 +10,12 @@ payload is non-PII u64 ids so other clients may use it. Only
 `/internal/stats` stays unproxied. Public clients use the HTTP read API
 or the dim-buildings WS.
 
+Production note: since the 2026-08-17 one-process cutover the live
+instance is the **embedded** cache inside `bitcraft-mirror.service`, bound
+to `127.0.0.1:8090` (`--cache-bind`). The standalone binary (default bind
+`127.0.0.1:8089`) is retired with the blue fleet and kept for rollback
+only; the examples below use its default port.
+
 The crate runs in **two modes** with identical stores, HTTP API, and
 dim-buildings WS:
 
