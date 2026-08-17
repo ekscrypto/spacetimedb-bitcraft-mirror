@@ -948,12 +948,14 @@ async fn bootstrap_public_mirror(
         connect_timeout: Duration::from_secs(60),
     };
     let observers = cache.as_ref().map(|c| c.registry.clone());
+    let mirror_status_registry = std::sync::Arc::clone(ctx.mirror_status_registry());
     tokio::spawn(async move {
         if let Err(e) = run_public_mirror_loop(
             module_host,
             mirror_cfg,
             module_def,
             status,
+            mirror_status_registry,
             subscribe_gate,
             coordinator_socket,
             observers,

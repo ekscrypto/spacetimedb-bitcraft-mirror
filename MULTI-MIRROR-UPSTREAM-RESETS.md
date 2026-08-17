@@ -112,12 +112,19 @@ queueing, and the container's page cache hides disk behavior.
 
 **Next steps specific to this attempt:**
 
-1. Pace seeding whenever any other mirror is live (not just reconnect
-   sessions) — directly targets the cold-start tail where both production
-   cascades occurred.
-2. Fixed capture for the next attempt: CPU **and iowait split** +
-   `/proc/diskstats` + per-process IO bytes, started from a pidfile-guarded
-   script (no `pkill` self-match), before green starts.
+1. ✅ **Pace seeding whenever any other mirror is live** (implemented
+   2026-08-17): `run_public_mirror_loop` consults the status registry before
+   each session — reconnects *and* cold-start sessions with ≥1 live mirror
+   now seed with at most `SEED_BACKLOG_MAX_TABLES` (4) seed tables queued or
+   in flight, bounding the burst without making cold start fully apply-bound
+   (which would stretch past the cutover wait). Only the very first mirror
+   of a cold start pipelines unbounded (nothing is live to starve).
+2. ✅ **Fixed capture for the next attempt** (implemented 2026-08-17):
+   `bitcraft-relay/tools/cutover-telemetry-capture.sh` — pidfile-guarded (no
+   pattern-match kills), CPU **and iowait split**, `/proc/diskstats`, and
+   the green process's CPU + `/proc/PID/io` bytes, pid re-resolved every
+   sample; `summarize` prints per-minute rows. Wired best-effort into
+   `cutover-to-bitcraft-mirror.sh` step 5/8 so it cannot be forgotten.
 3. If iowait confirms: the fix family changes from CPU scheduling to IO
    (batch/relax durability for mirror stores, or keep mirror DBs on
    tmpfs-style storage).

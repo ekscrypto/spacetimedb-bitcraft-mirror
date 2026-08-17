@@ -20,7 +20,7 @@ use crate::coordinator_client::CoordinatorClient;
 
 use crate::observer::MirrorObserverRegistry;
 use crate::schema::public_user_table_names;
-use crate::status::MirrorStatusHandle;
+use crate::status::{MirrorConnectivity, MirrorStatusHandle, MirrorStatusRegistry};
 use crate::upstream::{self, UpstreamConfig, UpstreamUpdate};
 
 /// Configuration for the public-mirror upstream loop.
@@ -100,6 +100,7 @@ pub async fn run_public_mirror_loop(
     config: PublicMirrorConfig,
     module_def: ModuleDef,
     status: MirrorStatusHandle,
+    registry: Arc<MirrorStatusRegistry>,
     subscribe_gate: Arc<Semaphore>,
     coordinator_socket: Option<PathBuf>,
     observers: Option<Arc<MirrorObserverRegistry>>,
@@ -211,6 +212,18 @@ pub async fn run_public_mirror_loop(
             None => None,
         };
         let gate_permit = acquire_subscribe_slot(&subscribe_gate, &config.database, &status).await?;
+        // Seed pacing applies to reconnects, and to cold-start sessions once
+        // any *other* mirror is already live: both 2026-08-17 production
+        // cascades ran in exactly that window — the cold-start tail, with
+        // live regions ingesting while later regions seeded unpaced. Our own
+        // status is Waiting/Connecting here, so any Live mirror is another
+        // mirror's session.
+        let others_live = registry
+            .snapshot()
+            .mirrors
+            .iter()
+            .any(|m| matches!(m.connectivity, MirrorConnectivity::Live));
+        let pace_seeds = generation > 1 || others_live;
         let mut live_started = None;
         let mut failed_table = None;
         let result = upstream::connect_and_mirror(
@@ -226,9 +239,9 @@ pub async fn run_public_mirror_loop(
             Arc::clone(&completed_tables),
             observers.clone(),
             generation,
-            // Re-seed pacing on every session after the cold start: bounded
-            // bursts instead of a full-snapshot pile-up behind live ingest.
-            generation > 1,
+            // Bounded seed bursts on reconnects and once other mirrors are
+            // live — see the pacing decision above.
+            pace_seeds,
         )
         .await;
         let lived_for = live_started.map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
