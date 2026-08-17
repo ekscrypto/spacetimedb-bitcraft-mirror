@@ -1,12 +1,12 @@
 # Upstream connection resets in one-process multi-mirror mode (OPEN)
 
 > First hard evidence: 2026-08-17 production switch attempt (01:13–01:26 UTC).
-> Status: **OPEN** — mechanism confirmed in the calibrated local repro
-> 2026-08-17; mitigations 1–3 validated locally but the **2026-08-17 second
-> production attempt (10:22–10:31 UTC, mitigated build) still cascaded during
-> the unpaced cold-start tail** — death profile changed completely (6×
-> upstream EOF, zero self-inflicted probe/RST kills) but 37–51 s poll gaps
-> exceeded what the local repro modeled. See "Production attempt #2" below.
+> Status: **OPEN** — attempts #1–#3 all lost busy regions to upstream closes,
+> but the mechanism has been **re-attributed by attempt #3's telemetry**: the
+> host is nearly idle (2–5 % CPU, ~0 disk IO, memory-only mirror stores) —
+> the stalls that violate the 10–30 s session deadlines are **in-process
+> synchronous blocking in `Future::poll`**, not resource starvation. See
+> "Production attempt #3".
 > Sibling analysis: [`MULTI-MIRROR-STARVATION.md`](MULTI-MIRROR-STARVATION.md)
 > (fixed 2026-08-16) — that failure was *self-inflicted* (process-wide client
 > gate + internal cascade). This one originates **upstream of us**: the
@@ -133,6 +133,58 @@ queueing, and the container's page cache hides disk behavior.
    tmpfs-style storage).
 4. The embedded-cache observer dispatch on workers remains the next CPU
    lever if CPU (not IO) is confirmed.
+
+## Production attempt #3 (2026-08-17 11:32 UTC →, serialized-seeding build `a627e4220`)
+
+Strict serial seeding (one table at a time, one mirror at a time) plus the
+auto-started telemetry capture. **The telemetry finally covers the failure
+window — and it re-attributes the mechanism:**
+
+| measurement (during 22–31 s poll gaps + deaths) | value |
+|---|---|
+| System CPU | **2–5 %** |
+| iowait | 3–13 % of total (≤ ~1 core), but **disk throughput 0.00–0.12 MiB/s** |
+| Green `--data-dir` | **5.5 MB** (control-db + config + logs — mirror stores are memory-only, as designed) |
+| Swap | 1 GiB nearly full (37 MB free), **zero current traffic** |
+
+**Aggregate CPU starvation is disproven as the production mechanism** (as are
+database disk IO and swap). The session-deadline violations are real — gaps
+of 22–31 s — but they occur with the box idle: **in-process synchronous
+blocking inside `Future::poll` on a Tokio worker** (a std-mutex/condvar wait
+held across slow work parks the worker without consuming CPU or IO). Prime
+suspects: the embedded-cache observer dispatch and the shared module-host
+apply plumbing; journald/stdout write backpressure under our verbose logging
+is the secondary suspect. The local Docker repro's CPU-starvation
+reproduction was genuine for its own environment (CFS quota throttling) but
+modeled the wrong resource for production — the "Leading hypothesis" section
+above is retained as history, superseded here.
+
+**Mitigations' production scorecard (attempt #3, vs #1 / #2):** cold start
+strictly serialized (visible in `/v1/mirrors` — exactly one mirror
+subscribing at a time); silence-aware probe absorbed every late probe
+(multiple "tolerating starved runtime" events with megabytes received, zero
+self-inflicted kills); the cascade is dramatically slower — 4 deaths (12, 8,
+9, 19), all upstream-initiated RST / `ECONNRESET`, fleet holding at 10/14
+(vs collapse to 5 in #1, 7 in #2) with reconnects proceeding strictly
+serially. The underlying stall mechanism remains unfixed.
+
+**Recovery-path observation:** a disconnected region takes minutes before it
+visibly re-attempts — cold-reset (flushing all 274 in-memory tables), then
+backoff, then queueing at the subscribe gate behind whichever serialized
+re-seed is in progress. The `disconnected` status does not distinguish
+flushing / backing-off / gate-queued, which reads as "never re-attempts".
+
+**Next steps (revised):**
+
+1. **Unblock the poll path** (top lever): per-database lock granularity, or
+   move the embedded-cache observer dispatch off the session task's poll —
+   one region's seed work must not park another region's worker.
+2. Status granularity: expose flushing / backoff / gate-queued as distinct
+   states so recovery is legible.
+3. Cheap journald-hypothesis test: async logging or `RUST_LOG=warn` on the
+   next attempt.
+4. Watch swap: 1 GiB nearly exhausted — dormant now, but there is no swap
+   cushion left if memory spikes.
 
 ## Symptom
 
