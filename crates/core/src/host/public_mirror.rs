@@ -178,6 +178,10 @@ pub fn apply_external_update(
     if is_seed {
         let mut total_applied = 0u64;
         let mut since_tick = 0u64;
+        // One summary line instead of one per table: 274 INFO lines per cold
+        // reset was real journal volume on the slow-disk host (attempt #4).
+        let mut total_cleared = 0u64;
+        let mut tables_cleared = 0u64;
 
         for table_ops in ops {
             let mut clear_first = true;
@@ -194,10 +198,8 @@ pub fn apply_external_update(
                 if clear_first {
                     let removed = tx.clear_table(table_ops.table_id)?;
                     if removed > 0 {
-                        log::info!(
-                            "public-mirror: cleared {removed} stale rows from table {} before re-seed",
-                            table_ops.table_id
-                        );
+                        total_cleared += removed;
+                        tables_cleared += 1;
                     }
                     clear_first = false;
                 }
@@ -212,6 +214,12 @@ pub fn apply_external_update(
                 }
                 chunk_start = chunk_end;
             }
+        }
+
+        if tables_cleared > 0 {
+            log::info!(
+                "public-mirror: cleared {total_cleared} stale rows across {tables_cleared} tables before re-seed"
+            );
         }
 
         if let Some(p) = &progress {

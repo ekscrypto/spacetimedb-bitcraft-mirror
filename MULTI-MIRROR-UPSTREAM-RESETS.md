@@ -389,20 +389,30 @@ single platter read-hostile for a minute at a time.
 
 ### Fix list for attempt #5 (ranked by leverage)
 
-1. **nginx logging hygiene** (host ops): install/enable logrotate, rotate +
-   truncate the 14.9 GB access.log, `access_log … buffer=64k flush=5s`, and
-   `error_log … warn` on the WS-band vhosts so a dark band cannot
-   self-inflict an IO storm during the mirror's most fragile window.
-2. **Pre-fault + lock the binary** so green needs no disk reads after
-   startup (`vmtouch -l` in `ExecStartPre`, or an in-code mlock warmup).
-3. `Environment="SPACETIMEDB_DISABLE_DISK_LOGGING=1"` in
-   `bitcraft-mirror.service` (kills the 5.5 MB/run double-write).
-4. Aggregate the per-table `cleared N stale rows` INFO line
-   (`crates/core/src/host/public_mirror.rs:198`, 274 lines per cold reset)
-   into one summary line per flush.
-5. **Swap off** (`swapoff -a` + `/etc/fstab`): exonerated for #4, but
-   all-downside here — full for weeks (no cushion) and its swap-in reads
-   land on the same platter. Costs seconds while nearly empty.
+1. ✅ **nginx logging hygiene** (host ops, done 2026-08-17): logrotate
+   installed (timer active; was never installed — 14.9 GB access.log since
+   13 Jul), giants rotated out as `*.pre-rotation-2026-08-17`,
+   `access_log … combined buffer=64k flush=5s` in nginx.conf, `error_log …
+   crit` in the WS-band server block (kills the 502-storm prose; access_log
+   still records the status codes), rotation `daily, rotate 14, nocompress`
+   (no gzip churn on the slow array).
+2. ✅ **Pre-fault + lock the binary** so green needs no disk reads after
+   startup: `relay-pin-bitcraft-mirror.service` +
+   `relay-pin-public-mirror.service` (blue fleet, one lock covers all 14
+   instances) running `relay-pin-pages.sh` (vmtouch mlock, ~140 MB each,
+   enabled at boot, restarted by deploy.sh after each build — a redeployed
+   binary is a new inode).
+3. ✅ `Environment="SPACETIMEDB_DISABLE_DISK_LOGGING=1"` added to
+   `bitcraft-relay/tools/bitcraft-mirror.service` (kills the 5.5 MB/run
+   double-write; deploys with the next cutover's unit install).
+4. ✅ Aggregate the per-table `cleared N stale rows` INFO line
+   (`crates/core/src/host/public_mirror.rs` `apply_external_update`, 274
+   lines per cold reset) into one summary line per flush —
+   `cleared {total} stale rows across {n} tables before re-seed`.
+5. ✅ **Swap off** (2026-08-17: `swapoff -a`, both fstab swap lines
+   commented, backup `/etc/fstab.relay-backup-2026-08-17`): exonerated for
+   #4, but all-downside here — full for weeks (no cushion) and its swap-in
+   reads land on the same platter.
 6. Keep the telemetry capture; add **per-thread kernel stacks of D-state
    threads during a stall** (`/proc/PID/task/*/stack`, or perf) — the one
    measurement still missing to name the exact blocked syscalls.
