@@ -168,6 +168,16 @@ self-inflicted kills); the cascade is dramatically slower — 4 deaths (12, 8,
 (vs collapse to 5 in #1, 7 in #2) with reconnects proceeding strictly
 serially. The underlying stall mechanism remains unfixed.
 
+**Attempt #3 outcome:** rolled back at ~11:58 UTC after 5 upstream-initiated
+deaths (regions 12, 8, 9, 7 — the last live 23 min — plus region 19, whose
+serialized re-seed died mid-subscribe at `lived 0ns`, confirming that a
+region whose big-table apply stalls past the pong deadline may never
+complete a re-seed). Fleet held 10/14 throughout; no collapse. Full
+telemetry and the green journal are archived in
+`artifacts-attempt3/` (telemetry log committed; journal also on the host at
+`/tmp/cutover-telemetry/`). The 27-minute window shows 2–5 % CPU and ~0
+disk for the entire attempt — the stall is in-process, full stop.
+
 **Recovery-path observation:** a disconnected region takes minutes before it
 visibly re-attempts — cold-reset (flushing all 274 in-memory tables), then
 backoff, then queueing at the subscribe gate behind whichever serialized
