@@ -492,7 +492,12 @@ where
     let query_id = request_id;
     let query = format!("SELECT * FROM {table}");
     let frame = encode_subscribe_multi(request_id, query_id, &query)?;
-    log::info!(
+    // Per-table progress is debug: a 274-table region logs this pair hundreds
+    // of times per seed, and under the strict-serialized cold start that
+    // volume is what floods slow-disk logging sinks (see
+    // MULTI-MIRROR-UPSTREAM-RESETS.md). `/v1/mirrors` exposes the same
+    // progress (`current_table`, seed rows applied) without the log firehose.
+    log::debug!(
         "public-mirror: subscribe [{}/{}] {table} (request_id={request_id})",
         idx + 1,
         total
@@ -501,7 +506,7 @@ where
     ctx.sock.send(Message::Binary(frame.into())).await?;
 
     let (mut tables_ops, n_rows, wire_bytes) = ctx.await_seed(query_id, table).await?;
-    log::info!("public-mirror: SubscribeMultiApplied for {table} ({n_rows} seed rows, {wire_bytes} wire bytes)");
+    log::debug!("public-mirror: SubscribeMultiApplied for {table} ({n_rows} seed rows, {wire_bytes} wire bytes)");
 
     // An empty seed must still clear the local table: after a reconnect the
     // previous session's rows may be stale (upstream table now empty).

@@ -4,6 +4,7 @@ use spacetimedb_paths::server::{ConfigToml, LogsDir};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::time::Duration;
+use tracing_appender::non_blocking::NonBlockingBuilder;
 use tracing_appender::rolling;
 use tracing_core::LevelFilter;
 use tracing_flame::FlameLayer;
@@ -59,25 +60,40 @@ pub fn configure_tracing(opts: TracingOptions) {
 
     let use_ansi = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
 
+    // Every fmt writer below is wrapped in `tracing_appender::non_blocking`:
+    // a dedicated writer thread with a bounded, lossy queue. Emitting a log
+    // event must never `write()` on the caller's thread — under systemd,
+    // stdout is a pipe to journald, and when the host's storage stalls the
+    // pipe fills and any task logging from inside a Tokio worker blocks in
+    // `write()`. That froze every mirror session process-wide for as long as
+    // the pipe stayed full (see MULTI-MIRROR-UPSTREAM-RESETS.md, 2026-08-17
+    // attempt #3: CPU ~0, all event loops silent, everyone released the instant the
+    // pipe drained. With the worker thread, a stalled sink drops log lines
+    // instead of freezing the database.
+
     let file_fmt_layer = if let Some(logs_dir) = opts.disk_logging {
         let roller = rolling::Builder::new()
             .filename_prefix(LogsDir::filename_prefix(&opts.edition))
             .filename_suffix(LogsDir::filename_extension())
             .build(logs_dir)
             .unwrap();
+        let (writer, guard) = non_blocking_builder().finish(roller);
+        std::mem::forget(guard);
         Some(
             tracing_subscriber::fmt::Layer::default()
                 .with_ansi(false)
-                .with_writer(roller)
+                .with_writer(writer)
                 .event_format(format.clone()),
         )
     } else {
         None
     };
 
+    let (stdout_writer, stdout_guard) = non_blocking_builder().finish(std::io::stdout());
+    std::mem::forget(stdout_guard);
     let fmt_layer = tracing_subscriber::fmt::Layer::default()
         .with_ansi(use_ansi)
-        .with_writer(std::io::stdout)
+        .with_writer(stdout_writer)
         .event_format(format);
 
     let env_filter_layer = conf_to_filter(opts.config);
@@ -121,10 +137,29 @@ pub fn configure_tracing(opts: TracingOptions) {
     }
 }
 
+/// Bounded queue of formatted log lines per writer thread. At ~150 bytes a
+/// line this holds roughly the volume of a multi-minute journald stall
+/// before dropping; the preallocated slot array stays a few MiB.
+const LOG_WRITER_BUFFERED_LINES: usize = 100_000;
+
+fn non_blocking_builder() -> NonBlockingBuilder {
+    NonBlockingBuilder::default()
+        .lossy(true)
+        .buffered_lines_limit(LOG_WRITER_BUFFERED_LINES)
+}
+
 fn conf_to_filter(conf: LogConfig) -> EnvFilter {
+    // `RUST_LOG` overrides the config.toml directives. Without this the env
+    // var is silently ignored and a data-dir config.toml copied from the
+    // shipped default runs the whole server at `debug` — the log volume that
+    // turned slow-disk writeback stalls into process-wide freezes.
+    let directives = match std::env::var("RUST_LOG") {
+        Ok(s) if !s.trim().is_empty() => s,
+        _ => conf.directives.join(","),
+    };
     EnvFilter::builder()
         .with_default_directive(conf.level.unwrap_or(LevelFilter::ERROR).into())
-        .parse_lossy(conf.directives.join(","))
+        .parse_lossy(directives)
 }
 
 fn parse_from_file(path: &ConfigToml) -> EnvFilter {

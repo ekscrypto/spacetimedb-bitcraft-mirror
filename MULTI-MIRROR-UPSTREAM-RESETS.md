@@ -1,17 +1,21 @@
-# Upstream connection resets in one-process multi-mirror mode (OPEN)
+# Upstream connection resets in one-process multi-mirror mode (ROOT CAUSE IDENTIFIED — fix pending deployment)
 
 > First hard evidence: 2026-08-17 production switch attempt (01:13–01:26 UTC).
-> Status: **OPEN** — attempts #1–#3 all lost busy regions to upstream closes,
-> but the mechanism has been **re-attributed by attempt #3's telemetry**: the
-> host is nearly idle (2–5 % CPU, ~0 disk IO, memory-only mirror stores) —
-> the stalls that violate the 10–30 s session deadlines are **in-process
-> synchronous blocking in `Future::poll`**, not resource starvation. See
-> "Production attempt #3".
+> Status: attempts #1–#3 all lost busy regions to upstream closes.
+> **Root cause identified 2026-08-17 from the attempt-#3 artifacts** (see
+> "Root cause" under "Production attempt #3"): synchronous logging blocked
+> inside `Future::poll` whenever the host's storage stalled (whole-host
+> iowait 20–95 % through the cascade — the first telemetry reading of
+> "~0 disk" was a minute-average artifact). A slow journald/pipe froze every
+> session process-wide; upstream RST'd Pong-deadline violators; re-seeds
+> amplified. Fix implemented and validated locally (non-blocking log writers
+> + honored `RUST_LOG` + quieter seed progress); awaiting the next cutover
+> attempt.
 > Sibling analysis: [`MULTI-MIRROR-STARVATION.md`](MULTI-MIRROR-STARVATION.md)
 > (fixed 2026-08-16) — that failure was *self-inflicted* (process-wide client
-> gate + internal cascade). This one originates **upstream of us**: the
-> upstream edge kills our connections. Per-database client gating contains
-> the blast radius, but the busy regions flap.
+> gate + internal cascade). This one is a feedback loop between our own
+> logging stalls and the upstream edge's pong-deadline RSTs. Per-database
+> client gating contains the blast radius, but the busy regions flap.
 
 ## Leading hypothesis (2026-08-17): CPU starvation violates the session deadlines
 
@@ -138,26 +142,32 @@ queueing, and the container's page cache hides disk behavior.
 
 Strict serial seeding (one table at a time, one mirror at a time) plus the
 auto-started telemetry capture. **The telemetry finally covers the failure
-window — and it re-attributes the mechanism:**
+window — and its first reading (below) re-attributed the mechanism; a
+subsequent per-interval decode of the same samples re-read it again** (see
+"Root cause" next section): aggregate CPU starvation is disproven either way
+(the box's *compute* was never saturated), but the storage was not idle —
+whole-host **iowait ran 20–95 %** through the cascade.
 
-| measurement (during 22–31 s poll gaps + deaths) | value |
-|---|---|
-| System CPU | **2–5 %** |
-| iowait | 3–13 % of total (≤ ~1 core), but **disk throughput 0.00–0.12 MiB/s** |
-| Green `--data-dir` | **5.5 MB** (control-db + config + logs — mirror stores are memory-only, as designed) |
-| Swap | 1 GiB nearly full (37 MB free), **zero current traffic** |
+| measurement (during 22–31 s poll gaps + deaths) | first reading | corrected reading (per-interval `/proc/stat` decode) |
+|---|---|---|
+| System CPU | 2–5 % | 0.4–13 % during freezes (never compute-bound) ✔ |
+| iowait | "3–13 %, ~1 core" | **16 % → 47 % → 84 %** at cascade onset (11:42:26+), **91–95 %** inside the mass freezes ✔ |
+| disk throughput | 0.00–0.12 MiB/s | 32–53 MB/s write burst at 11:42:26–36, then 1–5 MB/s flushes against a stalled device |
+| Green `--data-dir` | 5.5 MB (control-db + config + logs — mirror stores memory-only, as designed) ✔ | unchanged |
+| Swap | 1 GiB nearly full, zero current traffic ✔ | unchanged |
 
-**Aggregate CPU starvation is disproven as the production mechanism** (as are
-database disk IO and swap). The session-deadline violations are real — gaps
-of 22–31 s — but they occur with the box idle: **in-process synchronous
-blocking inside `Future::poll` on a Tokio worker** (a std-mutex/condvar wait
-held across slow work parks the worker without consuming CPU or IO). Prime
-suspects: the embedded-cache observer dispatch and the shared module-host
-apply plumbing; journald/stdout write backpressure under our verbose logging
-is the secondary suspect. The local Docker repro's CPU-starvation
-reproduction was genuine for its own environment (CFS quota throttling) but
-modeled the wrong resource for production — the "Leading hypothesis" section
-above is retained as history, superseded here.
+The corrected row matters because the first reading ("box idle, ~0 disk")
+made an environmental blocker look impossible and pushed the suspicion
+inward. What actually holds at both readings: the *process* was idle (proc
+CPU 0.4–1.2 % of one core during the freezes, own disk writes ≈ 0) while its
+tasks were parked — **in-process synchronous blocking inside `Future::poll`
+on a Tokio worker**. The per-interval decode plus the journal timestamps
+then identified the blocker (next section): not lock contention in the
+apply plumbing, but the synchronous logging path against a stalled storage
+stack. The local Docker repro's CPU-starvation reproduction was genuine for
+its own environment (CFS quota throttling) but modeled the wrong resource
+for production — the "Leading hypothesis" section above is retained as
+history, superseded here.
 
 **Mitigations' production scorecard (attempt #3, vs #1 / #2):** cold start
 strictly serialized (visible in `/v1/mirrors` — exactly one mirror
@@ -166,17 +176,16 @@ subscribing at a time); silence-aware probe absorbed every late probe
 self-inflicted kills); the cascade is dramatically slower — 4 deaths (12, 8,
 9, 19), all upstream-initiated RST / `ECONNRESET`, fleet holding at 10/14
 (vs collapse to 5 in #1, 7 in #2) with reconnects proceeding strictly
-serially. The underlying stall mechanism remains unfixed.
+serially. The underlying stall mechanism remained unfixed *at that build* —
+see below.
 
 **Attempt #3 outcome:** rolled back at ~11:58 UTC after 5 upstream-initiated
 deaths (regions 12, 8, 9, 7 — the last live 23 min — plus region 19, whose
 serialized re-seed died mid-subscribe at `lived 0ns`, confirming that a
-region whose big-table apply stalls past the pong deadline may never
-complete a re-seed). Fleet held 10/14 throughout; no collapse. Full
-telemetry and the green journal are archived in
-`artifacts-attempt3/` (telemetry log committed; journal also on the host at
-`/tmp/cutover-telemetry/`). The 27-minute window shows 2–5 % CPU and ~0
-disk for the entire attempt — the stall is in-process, full stop.
+region whose apply loop stalls past the pong deadline may never complete a
+re-seed). Fleet held 10/14 throughout; no collapse. Full telemetry and the
+green journal are archived in `artifacts-attempt3/` (telemetry log committed;
+journal also on the host at `/tmp/cutover-telemetry/`).
 
 **Recovery-path observation:** a disconnected region takes minutes before it
 visibly re-attempts — cold-reset (flushing all 274 in-memory tables), then
@@ -184,17 +193,113 @@ backoff, then queueing at the subscribe gate behind whichever serialized
 re-seed is in progress. The `disconnected` status does not distinguish
 flushing / backing-off / gate-queued, which reads as "never re-attempts".
 
+## Root cause (2026-08-17, post-#3 artifact re-analysis): synchronous logging against stalled storage froze the whole process
+
+Three signatures in the attempt-#3 artifacts identify the blocker precisely:
+
+1. **Process-wide log silence for 18.3 s.** The green journal's last line is
+   `subscribe [162/274]` at 11:44:57.199; the next lines — eight
+   `event loop gap` warnings from eight *different* databases — land at
+   11:45:15.489–15.525, i.e. **within 36 ms of each other** after 18 s of
+   nothing. When the blockage cleared, every blocked writer flushed at once.
+   Repeated in waves at 11:45:23/26/27/29/35 with gaps up to 31.8 s.
+2. **Freezes end simultaneously across unrelated sessions** — a shared,
+   process-wide resource, not per-database locks (the apply path had already
+   been verified per-database: `SingleThreadedExecutor` per DB, channel-in /
+   oneshot-out, no worker blocking).
+3. **The process itself was doing nothing** during the freezes: proc CPU
+   0.4–1.2 % of one core, own disk writes ≈ 0, whole-host iowait 91–95 %.
+   All cores idle, storage choked, everything waiting.
+
+The shared resource is the **logging path**. `configure_tracing`
+(`crates/core/src/startup.rs`) wrote every event synchronously from the
+emitting task, twice: to `std::io::stdout` — under systemd a 16–64 KiB pipe
+to journald — and, because disk logging defaults **on**, to a rolling file
+in the data dir. When the host's storage stalls (whole-device iowait
+20–95 % for the final 16 minutes of the attempt; the write volume itself
+was only 1–5 MB/s of flushes — trivial for a healthy disk, saturating for
+this one), journald stops draining the stdout pipe and dirty-page writeback
+throttles the file writes. Every `log::`/`tracing` event then blocks its
+caller inside `Future::poll` on a Tokio worker. Ping/Pong/probe servicing
+stops process-wide; upstream RSTs sessions whose Pongs don't flush within
+~30 s; each death triggers serialized re-seeds that log and allocate more,
+deepening the stall — the cascade, and the "recovery that never visibly
+re-attempts" (the reconnect path logs too).
+
+Aggravators, all confirmed in the code at the time:
+
+- **`RUST_LOG` was silently ignored** — `conf_to_filter` parsed only the
+  config.toml directives, and the data-dir config.toml (copied from the
+  shipped default `crates/standalone/config.toml`) pins
+  `spacetimedb=debug`. That is why DEBUG probe lines appear in the
+  production journal despite the unit's `RUST_LOG=…=info`. The unit's env
+  var never worked.
+- **Per-table subscribe progress at INFO** — two lines × 274 tables per
+  region-seed; the biggest single multiplier of storm volume.
+
+Why the per-instance fleet is stable on the same host: fourteen separate
+processes each get their own runtime and their own small pipe to journald;
+no single process's cold start multiplies fourteen regions' log storm, and
+the fleet's steady state never re-seeds everything at once.
+
+### Fix (commit pending, validated locally)
+
+1. **Non-blocking writers** (`crates/core/src/startup.rs`): both fmt writers
+   (stdout and the rolling file) are wrapped in
+   `tracing_appender::non_blocking` — a dedicated writer thread with a
+   bounded (100 000-line) lossy queue. A stalled sink now drops log lines
+   instead of freezing the database.
+2. **`RUST_LOG` honored**: the env var now overrides the config.toml
+   directives, so the unit's `RUST_LOG=spacetimedb=info,public_mirror=info,relay_cache=info`
+   takes effect.
+3. **Per-table subscribe progress downgraded INFO→DEBUG**
+   (`crates/public-mirror/src/upstream.rs`); `/v1/mirrors` exposes the same
+   progress without the firehose.
+
+**Local A/B validation** (`scripts/local-logging-stall-test.sh`: one region,
+no CPU cap, stdout piped through a reader that never drains — a fully wedged
+journald pipe; verdict = `event loop gap` warnings in the data-dir rolling
+logs, which keep flowing on a healthy local disk):
+
+- **pre-fix binary** (HEAD before the fix): process parked at **0.0 % CPU**,
+  seeding **stuck at table 147/274 for 100+ consecutive seconds**, event-loop
+  gaps **5.8 s and 42.0 s** (42 s is past the ~30 s pong deadline — the
+  production kill), never reached live in the window. Under a gentler 4 KB/s
+  drain the same binary stalls 6.5 s mid-seed — matching the production
+  freeze/release cycling as the pipe trickles.
+- **fixed binary**: **96.7 % CPU (working)** through the same wedged pipe,
+  seeded all 274 tables and went **live in ~105 s**, event-loop gaps only
+  2 × 5.5 s — a bounded big-table decode hiccup that the pre-fix binary
+  shows identically at the same tables (it is not the freeze mechanism and
+  is far inside the pong deadline).
+
+The residual 5–6 s gaps during the multi-million-row table decodes
+(`location_state`, `knowledge_*`) exist in both arms and are pre-existing:
+the offloaded `spawn_blocking` decode plus task scheduling at that scale.
+They did not escalate and did not kill sessions; watching whether they
+stretch on the slower production cores is part of the next attempt's
+telemetry review.
+
 **Next steps (revised):**
 
-1. **Unblock the poll path** (top lever): per-database lock granularity, or
-   move the embedded-cache observer dispatch off the session task's poll —
-   one region's seed work must not park another region's worker.
-2. Status granularity: expose flushing / backoff / gate-queued as distinct
-   states so recovery is legible.
-3. Cheap journald-hypothesis test: async logging or `RUST_LOG=warn` on the
-   next attempt.
-4. Watch swap: 1 GiB nearly exhausted — dormant now, but there is no swap
-   cushion left if memory spikes.
+1. ✅ Logging fix landed (above) — deploy with the next attempt.
+2. Recommend `Environment="SPACETIMEDB_DISABLE_DISK_LOGGING=1"` in
+   `bitcraft-mirror.service`: journald already captures stdout; the rolling
+   file double-writes every line to the same slow disk.
+3. Watch **iowait**, not just CPU, in the attempt telemetry (the sampler
+   already records `/proc/stat` — decode it per-interval; minute averages
+   hid the onset for two analysis rounds).
+4. Identify the 11:42:26 whole-host 32–53 MB/s write burst (journald
+   flushing the accumulated cold-start log volume? page-cache writeback of
+   the same? another unit?) — a storage-rate check on the host
+   (`iostat -x 5`, `journalctl --disk-usage`) before the next attempt
+   would settle it.
+5. Swap: 1 GiB nearly exhausted, dormant through #3 — still no cushion.
+6. Status granularity (flushing / backoff / gate-queued) — still worth
+   doing for operator legibility, now decoupled from the incident.
+7. Report upstream to Clockwork Labs the RSTs that arrive *after* the
+   pong-deadline stalls — those stalls were self-inflicted, but the edge's
+   response (RST vs close) remains their side.
 
 ## Symptom
 
@@ -262,12 +367,19 @@ dependent — not deterministic in the process itself.
   run — the host had no CPU sampler during the incident window (see leading
   hypothesis above).
 
-## Hypotheses (unvalidated; leading hypothesis above, then secondary)
+## Hypotheses (0 superseded — root cause identified; the rest secondary)
 
-0. **CPU starvation on the 4C/8T production host violates the 10–30 s session
-   deadlines** — see "Leading hypothesis". The RSTs are the edge's response to
-   our starved slow-client behavior; the re-seed amplification loop is its
-   engine. Under confirmation.
+0. ~~**CPU starvation on the 4C/8T production host violates the 10–30 s
+   session deadlines**~~ — **superseded twice over**: aggregate CPU was idle
+   during production freezes, and the local CFS-quota reproduction, while
+   real, reproduced a different environment's failure. The deadline
+   violations were real, the starvation was **of the logging sink**, not the
+   CPU (see "Root cause").
+0.5. **Synchronous logging against stalled storage** — **CONFIRMED** (code
+   path, per-interval iowait correlation, journal-silence signatures, and a
+   local single-region repro through a wedged stdout pipe: pre-fix parks at
+   0 % CPU with a 42 s event-loop gap; fixed runs at ~97 % CPU to live).
+   Fixed 2026-08-17.
 1. **Upstream edge throttling / anti-abuse on bursty multi-connection
    patterns.** 14 WebSocket connections established within ~5 minutes plus
    multi-hundred-MB Brotli seed downloads from one IP, then sustained
