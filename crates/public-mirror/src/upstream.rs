@@ -133,13 +133,6 @@ const OFFLOAD_COMPRESSED_BYTES: usize = 4 * 1024;
 /// instead of growing without bound.
 const LIVE_QUEUE_BYTES_MAX: usize = 1024 * 1024 * 1024;
 
-/// When seeding is paced ([`SessionCtx::pace_seeds`]), at most this many seed
-/// tables may sit queued or in flight at once. Small enough to bound a seeding
-/// region's decode/apply burst — both 2026-08-17 production cascades ran on an
-/// unbounded ~274-table pile-up — yet large enough to keep some
-/// download/apply pipelining so cold start stays inside the cutover wait.
-const SEED_BACKLOG_MAX_TABLES: usize = 4;
-
 /// Max live updates applied in one database job. Batching amortizes the
 /// cross-thread round trip to the mirror's dedicated executor when a backlog
 /// has built up (e.g. TUs queued behind a multi-minute seed apply).
@@ -275,10 +268,12 @@ type ApplyFn = Arc<
 /// stall live applies — those run on this DB's JobCores thread, and heavy frame
 /// decode is offloaded off the shared Tokio runtime.
 ///
-/// `pace_seeds` bounds the seeding burst: at most [`SEED_BACKLOG_MAX_TABLES`]
-/// seed tables may be queued or in flight at once (reconnects always; cold
-/// starts once any other mirror is live — see `run_public_mirror_loop`).
-/// Both 2026-08-17 production cascades ran on the unbounded pile-up.
+/// `pace_seeds` makes seeding strictly serial: one table at a time (each
+/// table's seed applies locally before the next downloads) and — because the
+/// pacing waits happen inside the gate-held seeding phase — one mirror at a
+/// time, end to end. Engages on reconnects and on cold-start sessions once
+/// any other mirror is live (see `run_public_mirror_loop`); both 2026-08-17
+/// production cascades ran on unbounded, overlapping seeding.
 #[allow(clippy::too_many_arguments)]
 pub async fn connect_and_mirror(
     config: UpstreamConfig,
@@ -435,9 +430,8 @@ where
 
     if ctx.pace_seeds {
         log::info!(
-            "public-mirror: seed pacing active (database={}) — at most {} seed tables queued/in-flight at once",
-            ctx.observers.database,
-            SEED_BACKLOG_MAX_TABLES
+            "public-mirror: seed pacing active (database={}) — one table seeds at a time, one mirror at a time via the subscribe gate",
+            ctx.observers.database
         );
     }
 
@@ -446,13 +440,17 @@ where
             *failed_table = Some(table.clone());
             return Err(e);
         }
-        // Paced seeding: bound the number of not-yet-applied seed tables so a
-        // seeding region's decode/apply burst stays capped while other
-        // regions' live ingest needs the CPU (and the disk). Client Pings
-        // keep the socket byte counter moving, so the subscribe stall
-        // timeout cannot fire while we wait.
+        // Paced seeding is strictly one table at a time: this table's seed
+        // applies locally before the next one downloads, so a seeding
+        // region's decode/apply burst is a single table's worth while other
+        // regions' live ingest needs the CPU (and the disk). Because the
+        // pacing wait happens inside the gate-held seeding phase, the
+        // subscribe gate is then held through the mirror's entire seeding —
+        // one mirror seeds at a time, end to end. Client Pings keep the
+        // socket byte counter moving, so the subscribe stall timeout cannot
+        // fire while we wait.
         if ctx.pace_seeds {
-            await_seed_backlog_below(ctx, SEED_BACKLOG_MAX_TABLES).await?;
+            await_all_seeds_applied(ctx, &completed_tables).await?;
         }
     }
 
@@ -552,23 +550,6 @@ where
         }
     }
     ctx.flush_completed_seeds(completed_tables).await;
-    Ok(())
-}
-
-/// Pacing primitive: wait until at most `max` seed tables remain queued or in
-/// flight, servicing the socket the whole time. Bounds a seeding session's
-/// burst without making it fully apply-bound (which would stretch cold start
-/// past the cutover wait).
-async fn await_seed_backlog_below<S>(ctx: &mut SessionCtx<S>, max: usize) -> Result<(), UpstreamError>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    while ctx.applier.seed_backlog_len() > max {
-        match ctx.next_event().await? {
-            Event::Frame(frame) => ctx.handle_frames_from(frame).await?,
-            Event::Applied | Event::Tick | Event::Probe => {}
-        }
-    }
     Ok(())
 }
 
@@ -1139,20 +1120,6 @@ impl Applier {
             return true;
         }
         self.queue.iter().any(|p| matches!(p.kind, ApplyKind::Seed { .. }))
-    }
-
-    /// Seed tables queued or in flight — the seeding burst the pacing
-    /// primitive ([`await_seed_backlog_below`]) bounds.
-    fn seed_backlog_len(&self) -> usize {
-        let in_flight = self
-            .in_flight
-            .as_ref()
-            .is_some_and(|f| f.seed_table_number.is_some()) as usize;
-        in_flight + self
-            .queue
-            .iter()
-            .filter(|p| matches!(p.kind, ApplyKind::Seed { .. }))
-            .count()
     }
 
     fn drain_completed_seed_tables(&mut self) -> Vec<String> {
@@ -1758,48 +1725,6 @@ mod tests {
         }
         assert!(!applier.has_pending_seeds());
         assert_eq!(finished, vec!["t_a".to_string(), "t_b".to_string(), "t_c".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn seed_backlog_counts_queued_and_in_flight_seeds_only() {
-        let status = test_status();
-        let on_update = counting_apply(Arc::new(AtomicUsize::new(0)));
-        let mut applier = Applier::default();
-
-        for (name, n) in [("t_a", 1u32), ("t_b", 2)] {
-            applier.enqueue_seed(
-                name.into(),
-                UpstreamUpdate {
-                    provenance: None,
-                    tables: Vec::new(),
-                    is_seed: true,
-                },
-                0,
-                n,
-            );
-        }
-        // Live updates interleaved with seeds must not count toward the
-        // seeding backlog the pacing primitive bounds.
-        applier.enqueue_live(live_update(false, 8)).unwrap();
-        applier.enqueue_seed(
-            "t_c".into(),
-            UpstreamUpdate {
-                provenance: None,
-                tables: Vec::new(),
-                is_seed: true,
-            },
-            0,
-            3,
-        );
-        assert_eq!(applier.seed_backlog_len(), 3);
-
-        // Starting the front seed moves it from queued to in-flight — still
-        // counted; finishing it drops the backlog by one.
-        applier.maybe_start(&on_update, &status);
-        assert_eq!(applier.seed_backlog_len(), 3);
-        let result = applier.in_flight.as_mut().unwrap().fut.as_mut().await;
-        applier.finish_in_flight(result, &status).unwrap();
-        assert_eq!(applier.seed_backlog_len(), 2);
     }
 
     #[test]

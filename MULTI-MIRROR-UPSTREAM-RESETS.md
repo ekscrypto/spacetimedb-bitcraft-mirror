@@ -112,13 +112,16 @@ queueing, and the container's page cache hides disk behavior.
 
 **Next steps specific to this attempt:**
 
-1. ✅ **Pace seeding whenever any other mirror is live** (implemented
-   2026-08-17): `run_public_mirror_loop` consults the status registry before
-   each session — reconnects *and* cold-start sessions with ≥1 live mirror
-   now seed with at most `SEED_BACKLOG_MAX_TABLES` (4) seed tables queued or
-   in flight, bounding the burst without making cold start fully apply-bound
-   (which would stretch past the cutover wait). Only the very first mirror
-   of a cold start pipelines unbounded (nothing is live to starve).
+1. ✅ **Serial seeding: one mirror at a time, one table at a time**
+   (implemented 2026-08-17): `run_public_mirror_loop` consults the status
+   registry before each session — pacing applies to reconnects *and*
+   cold-start sessions with ≥1 live mirror (only the very first mirror of a
+   cold start pipelines; nothing is live to starve). Pacing is strict: each
+   table's seed applies locally before the next downloads, and because the
+   waits happen inside the gate-held seeding phase, the subscribe gate then
+   covers the mirror's entire seeding — one mirror seeds end-to-end at a
+   time. `CUTOVER_WAIT_TIMEOUT` default raised 3600 → 7200 s for the longer
+   serialized cold start.
 2. ✅ **Fixed capture for the next attempt** (implemented 2026-08-17):
    `bitcraft-relay/tools/cutover-telemetry-capture.sh` — pidfile-guarded (no
    pattern-match kills), CPU **and iowait split**, `/proc/diskstats`, and
