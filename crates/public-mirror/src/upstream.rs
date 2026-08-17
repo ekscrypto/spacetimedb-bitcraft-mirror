@@ -12,15 +12,25 @@
 //! kernel buffer so upstream never sees a slow consumer.
 //!
 //! Apply ordering is preserved: the queue is strictly FIFO — seeds and live
-//! updates apply in arrival order. During initial subscribe, wire seeds are
+//! updates apply in arrival order. On the initial cold start, wire seeds are
 //! queued as they arrive and the next table's `SubscribeMulti` is sent
-//! immediately (same pipelining as relay sequential mode); local apply
-//! catches up on the dedicated DB thread while upstream keeps sending.
-//! Frames read while a large seed frame is decoding on the blocking pool are
-//! **deferred** (buffered, not applied) and replayed once the seed is enqueued
-//! — applying them eagerly would reorder post-snapshot updates ahead of the
-//! seed, whose truncate-then-insert would erase their effects and leave stale
-//! rows behind.
+//! immediately; local apply catches up on the dedicated DB thread while
+//! upstream keeps sending. **Re-seeds are paced** (each table's seed applies
+//! locally before the next downloads) so a reconnecting region's decode and
+//! apply bursts cannot starve the live sessions sharing the runtime. Heavy
+//! frames — anything at/above [`OFFLOAD_DECODE_BYTES`], or compressed
+//! at/above [`OFFLOAD_COMPRESSED_BYTES`] — decompress + decode on the
+//! (deprioritized) blocking pool; frames read while such a decode is in
+//! flight are **deferred** (buffered, not applied) and replayed in arrival
+//! order once the decoded message has been routed — applying them eagerly
+//! would reorder post-snapshot updates ahead of the seed, whose
+//! truncate-then-insert would erase their effects and leave stale rows
+//! behind.
+//!
+//! The liveness probe is **silence-aware**: a late probe on a socket that is
+//! still receiving indicates a starved local runtime, not a dead upstream,
+//! and is tolerated (up to [`PROBE_LATE_HARD_TIMEOUT`]) instead of
+//! cold-resetting the session into a re-seed cascade.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -72,9 +82,21 @@ const CLIENT_PING_INTERVAL: Duration = Duration::from_secs(10);
 /// connectivity stays `live` but transactions freeze.
 const PROBE_INTERVAL: Duration = Duration::from_secs(60);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Silence-awareness (2026-08-17 upstream-resets post-mortem): a probe that
+/// is late while the socket is still receiving is a starved runtime, not a
+/// dead upstream — killing it triggers the re-seed cascade (6 of 7 probe
+/// timeouts in the calibrated repro were false). Only a probe unanswered
+/// this long **with bytes flowing** is treated as a real failure.
+const PROBE_LATE_HARD_TIMEOUT: Duration = Duration::from_secs(150);
 const PROBE_MESSAGE_ID: &[u8] = b"PUBLIC_MIRROR_PROBE";
 /// How often to poll an in-flight probe against [`PROBE_TIMEOUT`].
 const PROBE_DEADLINE_POLL: Duration = Duration::from_secs(5);
+
+/// Warn when the gap between `next_event` completions exceeds this: the
+/// session task was starved off the shared Tokio workers (host CPU
+/// saturation), and the client-ping (10s), upstream-pong (~30s), and probe
+/// (30s) deadlines above have started to slip.
+const EVENT_LOOP_LAG_WARN: Duration = Duration::from_secs(5);
 
 /// Absolute per-table cap waiting for `SubscribeMultiApplied`. Safety net only:
 /// the *stall* timeout below is the operative one, so a slow-but-progressing
@@ -96,6 +118,13 @@ const IDENTITY_TOKEN_TIMEOUT: Duration = Duration::from_secs(60);
 /// tasks on the shared Tokio runtime. Live transaction updates stay well under
 /// this; only seed snapshots exceed it.
 const OFFLOAD_DECODE_BYTES: usize = 256 * 1024;
+/// Compressed frames at/above this (compressed) size also decode on the
+/// blocking pool even though they are under [`OFFLOAD_DECODE_BYTES`]:
+/// Brotli-decompressing busy-region live updates inline on a worker is
+/// exactly what stretched poll gaps to 5–10 s and starved Ping/Pong/probe
+/// servicing in the 2026-08-17 incident. Below this the decompress is
+/// microseconds and not worth a blocking-pool round trip.
+const OFFLOAD_COMPRESSED_BYTES: usize = 4 * 1024;
 
 /// Cap on decoded-but-unapplied *live* update bytes queued in memory. Seeds are
 /// excluded from this cap: their size is dictated by upstream and they queue in
@@ -236,8 +265,13 @@ type ApplyFn = Arc<
 ///
 /// **Live invariant:** once this session reaches `status.set_live()`, it never
 /// reacquires the gate until disconnect. Another mirror's subscribe/seed must not
-/// stall live applies — those run on this DB's JobCores thread, and large frame
+/// stall live applies — those run on this DB's JobCores thread, and heavy frame
 /// decode is offloaded off the shared Tokio runtime.
+///
+/// `pace_seeds` (reconnects only) serializes each table's wire seed with its
+/// local apply: the next table's `SubscribeMulti` is not sent until the
+/// previous seed has applied, bounding a re-seed's decode/apply burst to one
+/// table at a time instead of the whole snapshot queueing at once.
 #[allow(clippy::too_many_arguments)]
 pub async fn connect_and_mirror(
     config: UpstreamConfig,
@@ -252,6 +286,7 @@ pub async fn connect_and_mirror(
     completed_tables: Arc<Mutex<HashSet<String>>>,
     observers: Option<Arc<MirrorObserverRegistry>>,
     generation: u64,
+    pace_seeds: bool,
 ) -> Result<(), UpstreamError> {
     *live_started = None;
     *failed_table = None;
@@ -287,12 +322,17 @@ pub async fn connect_and_mirror(
         let tcp = TcpStream::connect(&addr)
             .await
             .map_err(|e| UpstreamError::Connect(format!("tcp connect {addr}: {e}")))?;
+        let peer = tcp
+            .peer_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| "unknown".into());
         let counted = ByteCountStream::new(tcp, counter.clone());
         client_async_tls_with_config(request, counted, Some(ws_config), None)
             .await
             .map_err(|e| UpstreamError::Connect(e.to_string()))
+            .map(|(sock, response)| ((sock, response), peer))
     };
-    let (sock, _response) = tokio::time::timeout(config.connect_timeout, connect_fut)
+    let ((sock, _response), peer) = tokio::time::timeout(config.connect_timeout, connect_fut)
         .await
         .map_err(|_| UpstreamError::Connect("connect timeout".into()))??;
 
@@ -301,7 +341,10 @@ pub async fn connect_and_mirror(
     // Splitting read/write means auto-Pongs queued during a multi-GiB
     // fragmented Binary never flush until the write half is polled —
     // upstream's ~30s ping timeout then RSTs the connection mid-seed.
-    log::info!("public-mirror: upstream websocket established");
+    log::info!(
+        "public-mirror: upstream websocket established (database={}, peer={peer})",
+        config.database
+    );
     status.set_connected();
 
     let mut ping_interval = tokio::time::interval(CLIENT_PING_INTERVAL);
@@ -327,7 +370,7 @@ pub async fn connect_and_mirror(
         probe_answered: true,
         probe_sent_at: None,
         applier: Applier::default(),
-        row_types,
+        row_types: Arc::new(row_types),
         on_update,
         status,
         observers: SessionObservers {
@@ -336,6 +379,11 @@ pub async fn connect_and_mirror(
             registry: observers,
         },
         counter,
+        last_event_at: None,
+        max_event_gap: Duration::ZERO,
+        probe_sent_bytes: 0,
+        probe_late_warned: false,
+        pace_seeds,
         deferred: VecDeque::new(),
     };
 
@@ -378,10 +426,25 @@ where
     // state (kick clients + flush tables) before re-acquiring the subscribe gate.
     completed_tables.lock().await.clear();
 
+    if ctx.pace_seeds {
+        log::info!(
+            "public-mirror: re-seed pacing active (database={}) — each table's seed applies locally before the next downloads",
+            ctx.observers.database
+        );
+    }
+
     for (idx, table) in tables.iter().enumerate() {
         if let Err(e) = subscribe_table(ctx, table, idx, tables.len()).await {
             *failed_table = Some(table.clone());
             return Err(e);
+        }
+        // Paced re-seeds: let this table's seed finish applying before the
+        // next one downloads, so the re-seeding region's decode/apply burst
+        // stays bounded to one table while other regions' live ingest needs
+        // the CPU. Client Pings keep the socket byte counter moving, so the
+        // subscribe stall timeout cannot fire while we wait.
+        if ctx.pace_seeds {
+            await_all_seeds_applied(ctx, &completed_tables).await?;
         }
     }
 
@@ -459,7 +522,7 @@ where
     // Now that the seed is queued, replay frames that arrived while it was
     // decoding off-thread. These are post-snapshot updates: applying them
     // before the seed would let the truncate-and-seed erase their effects.
-    ctx.drain_deferred()?;
+    ctx.drain_deferred_background().await?;
 
     Ok(())
 }
@@ -475,7 +538,7 @@ where
 {
     while ctx.applier.has_pending_seeds() {
         match ctx.next_event().await? {
-            Event::Frame(frame) => ctx.handle_background_frame(frame)?,
+            Event::Frame(frame) => ctx.handle_frames_from(frame).await?,
             Event::Applied => ctx.flush_completed_seeds(completed_tables).await,
             Event::Tick | Event::Probe => {}
         }
@@ -521,12 +584,30 @@ struct SessionCtx<S> {
     probe_answered: bool,
     probe_sent_at: Option<tokio::time::Instant>,
     applier: Applier,
-    row_types: HashMap<String, ProductType>,
+    row_types: Arc<HashMap<String, ProductType>>,
     on_update: ApplyFn,
     status: MirrorStatusHandle,
     observers: SessionObservers,
     counter: ByteCounter,
-    /// Frames received while a large seed frame is decoding off-thread.
+    /// When `next_event` last completed; gaps mean the session task was not
+    /// polled (shared-runtime worker starvation) long enough to threaten the
+    /// ping/probe deadlines.
+    last_event_at: Option<tokio::time::Instant>,
+    /// Largest inter-poll gap observed this session.
+    max_event_gap: Duration,
+    /// `counter.bytes_total()` when the in-flight probe was sent — at deadline
+    /// time distinguishes "upstream silent" from "response arrived but was
+    /// processed late" (a starved-runtime false timeout).
+    probe_sent_bytes: u64,
+    /// Whether the current probe's "late but receiving" warning has fired
+    /// (avoid re-warning every [`PROBE_DEADLINE_POLL`] while it lags).
+    probe_late_warned: bool,
+    /// Re-seed pacing (reconnects only): wait for each table's seed to apply
+    /// locally before subscribing the next, so a re-seeding region's decode
+    /// and apply bursts cannot pile up behind live ingest. Cold starts keep
+    /// the pipelined behavior — nothing is live yet to starve.
+    pace_seeds: bool,
+    /// Frames received while a heavy frame is decoding off-thread.
     /// Applying them immediately would reorder them **ahead of the seed**
     /// they arrived after (the truncate-and-seed then erases their effects,
     /// leaving stale rows whose next update hits a unique-constraint
@@ -583,7 +664,7 @@ where
             _ = probe_deadline.tick(), if probe_armed => RawEvent::ProbeCheck,
             msg = next_binary(sock) => RawEvent::Frame(msg?),
         };
-        match raw {
+        let result = match raw {
             RawEvent::ApplyFinished(result) => {
                 self.applier.finish_in_flight(result, &self.status)?;
                 self.applier.maybe_start(&self.on_update, &self.status);
@@ -598,45 +679,91 @@ where
                 send_liveness_probe(&mut self.sock).await?;
                 self.probe_answered = false;
                 self.probe_sent_at = Some(tokio::time::Instant::now());
+                self.probe_sent_bytes = self.counter.bytes_total();
+                self.probe_late_warned = false;
                 Ok(Event::Probe)
             }
             RawEvent::ProbeCheck => {
                 if !self.probe_answered {
                     if let Some(sent_at) = self.probe_sent_at {
-                        if sent_at.elapsed() >= PROBE_TIMEOUT {
-                            log::warn!(
-                                "public-mirror: liveness probe timed out after {}s — forcing reconnect",
-                                PROBE_TIMEOUT.as_secs()
-                            );
-                            return Err(UpstreamError::ProbeTimeout(PROBE_TIMEOUT.as_secs()));
+                        let elapsed = sent_at.elapsed();
+                        if elapsed >= PROBE_TIMEOUT {
+                            let bytes_since_probe = self
+                                .counter
+                                .bytes_total()
+                                .saturating_sub(self.probe_sent_bytes);
+                            if bytes_since_probe == 0 {
+                                // Socket silent since the probe was sent: the
+                                // upstream genuinely stopped responding.
+                                log::warn!(
+                                    "public-mirror: liveness probe timed out after {}s — forcing reconnect (database={}, socket silent since probe send — upstream non-response, max event gap {:?})",
+                                    PROBE_TIMEOUT.as_secs(),
+                                    self.observers.database,
+                                    self.max_event_gap
+                                );
+                                return Err(UpstreamError::ProbeTimeout(PROBE_TIMEOUT.as_secs()));
+                            }
+                            if elapsed >= PROBE_LATE_HARD_TIMEOUT {
+                                // Bytes flow but the probe response was never
+                                // processed even given a generous starvation
+                                // allowance — treat as a real failure.
+                                log::warn!(
+                                    "public-mirror: liveness probe unanswered for {elapsed:?} despite {bytes_since_probe}B received — exceeding hard cap, forcing reconnect (database={}, max event gap {:?})",
+                                    self.observers.database,
+                                    self.max_event_gap
+                                );
+                                return Err(UpstreamError::ProbeTimeout(PROBE_TIMEOUT.as_secs()));
+                            }
+                            // Late but receiving: a starved runtime, not a dead
+                            // upstream. Tolerate (once per probe) instead of
+                            // cold-resetting into the re-seed cascade.
+                            if !self.probe_late_warned {
+                                self.probe_late_warned = true;
+                                log::warn!(
+                                    "public-mirror: liveness probe late by {elapsed:?} but socket is receiving ({bytes_since_probe}B since send) — tolerating starved runtime, not killing the session (database={}, max event gap {:?})",
+                                    self.observers.database,
+                                    self.max_event_gap
+                                );
+                            }
                         }
                     }
                 }
                 Ok(Event::Probe)
             }
+        };
+        self.note_event_gap();
+        result
+    }
+
+    /// Record the gap since the previous `next_event` completion. A gap means
+    /// the session task was not polled at all for that long — the direct
+    /// signature of shared-runtime worker starvation — at which scale the
+    /// client-ping (10s), upstream-pong (~30s), and probe (30s) deadlines
+    /// slip and the upstream edge RSTs us.
+    fn note_event_gap(&mut self) {
+        let now = tokio::time::Instant::now();
+        if let Some(last) = self.last_event_at.replace(now) {
+            let gap = now - last;
+            if gap > self.max_event_gap {
+                self.max_event_gap = gap;
+            }
+            if gap >= EVENT_LOOP_LAG_WARN {
+                log::warn!(
+                    "public-mirror: event loop gap {gap:?} between polls (database={}, max {:?}) — shared-runtime worker starvation suspected",
+                    self.observers.database,
+                    self.max_event_gap
+                );
+            }
         }
     }
 
-    /// Decode and route a frame received outside a seed wait: enqueue live TUs,
-    /// surface subscription errors, ignore the rest.
-    fn handle_background_frame(&mut self, frame: Bytes) -> Result<(), UpstreamError> {
-        let server = decode_server_message(&frame)?;
-        self.route_background(server)
-    }
-
-    fn route_background(&mut self, server: ServerMessage<BsatnFormat>) -> Result<(), UpstreamError> {
-        match server {
-            ServerMessage::TransactionUpdate(tu) => {
-                if let Some(update) = tu_to_update(tu, &self.row_types)? {
-                    self.enqueue_live(update)?;
-                }
-            }
-            ServerMessage::TransactionUpdateLight(tul) => {
-                if let Some(update) = tul_to_update(tul, &self.row_types)? {
-                    self.enqueue_live(update)?;
-                }
-            }
-            ServerMessage::OneOffQueryResponse(_) => {
+    /// Route an already-decoded background message: enqueue live TUs, mark
+    /// probe responses, surface subscription errors, ignore the rest.
+    fn apply_decoded_background(&mut self, decoded: DecodedBackground) -> Result<(), UpstreamError> {
+        match decoded {
+            DecodedBackground::Update(Some(update)) => self.enqueue_live(update),
+            DecodedBackground::Update(None) => Ok(()),
+            DecodedBackground::ProbeResponse => {
                 // Liveness probe reply — any response (ok or error) proves the
                 // upstream application is still processing requests.
                 if !self.probe_answered {
@@ -644,15 +771,118 @@ where
                     self.probe_answered = true;
                     self.probe_sent_at = None;
                 }
+                Ok(())
             }
-            ServerMessage::SubscriptionError(err) => {
-                return Err(UpstreamError::Subscription(err.error.to_string()));
-            }
-            other => {
-                log::debug!("public-mirror: ignoring message: {}", variant_name(&other));
+            DecodedBackground::SubscriptionError(e) => Err(UpstreamError::Subscription(e)),
+            DecodedBackground::Ignored(name) => {
+                log::debug!("public-mirror: ignoring message: {name}");
+                Ok(())
             }
         }
+    }
+
+    /// Decode one background frame and route it, then any frames deferred
+    /// while it decoded off-thread — strictly in arrival order. Heavy frames
+    /// (see [`is_heavy_frame`]) decode on the blocking pool: keeping the
+    /// per-poll work on the shared Tokio workers tiny is what keeps
+    /// Pings/Pongs and probe responses flowing when many mirrors ingest at
+    /// once on a saturated host.
+    async fn handle_frames_from(&mut self, first: Bytes) -> Result<(), UpstreamError> {
+        let mut current = Some(first);
+        loop {
+            let frame = match current.take() {
+                Some(f) => f,
+                None => match self.deferred.pop_front() {
+                    Some(f) => f,
+                    None => return Ok(()),
+                },
+            };
+            let decoded = if is_heavy_frame(&frame) {
+                let row_types = Arc::clone(&self.row_types);
+                self.run_blocking_decode(move || decode_background_frame(&frame, &row_types))
+                    .await?
+            } else {
+                decode_background_frame(&frame, &self.row_types)?
+            };
+            self.apply_decoded_background(decoded)?;
+        }
+    }
+
+    /// Like [`Self::handle_frames_from`], but classifies with the awaited
+    /// `query_id` so the session's own wire seed is never swallowed as a
+    /// background message. Returns the awaited seed if found (remaining
+    /// deferred frames are left for the caller to replay **after** the seed
+    /// is enqueued), or `None` once every deferred frame is routed.
+    async fn handle_frames_from_seed_wait(
+        &mut self,
+        first: Bytes,
+        query_id: u32,
+    ) -> Result<Option<(Vec<UpstreamTableOps>, usize, usize)>, UpstreamError> {
+        let mut current = Some(first);
+        loop {
+            let frame = match current.take() {
+                Some(f) => f,
+                None => match self.deferred.pop_front() {
+                    Some(f) => f,
+                    None => return Ok(None),
+                },
+            };
+            let decoded = if is_heavy_frame(&frame) {
+                let row_types = Arc::clone(&self.row_types);
+                self.run_blocking_decode(move || decode_seed_wait_frame(&frame, query_id, &row_types))
+                    .await?
+            } else {
+                decode_seed_wait_frame(&frame, query_id, &self.row_types)?
+            };
+            match decoded {
+                SeedWaitDecode::Seed {
+                    tables_ops,
+                    n_rows,
+                    wire_bytes,
+                } => return Ok(Some((tables_ops, n_rows, wire_bytes))),
+                SeedWaitDecode::WrongQueryId { got, want } => {
+                    log::warn!("public-mirror: unexpected SubscribeMultiApplied query_id={got} (want {want})");
+                }
+                SeedWaitDecode::Background(bg) => self.apply_decoded_background(bg)?,
+            }
+        }
+    }
+
+    /// Replay frames deferred during offloaded decodes (background mode).
+    async fn drain_deferred_background(&mut self) -> Result<(), UpstreamError> {
+        if let Some(frame) = self.deferred.pop_front() {
+            self.handle_frames_from(frame).await?;
+        }
         Ok(())
+    }
+
+    /// Run `decode` on the blocking pool (deprioritized) while continuing to
+    /// service the socket, Pings, probes, and in-flight applies. Frames that
+    /// arrive meanwhile are deferred; the callers above replay them in
+    /// arrival order once the decode returns.
+    async fn run_blocking_decode<T, F>(&mut self, decode: F) -> Result<T, UpstreamError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, UpstreamError> + Send + 'static,
+    {
+        let mut join = tokio::task::spawn_blocking(move || {
+            deprioritize_mirror_background_thread();
+            decode()
+        });
+        loop {
+            tokio::select! {
+                biased;
+                joined = &mut join => {
+                    return joined
+                        .map_err(|e| UpstreamError::Decode(format!("offloaded decode join failed: {e}")))?;
+                }
+                ev = self.next_event() => {
+                    if let Event::Frame(frame) = ev? {
+                        self.deferred.push_back(frame);
+                    }
+                }
+            }
+        }
     }
 
     fn enqueue_live(&mut self, update: UpstreamUpdate) -> Result<(), UpstreamError> {
@@ -687,7 +917,7 @@ where
                             log::info!("public-mirror: identity token received (identity={})", it.identity);
                             return Ok(());
                         }
-                        other => self.route_background(other)?,
+                        other => self.apply_decoded_background(classify_background(other, &self.row_types)?)?,
                     }
                 }
                 Event::Applied | Event::Tick | Event::Probe => {}
@@ -718,79 +948,15 @@ where
             }
             match self.next_event().await? {
                 Event::Frame(frame) => {
-                    let decoded = if frame.len() >= OFFLOAD_DECODE_BYTES {
-                        self.decode_offloaded(frame, query_id).await?
-                    } else {
-                        decode_seed_wait_frame(&frame, query_id, &self.row_types)?
-                    };
-                    match decoded {
-                        SeedWaitDecode::Seed {
-                            tables_ops,
-                            n_rows,
-                            wire_bytes,
-                        } => {
-                            // Deferred frames are replayed by the caller,
-                            // *after* it enqueues this seed.
-                            return Ok((tables_ops, n_rows, wire_bytes));
-                        }
-                        SeedWaitDecode::WrongQueryId { got, want } => {
-                            log::warn!("public-mirror: unexpected SubscribeMultiApplied query_id={got} (want {want})");
-                            self.drain_deferred()?;
-                        }
-                        SeedWaitDecode::Other(server) => {
-                            self.route_background(server)?;
-                            self.drain_deferred()?;
-                        }
+                    if let Some(seed) = self.handle_frames_from_seed_wait(frame, query_id).await? {
+                        // Deferred frames (if any) are replayed by the caller,
+                        // *after* it enqueues this seed.
+                        return Ok(seed);
                     }
                 }
                 Event::Applied | Event::Tick | Event::Probe => {}
             }
         }
-    }
-
-    /// Decompress + decode a large frame on the blocking pool while continuing
-    /// to service the socket, Pings, and in-flight applies.
-    ///
-    /// **Ordering:** frames read while the decode is in flight arrived *after*
-    /// the frame being decoded, so they must apply after it. They are pushed
-    /// onto [`Self::deferred`] instead of being applied; the caller replays
-    /// them once the decoded message has been routed (for a seed, only after
-    /// the seed is enqueued).
-    async fn decode_offloaded(&mut self, frame: Bytes, query_id: u32) -> Result<SeedWaitDecode, UpstreamError> {
-        enum JoinEvent {
-            Done(Result<Result<SeedWaitDecode, UpstreamError>, tokio::task::JoinError>),
-            Session(Result<Event, UpstreamError>),
-        }
-        let row_types = self.row_types.clone();
-        let mut join = tokio::task::spawn_blocking(move || {
-            deprioritize_mirror_background_thread();
-            decode_seed_wait_frame(&frame, query_id, &row_types)
-        });
-        loop {
-            let raw = tokio::select! {
-                biased;
-                joined = &mut join => JoinEvent::Done(joined),
-                ev = self.next_event() => JoinEvent::Session(ev),
-            };
-            match raw {
-                JoinEvent::Done(joined) => {
-                    return joined.map_err(|e| UpstreamError::Decode(format!("seed decode join failed: {e}")))?;
-                }
-                JoinEvent::Session(ev) => {
-                    if let Event::Frame(frame) = ev? {
-                        self.deferred.push_back(frame);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Replay frames deferred during an offloaded decode, in arrival order.
-    fn drain_deferred(&mut self) -> Result<(), UpstreamError> {
-        while let Some(frame) = self.deferred.pop_front() {
-            self.handle_background_frame(frame)?;
-        }
-        Ok(())
     }
 
     /// Live update loop — read, decode, enqueue; applies complete concurrently.
@@ -804,7 +970,7 @@ where
         self.probe.reset_at(tokio::time::Instant::now() + PROBE_INTERVAL);
         loop {
             if let Event::Frame(frame) = self.next_event().await? {
-                self.handle_background_frame(frame)?;
+                self.handle_frames_from(frame).await?;
             }
         }
     }
@@ -1073,6 +1239,53 @@ fn encode_one_off_query(message_id: &[u8], query: &str) -> Result<Vec<u8>, Upstr
     bsatn::to_vec(&msg).map_err(|e| UpstreamError::Encode(e.to_string()))
 }
 
+/// A background (non-seed-wait) message after decoding and TU/TUL
+/// conversion — the CPU-heavy part — ready to route.
+#[derive(Debug)]
+enum DecodedBackground {
+    Update(Option<UpstreamUpdate>),
+    ProbeResponse,
+    SubscriptionError(String),
+    Ignored(&'static str),
+}
+
+/// Classify a decoded server message for the background path, doing the
+/// expensive TU/TUL conversion (Brotli row lists, delete-row decode) eagerly
+/// so it can run on the blocking pool instead of a Tokio worker.
+fn classify_background(
+    server: ServerMessage<BsatnFormat>,
+    row_types: &HashMap<String, ProductType>,
+) -> Result<DecodedBackground, UpstreamError> {
+    Ok(match server {
+        ServerMessage::TransactionUpdate(tu) => DecodedBackground::Update(tu_to_update(tu, row_types)?),
+        ServerMessage::TransactionUpdateLight(tul) => DecodedBackground::Update(tul_to_update(tul, row_types)?),
+        ServerMessage::OneOffQueryResponse(_) => DecodedBackground::ProbeResponse,
+        ServerMessage::SubscriptionError(err) => DecodedBackground::SubscriptionError(err.error.to_string()),
+        other => DecodedBackground::Ignored(variant_name(&other)),
+    })
+}
+
+fn decode_background_frame(
+    frame: &[u8],
+    row_types: &HashMap<String, ProductType>,
+) -> Result<DecodedBackground, UpstreamError> {
+    classify_background(decode_server_message(frame)?, row_types)
+}
+
+/// Whether a frame must be decompressed + decoded on the blocking pool: any
+/// frame at/above [`OFFLOAD_DECODE_BYTES`], or a compressed frame at/above
+/// [`OFFLOAD_COMPRESSED_BYTES`]. Keeping these off the workers is what keeps
+/// Pong/Ping/probe servicing alive under ingest saturation.
+fn is_heavy_frame(frame: &[u8]) -> bool {
+    if frame.len() >= OFFLOAD_DECODE_BYTES {
+        return true;
+    }
+    matches!(
+        frame.first(),
+        Some(&SERVER_MSG_COMPRESSION_TAG_BROTLI) | Some(&SERVER_MSG_COMPRESSION_TAG_GZIP)
+    ) && frame.len() >= OFFLOAD_COMPRESSED_BYTES
+}
+
 enum SeedWaitDecode {
     Seed {
         tables_ops: Vec<UpstreamTableOps>,
@@ -1083,7 +1296,7 @@ enum SeedWaitDecode {
         got: u32,
         want: u32,
     },
-    Other(ServerMessage<BsatnFormat>),
+    Background(DecodedBackground),
 }
 
 /// Decode one binary frame received while awaiting `SubscribeMultiApplied`.
@@ -1110,7 +1323,7 @@ fn decode_seed_wait_frame(
                 wire_bytes,
             })
         }
-        other => Ok(SeedWaitDecode::Other(other)),
+        other => Ok(SeedWaitDecode::Background(classify_background(other, row_types)?)),
     }
 }
 
@@ -1527,6 +1740,25 @@ mod tests {
             decode_server_message(&[9, 1, 2]),
             Err(UpstreamError::UnknownCompression(9))
         ));
+    }
+
+    #[test]
+    fn heavy_frame_detection_matches_thresholds() {
+        // Uncompressed frames only offload at the large-frame threshold.
+        let big_plain = vec![SERVER_MSG_COMPRESSION_TAG_NONE; OFFLOAD_DECODE_BYTES];
+        assert!(is_heavy_frame(&big_plain));
+        let small_plain = vec![SERVER_MSG_COMPRESSION_TAG_NONE; OFFLOAD_DECODE_BYTES - 1];
+        assert!(!is_heavy_frame(&small_plain));
+        // Compressed frames offload from the much smaller compressed threshold.
+        let small_brotli = vec![SERVER_MSG_COMPRESSION_TAG_BROTLI; OFFLOAD_COMPRESSED_BYTES - 1];
+        assert!(!is_heavy_frame(&small_brotli));
+        let brotli_at_threshold = vec![SERVER_MSG_COMPRESSION_TAG_BROTLI; OFFLOAD_COMPRESSED_BYTES];
+        assert!(is_heavy_frame(&brotli_at_threshold));
+        let gzip_at_threshold = vec![SERVER_MSG_COMPRESSION_TAG_GZIP; OFFLOAD_COMPRESSED_BYTES];
+        assert!(is_heavy_frame(&gzip_at_threshold));
+        // Uncompressed tag does not get the compressed threshold.
+        let plain_below_large = vec![SERVER_MSG_COMPRESSION_TAG_NONE; OFFLOAD_COMPRESSED_BYTES];
+        assert!(!is_heavy_frame(&plain_below_large));
     }
 
     #[test]

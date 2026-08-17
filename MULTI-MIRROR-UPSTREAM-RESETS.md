@@ -1,12 +1,77 @@
 # Upstream connection resets in one-process multi-mirror mode (OPEN)
 
 > First hard evidence: 2026-08-17 production switch attempt (01:13–01:26 UTC).
-> Status: **OPEN** — unresolved, under investigation.
+> Status: **OPEN** — mechanism confirmed in the calibrated local repro
+> 2026-08-17; **mitigations 1–3 implemented 2026-08-17 and validated in the
+> same repro** (fleet converged 14/14 and held, vs baseline cascade that never
+> recovered; false-probe self-kills 6 → 0, probe kills 14 → 8, poll-gap
+> warnings 145 → 83 at the harsh `--cpus=1` end of the host-equivalent
+> band). Production-side confirmation (deploy + `pidstat` capture on the
+> next switch attempt) still pending.
 > Sibling analysis: [`MULTI-MIRROR-STARVATION.md`](MULTI-MIRROR-STARVATION.md)
 > (fixed 2026-08-16) — that failure was *self-inflicted* (process-wide client
 > gate + internal cascade). This one originates **upstream of us**: the
 > upstream edge kills our connections. Per-database client gating contains
 > the blast radius, but the busy regions flap.
+
+## Leading hypothesis (2026-08-17): CPU starvation violates the session deadlines
+
+The production host is a **4-physical/8-logical-core Xeon E3-1270 v6** (~4k
+CPU-score class; the dev laptop that produced the 66-minute clean soak is
+~20k — ~5× per-core). The session loop is built around hard deadlines that
+assume Tokio workers poll tasks promptly:
+
+- client WS Ping every **10 s** (`upstream.rs` `CLIENT_PING_INTERVAL`),
+- upstream RSTs a connection whose Pongs aren't flushed within **~30 s**
+  (documented behavior, `upstream.rs` un-split-socket comment),
+- OneOffQuery liveness probe: **30 s wall-clock from send to processing the
+  response** (`upstream.rs` `PROBE_TIMEOUT`).
+
+Production builds have **no core partitioning** — the `core-pinning` feature
+is non-default and `tools/deploy.sh` builds with no features — so all 14
+sessions' socket tasks, TLS, and client serving share one multi-thread
+runtime sized `num_cpus` = 8 workers (on ~4 cores' worth of throughput).
+Frames under the 256 KiB offload threshold — including Brotli-compressed
+live transaction updates — decompress and BSATN-decode **inline on those
+workers**. Each upstream death triggers a cold reset + full re-seed (a
+hundreds-of-MB Brotli decode plus millions of row inserts plus embedded-cache
+rebuild). On this host's cores a re-seed burst takes ~5× longer than on the
+laptop; overlapping with 13 other mirrors' live ingest it starves worker
+polling past the 10–30 s deadlines → missed Pongs → upstream RST, or probe
+responses sitting unprocessed → false `ProbeTimeout` → more cold resets →
+more re-seeds. The cascade.
+
+This reframes rather than contradicts "the upstream edge kills our
+connections": the RSTs do originate at the edge, but the trigger is our
+slow-client behavior under CPU starvation. Note the one-process design does
+**less total work** than the fleet + standalone relay-cache it replaces (the
+embedded cache removes the WS hop and the second BSATN decode) — but the
+work it eliminates is not the deadline-threatening work. The irreducible
+first decode + relational apply is identical in both topologies and
+dominates; the integration also *concentrates* it onto one shared runtime,
+losing the per-process isolation that lets the slow host survive re-seed
+bursts in fleet mode.
+
+**Host measurements (2026-08-17 ~01:40 UTC, immediately after rollback to
+the per-instance fleet):** the 14 fleet mirror processes — which carry only
+the irreducible ingest work — summed to **771 % CPU (system total 99.7 %)**
+while re-seeding/catching up post-rollback, decaying within minutes to
+**~422 %** for the eight busy regions with regions 7 and 12 individually
+sustained at **~95 % of a core each**. The busy set (7, 8, 9, 12, 14, 17,
+18, 19) is exactly the set that died first in the incident. No sampler
+existed on the host during the incident window (no sar/atop/monitoring
+agents) — CPU for 01:13–01:26 UTC itself is unrecorded; the OVH Manager CPU
+graph is the only possible source (manual check pending).
+
+**Predictions that distinguish this hypothesis:** (1) event-loop poll gaps
+≥5 s precede deaths — **confirmed** (135 gap-warnings, 5–10 s, repro);
+(2) probe timeouts log "bytes arrived since probe send" (false timeouts),
+not "socket silent" — **confirmed** (6 false vs 1 silent, repro);
+(3) the CPU-capped local repro reproduces the death modes at host-equivalent
+`--cpus` — **confirmed** (21 deaths: 7 RST + 14 probe timeout at `--cpus=1`;
+the `--cpus=4` control ran clean, matching the fast-laptop soak);
+(4) on the next production attempt with `pidstat`/`vmstat` capturing, CPU is
+pegged during the cascade — pending.
 
 ## Symptom
 
@@ -69,24 +134,34 @@ dependent — not deterministic in the process itself.
   process-wide client gate. Here: external RSTs + upstream probe
   non-response, with per-DB gating already in place.
 - Not explained by: the 1 GiB live-backlog cap (no such errors), the 5-min
-  subscribe stall, CPU/RAM contention (host ~50 GiB free, blue stopped,
-  load fine during the local no-repro run).
+  subscribe stall, RAM (host ~50 GiB free, blue stopped). CPU contention is
+  **not** ruled out: "load fine" was observed only during the local no-repro
+  run — the host had no CPU sampler during the incident window (see leading
+  hypothesis above).
 
-## Hypotheses (unvalidated, most plausible first)
+## Hypotheses (unvalidated; leading hypothesis above, then secondary)
 
+0. **CPU starvation on the 4C/8T production host violates the 10–30 s session
+   deadlines** — see "Leading hypothesis". The RSTs are the edge's response to
+   our starved slow-client behavior; the re-seed amplification loop is its
+   engine. Under confirmation.
 1. **Upstream edge throttling / anti-abuse on bursty multi-connection
    patterns.** 14 WebSocket connections established within ~5 minutes plus
    multi-hundred-MB Brotli seed downloads from one IP, then sustained
    ~100k tx/min ingest. Datacenter source IP (OVH) may be policed more
    aggressively than the residential IP used in the passing local test.
+   Best match for the one `lived 0ns` instantly-refused connect, which CPU
+   starvation does not explain (connect-time RST = likely connection-rate
+   policing; secondary, distinct mechanism).
 2. **Shared-DNS edge variance.** `bitcraft-early-access.spacetimedb.com` is
    a shared DNS name with multiple A records; sessions land on different
    edge nodes. Some nodes/paths may reset long-lived or heavy connections.
-   The progressive worsening (12→5 live) is consistent with one bad path
-   progressively claiming connections.
+   Now testable per-session: the instrumented build logs `peer=` on every
+   connect.
 3. **Re-seed amplification loop.** Every reset re-downloads full seeds;
    the added burst raises the chance of further resets — a self-sustaining
-   flap once it starts.
+   flap once it starts. Consistent with hypothesis 0 (CPU-driven burst
+   crowding) rather than purely bandwidth-driven.
 
 ## Impact
 
@@ -98,23 +173,76 @@ dependent — not deterministic in the process itself.
 
 ## Next steps / mitigations to evaluate
 
-1. **Logging gap (do first):** session-error lines at `runtime.rs:247`
-   carry no `database=` tag — tonight's errors cannot be attributed to a
-   mirror from the journal alone (had to correlate connect timestamps and
-   lived-times). Add the database to every session lifecycle error.
-2. **Differential test on the host:** run the existing isolated trial rig
-   (`bitcraft-relay/tools/public-mirror-trial.service`, 2 mirrors on
-   `:3030`) and a single-mirror instance on the same host/IP for an hour:
-   - single mirror stable + 14-mirror flapping  → burst/multi-connection
-     trigger (hypothesis 1/3);
-   - single mirror also flapping → host/IP/edge path (hypothesis 2).
-3. **tcpdump during a flap:** record who sends the RST (upstream edge IP?)
+Done 2026-08-17 (instrumented build — built and unit-tested locally, **not
+yet deployed**; deploy via `tools/deploy.sh bitcraft` when ready):
+
+1. ✅ `database=` tag on every session lifecycle error (`runtime.rs` exit
+   lines) — errors are now attributable from the journal alone.
+2. ✅ Resolved `peer=` address logged on every upstream connect (tests the
+   shared-DNS hypothesis per session).
+3. ✅ Probe false-timeout detection: at `ProbeTimeout` the log now says
+   whether socket bytes arrived since the probe was sent ("response likely
+   delayed by local processing") or not ("upstream non-response").
+4. ✅ Event-loop gap warnings: any ≥5 s gap between session-task polls logs
+   `event loop gap … worker starvation suspected` — the direct starvation
+   signal, named per database.
+
+Open:
+
+5. **CPU capture during the next production attempt** (no sampler existed
+   for the 01:13–01:26 window): run `pidstat -t 5` + `vmstat 5` to a file
+   from before start through the soak; also check the OVH Manager CPU graph
+   for 2026-08-17 01:10–01:30 UTC.
+6. ✅ **CPU-capped local repro** (`scripts/local-full-fleet-test-cpu-capped.sh`):
+   **CONFIRMED 2026-08-17.** Calibrated with `openssl speed -evp sha256`
+   (8192-byte blocks): the whole production host (Xeon E3-1270 v6, 4C/8T; 8
+   threads aggregate to 3.88× its single core) reaches 1414 k/s vs 2328 k/s
+   for **one** M2 Max quota unit — the entire host ≈ 0.6 units on sha256
+   (per-core gap 6.4×), ≈ 1–1.3 units on branchy integer work. At the
+   host-equivalent `--cpus=1`: 21 deaths (7 reset-without-close-handshake,
+   14 probe timeout), 135 event-loop gaps of 5–10 s, and 6 of 7 probe
+   timeouts were **false** (socket bytes had arrived). The `--cpus=4`
+   control (~4–6× the whole host's compute) ran clean, matching the native
+   fast-laptop soak. Verdict: aggregate CPU starvation reproduces the
+   production failure locally, with the instrumented build attributing it.
+7. **tcpdump during a flap:** record who sends the RST (upstream edge IP?)
    and whether OneOffQuery probe responses genuinely stop arriving.
-4. **Log the resolved peer address** per mirror to test the shared-DNS
-   variance hypothesis (which A record each session landed on).
-5. **Traffic shaping in the mirror:** pace/stagger seed downloads (rate-
-   limit wire reads; stagger gate admissions) to avoid the burst signature.
-6. **Report upstream** to Clockwork Labs with timestamps — the RSTs
+8. **Mitigations, ranked by leverage now that the repro confirms the
+   mechanism** — **1–3 implemented and validated 2026-08-17** (local tests
+   13/13; calibrated `--cpus=1` repro, ~65 min: baseline 21 deaths /
+   never-recovering cascade → mitigated 14 deaths all during the pipelined
+   cold start, then **converged 14/14 live and held**; false-probe kills
+   6 → 0, probe kills 14 → 8, event-loop-gap warns 145 → 83, observed max
+   gap ~10 s → ~6 s):
+   - ✅ **Socket-silence-aware `ProbeTimeout`** (6 of 7 baseline timeouts
+     were false): a probe that is late while the socket is still receiving
+     is now tolerated (one-time warn, hard cap at 150 s) instead of
+     cold-resetting the session. Only a socket-silent probe kills.
+   - ✅ **Heavy decode off the workers** (RSTs from missed Pongs): all frames
+     ≥256 KiB **and** compressed frames ≥4 KiB decompress + BSATN-decode +
+     TU-convert on the (niced) blocking pool, keeping worker poll sections
+     tiny so Ping/Pong/probe servicing stays latency-bounded under load.
+     Restructuring the deferred-frame replay also fixed a latent race where
+     a wire seed arriving during an offloaded TU decode could be swallowed
+     as a background message.
+   - ✅ **Re-seed pacing** (reconnects only): each table's seed applies
+     locally before the next table downloads, bounding a re-seed's burst to
+     one table at a time; cold starts stay pipelined (nothing live to
+     starve). Observed in the repro: recovery proceeded one paced re-seed at
+     a time, live count monotonically 7→14, zero disconnected.
+   - **Capacity / topology** (still open): the host's ~4 slow cores measured
+     ~771 % demand during fleet catch-up; if the mitigations don't hold in
+     production, the host is sized for the per-instance fleet, not
+     one-process mode.
+   - **Next lever if more is needed**: the embedded-cache observer dispatch
+     still runs inside the apply future polled from session tasks — a
+     remaining CPU-on-worker path worth offloading next.
+   Note: `std::thread::yield_now()` is *not* the fix — the heavy threads
+   (seed decode, applies) are already niced, the OS already preempts
+   threads at timeslice granularity, and the starvation is in Tokio's
+   userspace task queues (poll sections + aggregate saturation), which a
+   thread yield doesn't touch.
+9. **Report upstream** to Clockwork Labs with timestamps — the RSTs
    originate at their edge (`bitcraft-early-access`).
 
 ## Quick reference
@@ -123,7 +251,11 @@ dependent — not deterministic in the process itself.
 |------|-------|
 | Error site / cold-reset loop | `crates/public-mirror/src/runtime.rs:247`, loop at `runtime.rs:181-246` |
 | Liveness probe (60 s interval / 30 s timeout) | `crates/public-mirror/src/upstream.rs` probe config |
+| Event-loop gap warning (starvation signal) | `crates/public-mirror/src/upstream.rs` `note_event_gap` / `EVENT_LOOP_LAG_WARN` |
+| Probe false-timeout diagnosis | `crates/public-mirror/src/upstream.rs` `ProbeCheck` arm |
 | Flush tables on reset | `crates/core/src/host/module_host.rs:1897-1934` |
 | Per-database client gating (mitigates impact) | `crates/client-api/src/routes/mirrors.rs` `public_mirror_accepts_clients_for` |
 | Local no-repro run (66 min, 0 disconnects) | `scripts/local-full-fleet-test.sh`, summary 2026-08-16 |
+| CPU-capped repro (aggregate-starvation test) | `scripts/local-full-fleet-test-cpu-capped.sh` |
 | Stable per-instance fleet for comparison | `bitcraft-relay/tools/public-mirror@.service` |
+| Host: 4C/8T Xeon E3-1270 v6, no CPU sampler | `ns518212` (measurements 2026-08-17 in Leading hypothesis) |

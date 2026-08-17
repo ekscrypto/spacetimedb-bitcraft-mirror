@@ -226,6 +226,9 @@ pub async fn run_public_mirror_loop(
             Arc::clone(&completed_tables),
             observers.clone(),
             generation,
+            // Re-seed pacing on every session after the cold start: bounded
+            // bursts instead of a full-snapshot pile-up behind live ingest.
+            generation > 1,
         )
         .await;
         let lived_for = live_started.map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
@@ -240,12 +243,14 @@ pub async fn run_public_mirror_loop(
         match result {
             Ok(()) => {
                 log::warn!(
-                    "public-mirror: upstream loop exited cleanly; cold-reset then reconnect in {backoff_secs}s (lived {lived_for:?})"
+                    "public-mirror: upstream loop exited cleanly; cold-reset then reconnect in {backoff_secs}s (lived {lived_for:?}, database={})",
+                    config.database
                 );
             }
             Err(e) => {
                 log::error!(
-                    "public-mirror: upstream error: {e:#}; cold-reset then reconnect in {backoff_secs}s (lived {lived_for:?})"
+                    "public-mirror: upstream error: {e:#}; cold-reset then reconnect in {backoff_secs}s (lived {lived_for:?}, database={})",
+                    config.database
                 );
             }
         }
