@@ -1,4 +1,4 @@
-# Upstream connection resets in one-process multi-mirror mode (log-stall root cause FIXED + VALIDATED in #4; residual: ~3 MB/s HDD read-starvation — fix list pending)
+# Upstream connection resets in one-process multi-mirror mode (root cause found in #5: unit `MemoryHigh=32G` memcg throttle — local, ours, fixed; soak in progress)
 
 > First hard evidence: 2026-08-17 production switch attempt (01:13–01:26 UTC).
 > Status: attempts #1–#3 all lost busy regions to upstream closes.
@@ -14,8 +14,17 @@
 > underneath end-to-end: the host's ~3 MB/s legacy HDD (no SSD) starves the
 > process's page-fault reads whenever host-side writeback bursts (this time:
 > nginx's own logging of the outage), stalling `Future::poll` past the pong
-> deadline. See "Production attempt #4" for the evidence and the ranked fix
-> list.
+> deadline. Attempt #5 (17:39 UTC →) deployed the full fix list — and the
+> new D-state stack telemetry caught the remaining killer in the act: the
+> staged unit's **`MemoryHigh=32G` soft cap** (set from the *local* soak
+> peak, ~26 GiB; production steady state is ~35–37 GiB) put green
+> permanently over `memory.high`, and every memory charge was memcg-throttled
+> with nothing reclaimable (no swap, binary mlocked) — 154 k throttle events,
+> tokio workers D-stalled in `mem_cgroup_handle_over_high`, one RST. Raised
+> to 48G mid-attempt; the throttle froze instantly. See "Production attempt
+> #5". This cap rode along in **every** prior attempt (staged `313e894`),
+> so all four failure layers — logging, disk, swap-adjacent, memcg — were
+> local and ours; nothing points at the upstream edge.
 > Sibling analysis: [`MULTI-MIRROR-STARVATION.md`](MULTI-MIRROR-STARVATION.md)
 > (fixed 2026-08-16) — that failure was *self-inflicted* (process-wide client
 > gate + internal cascade). This one is a feedback loop between our own
@@ -423,6 +432,65 @@ single platter read-hostile for a minute at a time.
    and both `lived 0ns` refusals only ever followed our own stalls.
    Revisit only if a future attempt shows deaths with no preceding local
    stall.
+
+## Production attempt #5 (2026-08-17 17:39 UTC →, all-fixes build + `MemoryHigh` discovery — ROOT CAUSE)
+
+Full swap via `switch-to-bitcraft-mirror.sh --apply`. Every fix from the
+list above was live: pinned binaries, swap off, nginx logging de-fanged
+(buffered access_log 61 MB and trickling at ~140 KB/s — nothing like #4's
+38–72 MB/s burst), disk logging disabled, aggregated flush lines, dstack
+telemetry. Green seeded 14/14 sequentially in ~17 min (r8's death added a
+re-seed cycle), nginx flipped at 17:56:56, all public endpoints verified,
+blue fully stopped. Public WS outage: ~17.5 min.
+
+**The fix list verifiably worked** — and the one residual death named its
+killer via the new telemetry:
+
+- Green's `read_bytes` flat at **536 KB for the whole run** (vs 224 MB in
+  #4): the page pin eliminated lazy text-fault reads entirely. No
+  read-starvation waves; iowait negligible outside benign md/jbd2 D-states.
+- One death: **r8 RST at ~17:54:04** (lived 791 s, its original seed
+  connection). The dstack histogram shows **5–9 tokio workers
+  simultaneously D-stalled in `mem_cgroup_handle_over_high`** from
+  17:52:46 through 17:54:03 — the sample right after the burst ended is
+  the disconnect. 139 memcg wchan captures in total, all pre-fix.
+- Re-seed worked as designed: 21 aggregated `cleared N stale rows across 1
+  tables` lines (vs 274 per-table lines before), 6.1 M-row largest table
+  cleared, feed reset generation=2, re-live in ~2 min, caught up to
+  1.1 M tx within minutes. All other 13 regions held their original
+  connections through the whole window.
+
+**Root cause — `MemoryHigh=32G` in the staged unit (`313e894`, 2026-08-16).**
+The cap was set from the *local* soak measurement ("peaks ~26 GiB" — the
+unit comment said so), but production steady state is **~35–37 GiB**.
+Green crossed 32 GiB while seeding r18/r19 (~17:49–17:51) and spent the
+rest of the window **permanently over `memory.high`**:
+
+- `memory.events.local`: **154 526 `high` throttle events** accrued by
+  17:57 (~500/s while over) — the counter is the smoking gun; it froze
+  the instant the limit was raised and has not moved since.
+- With swap off and the binary mlocked, in-cgroup reclaim has nothing to
+  free — nearly all pages are anonymous or pinned — so `try_charge`
+  throttling (`mem_cgroup_handle_over_high`) degrades from a nudge into
+  sustained multi-second D-stalls on whatever worker faults or allocates.
+  Same kill condition as every prior layer: any whole-process stall past
+  the 10–30 s session deadlines.
+- Remediation (mid-attempt): `systemctl set-property
+  bitcraft-mirror.service MemoryHigh=48G` at ~17:57:20 — throttle froze
+  immediately, zero memcg D-states since, `memory.current` stable at
+  ~36 GiB with 23 GiB MemAvailable. Persisted in the unit
+  (`bitcraft-relay` `e51d332`), synced to the host, and the
+  `system.control` override removed so the unit file is the single
+  source. Ram-guard (stop if MemAvailable < 2 GiB) stays the hard
+  backstop; `memory.max` remains unlimited.
+
+**Retroactive reach:** the cap rode along in attempts #1–#5 alike, so
+every attempt ran green permanently over the soft limit once seeded. The
+prior layers remain real and measured (logging storm, disk read
+starvation, writeback bursts) — and they compound: memcg reclaim pressure
+drives page-cache writeback/eviction, which on ~3 MB/s platters is exactly
+the read-starvation seen in #4. With the cap fixed at 48G, the soak is
+clean so far; decommission-blue decision pending that soak.
 
 ## Symptom
 
