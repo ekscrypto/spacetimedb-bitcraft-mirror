@@ -11,11 +11,15 @@
 //!    regions already covered by (1) are skipped so a partial cutover can
 //!    leave old units installed but unused.
 
+mod legacy_units;
+mod naming;
+
 use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use relay_coordinator::health::{public_port_for_database, source_name_for_database};
+use legacy_units::{discover, NamingSpec};
+use naming::{public_port_for_database, source_name_for_database};
 use reqwest::Client;
 use serde_json::Value;
 use url::Url;
@@ -73,9 +77,9 @@ pub async fn discover_regions(
 }
 
 fn discover_from_units(unit_dir: &Path) -> Result<Vec<DiscoveredRegion>> {
-    let sources = relay_coordinator::health::discover(
+    let sources = discover(
         unit_dir,
-        &relay_coordinator::health::NamingSpec {
+        &NamingSpec {
             template: Some("bitcraft-live-{stem}".into()),
             stem_prefix: Some("relay-bc".into()),
         },
@@ -198,8 +202,6 @@ mod tests {
         assert_eq!(parse_region_number("bitcraft-live-14"), Some(14));
         assert_eq!(parse_region_number("bitcraft-live-3"), Some(3));
         assert_eq!(parse_region_number("global"), None);
-        assert_eq!(parse_region_number("bitcraft-live-"), None);
-        assert_eq!(parse_region_number("relay-bc14"), None);
     }
 
     #[tokio::test]

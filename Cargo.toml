@@ -28,6 +28,9 @@ members = [
   "crates/primitives",
   "crates/public-mirror",
   "crates/relay-cache",
+  "crates/mirror-health",
+  "crates/relay-protocol",
+  "crates/relay-test-harness",
   "crates/query",
   "crates/runtime",
   "crates/sats",
@@ -157,6 +160,7 @@ spacetimedb-query-builder = { path = "crates/query-builder", version = "=2.7.1" 
 spacetimedb-runtime = { path = "crates/runtime", version = "=2.7.1" }
 spacetimedb-sats = { path = "crates/sats", version = "=2.7.1" }
 relay-cache = { path = "crates/relay-cache" }
+relay-protocol = { path = "crates/relay-protocol" }
 spacetimedb-schema = { path = "crates/schema", version = "=2.7.1" }
 spacetimedb-snapshot = { path = "crates/snapshot", version = "=2.7.1" }
 spacetimedb-standalone = { path = "crates/standalone", version = "=2.7.1" }
@@ -349,6 +353,10 @@ dashmap = "6"
 prost = "0.13"
 rustls = { version = "0.23", features = ["ring"] }
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
+
+# v1 compat for relay-test-harness integrity checks against v1.bsatn endpoints.
+spacetimedb-client-api-messages-v1 = { package = "spacetimedb-client-api-messages", version = "=1.12.0" }
+spacetimedb-lib-v1 = { package = "spacetimedb-lib", version = "=1.12.0" }
 
 # Pinned to a specific version rather than allowing SemVer fuzzy resolution
 # because our flake references the specific version of this library.

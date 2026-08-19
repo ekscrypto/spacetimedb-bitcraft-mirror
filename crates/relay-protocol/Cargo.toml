@@ -1,0 +1,17 @@
+[package]
+name = "relay-protocol"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/ekscrypto/spacetimedb-bitcraft-mirror"
+description = "Schema parse + BSATN row decode shared with relay-cache"
+
+[dependencies]
+spacetimedb-sats = { workspace = true }
+spacetimedb-client-api-messages = { workspace = true }
+spacetimedb-lib = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }
