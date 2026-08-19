@@ -29,7 +29,7 @@ pub fn roads_routes() -> axum::Router<Fleet> {
         .route("/roads/regions", get(roads_regions))
         .route("/roads/paving-types", get(roads_paving_types))
         .route("/roads/terraform-recipes", get(roads_terraform_recipes))
-        .route("/roads/region/{region}/map", get(roads_region_map))
+        .route("/roads/region/:region/map", get(roads_region_map))
 }
 
 fn require_roads(fleet: &Fleet) -> Result<&Arc<RoadsFleet>, Response> {
@@ -200,4 +200,52 @@ async fn roads_region_map(
     resp.headers_mut()
         .insert(header::ETAG, HeaderValue::from_str(&snap.etag).unwrap_or(HeaderValue::from_static("")));
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use parking_lot::RwLock;
+    use tower::ServiceExt;
+
+    use super::roads_routes;
+    use crate::interest::InterestHub;
+    use crate::roads::catalog::{GlobalRoadsCatalog, RoadsFleet};
+    use crate::serve::Fleet;
+
+    fn test_fleet() -> Fleet {
+        Fleet {
+            shards: vec![],
+            memory_pressure: Arc::new(AtomicBool::new(false)),
+            interest: InterestHub::new(),
+            roads: Some(Arc::new(RoadsFleet::new(Arc::new(RwLock::new(
+                GlobalRoadsCatalog::new(),
+            ))))),
+        }
+    }
+
+    /// matchit 0.7 (axum 0.7) uses `:param`, not `{param}`. A mismatched path
+    /// never hits the handler — axum returns an empty 404.
+    #[tokio::test]
+    async fn region_map_route_reaches_handler() {
+        let app = roads_routes().with_state(test_fleet());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/roads/region/9/map")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"unknown region 9");
+    }
 }
