@@ -180,12 +180,17 @@ more `--mirror` targets. Key flags (all require `--public-mirror-v1`):
 Status and per-table seed progress: `GET /v1/mirrors` (main port and the
 status sidecar).
 
-**Clients stay offline until every mirror is live.** Downstream WebSocket
-subscribe is rejected with HTTP 503 until **every** configured mirror
-reports `live`. This is intentional — clients must never see a half-seeded
-database or miss updates. A later disconnect on any mirror re-closes the
-gate until that mirror is `live` again. Poll the **status sidecar** during
-large seeds; the main HTTP port may not respond until seed apply finishes.
+**Clients are gated per database.** A downstream WebSocket subscribe to a
+given database is accepted once *that database's* mirror reports `live`, and
+is rejected with HTTP 503 only while that mirror is still
+`waiting` / `connecting` / `subscribing` / `disconnected`. Mirrors are
+independent: a region still seeding or reconnecting never blocks clients of
+healthy regions. When a mirror disconnects, only that database's subscribers
+are kicked (before its tables are flushed for the re-seed), and only its new
+connections 503 until its mirror is `live` again. This is intentional —
+clients must never see a half-seeded database or miss updates — and it holds
+per database, not process-wide. Poll the **status sidecar** during large
+seeds; the main HTTP port may not respond until seed apply finishes.
 
 Provisioning is nothing like a normal standalone: the schema is fetched
 from upstream at bootstrap, storage is forced in-memory (no durable mirror

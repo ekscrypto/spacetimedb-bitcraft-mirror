@@ -267,3 +267,179 @@ pub fn create_tables_from_module_def(stdb: &RelationalDB, module_def: &ModuleDef
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use parking_lot::RwLock;
+    use spacetimedb_client_api_messages::websocket::v1 as ws_v1;
+    use spacetimedb_lib::error::ResultTest;
+    use spacetimedb_lib::identity::AuthCtx;
+    use spacetimedb_lib::{AlgebraicType, ConnectionId, Identity};
+    use spacetimedb_primitives::TableId;
+    use spacetimedb_subscription::SubscriptionPlan;
+
+    use super::{apply_external_update, TableOps};
+    use crate::client::{
+        ClientActorId, ClientConfig, ClientConnectionReceiver, ClientConnectionSender, ClientName,
+    };
+    use crate::db::relational_db::tests_utils::{with_read_only, TestDB};
+    use crate::db::sql::ast::SchemaViewer;
+    use crate::subscription::execution_unit::QueryHash;
+    use crate::subscription::module_subscription_actor::ModuleSubscriptions;
+    use crate::subscription::module_subscription_manager::{spawn_send_worker, Plan, SubscriptionManager};
+    use crate::subscription::row_list_builder_pool::BsatnRowListBuilderPool;
+
+    use bytes::Bytes;
+
+    /// One mirrored region: in-memory DB, one table, a `ModuleSubscriptions`
+    /// wired like `make_replica_ctx` wires it in production, and one
+    /// subscribed client.
+    struct Region {
+        db: TestDB,
+        table: TableId,
+        subs: ModuleSubscriptions,
+        sender: Arc<ClientConnectionSender>,
+        rx: ClientConnectionReceiver,
+    }
+
+    fn setup_region(connection_id: u128) -> ResultTest<Region> {
+        let db = TestDB::in_memory()?;
+        let table = db.create_table_for_test("T", &[("a", AlgebraicType::U8)], &[])?;
+
+        let sql = "SELECT * FROM T";
+        let auth = AuthCtx::for_testing();
+        let plan = with_read_only(&db, |tx| {
+            let viewer = SchemaViewer::new(&*tx, &auth);
+            let (plans, has_param) = SubscriptionPlan::compile(sql, &viewer, &auth).unwrap();
+            let hash = QueryHash::from_string(sql, auth.caller(), has_param);
+            Arc::new(Plan::new(plans, hash, sql.into()))
+        });
+
+        let queue = spawn_send_worker(Some(db.database_identity()));
+        let manager = Arc::new(RwLock::new(SubscriptionManager::new(queue.clone())));
+        let subs = ModuleSubscriptions::new(
+            db.db.clone(),
+            manager.clone(),
+            queue,
+            BsatnRowListBuilderPool::new(),
+        );
+
+        let (sender, rx) = ClientConnectionSender::dummy_with_channel(
+            ClientActorId {
+                identity: Identity::ZERO,
+                connection_id: ConnectionId::from_u128(connection_id),
+                name: ClientName(0),
+            },
+            ClientConfig::for_test(),
+            (*db).clone(),
+        );
+        let sender = Arc::new(sender);
+        let query_id: ws_v1::QueryId = ws_v1::QueryId::new(1);
+        manager.write().add_subscription(sender.clone(), plan, query_id)?;
+
+        Ok(Region { db, table, subs, sender, rx })
+    }
+
+    fn live_insert(region: &Region, value: u8) -> ResultTest<()> {
+        apply_external_update(
+            &region.subs,
+            None,
+            [TableOps {
+                table_id: region.table,
+                deletes: vec![],
+                inserts: vec![Bytes::from(vec![value])],
+            }],
+            None,
+            false,
+        )?;
+        Ok(())
+    }
+
+    /// Flush `region`'s tables the way a reconnect re-seed does: an empty
+    /// seed clears every table it names.
+    fn flush_tables(region: &Region) -> ResultTest<()> {
+        apply_external_update(
+            &region.subs,
+            None,
+            [TableOps {
+                table_id: region.table,
+                deletes: vec![],
+                inserts: vec![],
+            }],
+            None,
+            true,
+        )?;
+        Ok(())
+    }
+
+    fn row_count(region: &Region) -> usize {
+        with_read_only(&region.db, |tx| region.db.iter(tx, region.table).unwrap().count())
+    }
+
+    fn recv_one(runtime: &tokio::runtime::Runtime, rx: &mut ClientConnectionReceiver, ctx: &str) {
+        runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(5), rx.recv()).await })
+            .unwrap_or_else(|_| panic!("timed out waiting for a client message ({ctx})"))
+            .unwrap_or_else(|| panic!("client channel closed ({ctx})"));
+    }
+
+    fn assert_no_message(
+        runtime: &tokio::runtime::Runtime,
+        rx: &mut ClientConnectionReceiver,
+        ctx: &str,
+    ) {
+        let got = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_millis(150), rx.recv()).await
+        });
+        assert!(got.is_err(), "expected no further client message ({ctx})");
+    }
+
+    /// A mirror session dying must kick and flush only its own database: the
+    /// healthy region's client keeps its subscription and keeps receiving
+    /// updates committed after the other region's reset.
+    ///
+    /// This drives the exact sequence `ModuleHost::reset_mirror_for_reconnect`
+    /// runs when `run_public_mirror_loop` ends a session (kick this
+    /// database's subscribers, then truncate its tables); per-database client
+    /// gating is covered by the registry/gate tests in the public-mirror
+    /// crate.
+    #[test]
+    fn mirror_reset_kicks_only_its_own_databases_clients() -> ResultTest<()> {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _rt = runtime.enter();
+
+        let mut a = setup_region(1)?;
+        let mut b = setup_region(2)?;
+
+        // Both regions live: each region's client receives its own update.
+        live_insert(&a, 7)?;
+        live_insert(&b, 8)?;
+        recv_one(&runtime, &mut a.rx, "region A pre-reset");
+        recv_one(&runtime, &mut b.rx, "region B pre-reset");
+        assert_eq!(row_count(&a), 1);
+        assert_eq!(row_count(&b), 1);
+
+        // Region A's upstream session dies: the reconnect cold reset kicks
+        // A's subscribers, then truncates A's tables for the re-seed.
+        let kicked = a.subs.kick_all_subscribers();
+        assert_eq!(kicked, 1, "region A's client should have been kicked");
+        flush_tables(&a)?;
+
+        assert!(a.sender.is_cancelled());
+        assert_eq!(row_count(&a), 0, "region A's table should be flushed");
+        assert!(!b.sender.is_cancelled());
+        assert_eq!(row_count(&b), 1, "region B's table must be untouched");
+
+        // The healthy region keeps serving: a live update committed after
+        // the other region's reset still reaches region B's client, while
+        // region A's kicked client receives nothing further.
+        live_insert(&b, 9)?;
+        recv_one(&runtime, &mut b.rx, "region B post-reset");
+        assert_no_message(&runtime, &mut a.rx, "region A post-kick");
+
+        Ok(())
+    }
+}

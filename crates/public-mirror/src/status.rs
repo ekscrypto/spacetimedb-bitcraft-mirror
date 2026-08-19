@@ -544,6 +544,41 @@ mod tests {
         assert_eq!(reg.snapshot().mirrors[0].transactions_processed, 2);
     }
 
+    /// One mirror disconnecting must gate only its own database: the
+    /// `MirrorsResponse` a snapshot produces is exactly what
+    /// `handle_websocket` feeds `public_mirror_accepts_clients_for`, so a
+    /// healthy region's clients are unaffected by another region's flap.
+    #[test]
+    fn mirror_disconnect_gates_only_its_own_database() {
+        use spacetimedb_client_api::routes::mirrors::public_mirror_accepts_clients_for;
+
+        let id_a = Identity::from_claims("public-mirror-v1", "bitcraft-live-7");
+        let id_b = Identity::from_claims("public-mirror-v1", "bitcraft-live-8");
+
+        let reg = MirrorStatusRegistry::new();
+        let host = Url::parse("wss://ea.example").unwrap();
+        let a = reg.register(&host, "bitcraft-live-7", id_a, 1);
+        let b = reg.register(&host, "bitcraft-live-8", id_b, 1);
+        for h in [&a, &b] {
+            h.set_connecting();
+            h.set_connected();
+            h.set_table_live(1);
+            h.set_live();
+        }
+
+        let snap = reg.snapshot();
+        assert!(public_mirror_accepts_clients_for(&snap, &id_a));
+        assert!(public_mirror_accepts_clients_for(&snap, &id_b));
+
+        // Region 7's upstream session dies: runtime.rs marks it disconnected
+        // before the cold reset, so new WS to region 7 must 503 while
+        // region 8 keeps accepting.
+        a.set_disconnected(SystemTime::now() + Duration::from_secs(1));
+        let snap = reg.snapshot();
+        assert!(!public_mirror_accepts_clients_for(&snap, &id_a));
+        assert!(public_mirror_accepts_clients_for(&snap, &id_b));
+    }
+
     #[test]
     fn empty_registry() {
         let reg = MirrorStatusRegistry::new();
