@@ -1,0 +1,51 @@
+syntax = "proto3";
+package bitcraft.roads;
+
+// Wire types served by relay /roads/regions, /roads/paving-types,
+// /roads/terraform-recipes (compatible with bitcraft-roadd).
+
+message Region {
+  uint32 id = 1;
+  string name = 2;
+  bool live = 3;
+  int32 rx = 4;
+  int32 rz = 5;
+  int32 origin_x = 6;
+  int32 origin_z = 7;
+}
+
+message RegionsResponse {
+  repeated Region regions = 1;
+  uint32 region_width_chunks = 2;
+  uint32 region_height_chunks = 3;
+}
+
+message PavingType {
+  int32 tile_type_id = 1;
+  string name = 2;
+  float paving_duration = 3;
+  int32 tier = 4;
+  int32 input_cargo_id = 5;
+  repeated MaterialStack consumed = 6;
+}
+
+message PavingTypesResponse {
+  repeated PavingType types = 1;
+}
+
+message MaterialStack {
+  int32 item_id = 1;
+  uint32 quantity = 2;
+  bool cargo = 3;
+}
+
+message TerraformRecipeRow {
+  int32 difference = 1;
+  int32 actions_count = 2;
+  float stamina_per_action = 3;
+  float time_per_action = 4;
+}
+
+message TerraformRecipesResponse {
+  repeated TerraformRecipeRow recipes = 1;
+}

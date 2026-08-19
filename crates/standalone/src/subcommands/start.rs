@@ -210,6 +210,17 @@ pub fn cli() -> clap::Command {
                 .requires("public_mirror_v1"),
         )
         .arg(
+            Arg::new("roads_cache")
+                .long("roads-cache")
+                .action(SetTrue)
+                .help(
+                    "Embed the roads terrain cache (~289 MiB/region): dense terrain/overlay \
+                     grids with a single atomic GET /roads/region/{id}/map snapshot per region. \
+                     Requires --bitcraft-cache.",
+                )
+                .requires("bitcraft_cache"),
+        )
+        .arg(
             Arg::new("cache_bind")
                 .long("cache-bind")
                 .help("Loopback bind for the embedded relay-cache HTTP API (default 127.0.0.1:8089).")
@@ -393,19 +404,32 @@ pub async fn exec(args: &ArgMatches, db_cores: JobCores) -> anyhow::Result<()> {
         let interest = relay_cache::interest::InterestHub::new();
         let memory_pressure = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let feed = relay_cache::feed::FeedManager::new(interest.clone());
+        let roads_enabled = args.get_flag("roads_cache");
+        let roads = if roads_enabled {
+            Some(feed.enable_roads())
+        } else {
+            None
+        };
+        let default_ceiling = if roads_enabled {
+            16 * 1024 * 1024 * 1024_u64
+        } else {
+            8 * 1024 * 1024 * 1024_u64
+        };
         let registry = Arc::new(MirrorObserverRegistry::new());
         log::info!(
-            "bitcraft-cache: embedded relay-cache enabled (bind {}, mem ceiling {} bytes)",
+            "bitcraft-cache: embedded relay-cache enabled (bind {}, mem ceiling {} bytes, roads={})",
             args.get_one::<String>("cache_bind").unwrap_or(&"127.0.0.1:8089".into()),
             args.get_one::<u64>("cache_mem_ceiling_bytes")
                 .copied()
-                .unwrap_or(8 * 1024 * 1024 * 1024),
+                .unwrap_or(default_ceiling),
+            roads_enabled,
         );
         Some(CacheContext {
             interest,
             memory_pressure,
             feed,
             registry,
+            roads,
         })
     } else {
         None
@@ -450,15 +474,22 @@ pub async fn exec(args: &ArgMatches, db_cores: JobCores) -> anyhow::Result<()> {
             .get_one::<String>("cache_bind")
             .cloned()
             .unwrap_or_else(|| "127.0.0.1:8089".into());
+        let roads_enabled = cache.roads.is_some();
+        let default_ceiling = if roads_enabled {
+            16 * 1024 * 1024 * 1024_u64
+        } else {
+            8 * 1024 * 1024 * 1024_u64
+        };
         let ceiling = args
             .get_one::<u64>("cache_mem_ceiling_bytes")
             .copied()
-            .unwrap_or(8 * 1024 * 1024 * 1024);
+            .unwrap_or(default_ceiling);
         let addr: std::net::SocketAddr = bind.parse().with_context(|| format!("parse --cache-bind `{bind}`"))?;
         let fleet = relay_cache::serve::Fleet {
             shards: cache.feed.shard_handles(),
             memory_pressure: cache.memory_pressure.clone(),
             interest: cache.interest.clone(),
+            roads: cache.roads.clone(),
         };
         tokio::spawn(async move {
             if let Err(e) = relay_cache::serve::serve(addr, fleet, std::future::pending()).await {
@@ -811,6 +842,7 @@ struct CacheContext {
     memory_pressure: std::sync::Arc<std::sync::atomic::AtomicBool>,
     feed: std::sync::Arc<relay_cache::feed::FeedManager>,
     registry: std::sync::Arc<MirrorObserverRegistry>,
+    roads: Option<std::sync::Arc<relay_cache::roads::RoadsFleet>>,
 }
 
 async fn bootstrap_public_mirror(
@@ -933,7 +965,13 @@ async fn bootstrap_public_mirror(
                 mirror_database,
                 cache.feed.clone() as Arc<dyn spacetimedb_public_mirror_client::observer::MirrorObserver>,
             ),
-            Ok(None) => {} // bitcraft-live-global: mirrored for WS clients, not cached
+            Ok(None) if mirror_database == "bitcraft-live-global" && cache.roads.is_some() => {
+                cache.registry.register(
+                    mirror_database,
+                    cache.feed.clone() as Arc<dyn spacetimedb_public_mirror_client::observer::MirrorObserver>,
+                );
+            }
+            Ok(None) => {} // global without roads, or skipped
             Err(e) => {
                 return Err(e).with_context(|| format!("--bitcraft-cache failed to register `{mirror_database}`"))
             }

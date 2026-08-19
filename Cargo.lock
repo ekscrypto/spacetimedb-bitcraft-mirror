@@ -6589,6 +6589,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2",
  "spacetimedb-client-api-messages 2.7.1",
  "spacetimedb-public-mirror-client",
  "spacetimedb-sats 2.7.1",

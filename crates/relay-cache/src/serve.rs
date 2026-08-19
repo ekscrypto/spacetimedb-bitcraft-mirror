@@ -51,7 +51,11 @@ const PROTOBUF_MIME: &str = "application/x-protobuf";
 const PROTO_SOURCE_MIME: &str = "text/plain; charset=utf-8";
 
 /// Checked-in `.proto` schemas embedded at compile time (whitelist only).
-const PROTO_FILES: &[(&str, &str)] = &[("relay_cache.proto", include_str!("../proto/relay_cache.proto"))];
+const PROTO_FILES: &[(&str, &str)] = &[
+    ("relay_cache.proto", include_str!("../proto/relay_cache.proto")),
+    ("roads_cache.proto", include_str!("../proto/roads_cache.proto")),
+    ("roads.proto", include_str!("../proto/roads.proto")),
+];
 
 fn proto_body(name: &str) -> Option<&'static str> {
     PROTO_FILES.iter().find(|(n, _)| *n == name).map(|(_, body)| *body)
@@ -64,6 +68,8 @@ pub struct Fleet {
     /// Set by the RSS sampler when resident set approaches the ceiling.
     pub memory_pressure: Arc<AtomicBool>,
     pub interest: Arc<InterestHub>,
+    /// Present when `--roads-cache` is enabled.
+    pub roads: Option<Arc<crate::roads::RoadsFleet>>,
 }
 
 pub async fn serve(
@@ -97,6 +103,7 @@ pub async fn serve(
         .route("/player/:entity_id/crafts", get(player_crafts))
         .route("/deposits", get(hexite_deposits))
         .route("/storage-logs", get(storage_logs))
+        .merge(crate::roads_serve::roads_routes())
         .layer(CorsLayer::permissive())
         .with_state(fleet);
 
@@ -2452,6 +2459,7 @@ mod tests {
             shards: vec![shard],
             memory_pressure: Arc::new(AtomicBool::new(false)),
             interest: InterestHub::new(),
+            roads: None,
         }
     }
 

@@ -1,0 +1,77 @@
+syntax = "proto3";
+package roads_cache;
+
+// Relay-side roads terrain cache API for relay.bitcraftsync.app.
+//
+// Binary responses: Accept: application/x-protobuf
+// Schemas listed on GET /proto alongside relay_cache.proto.
+
+// ---------------------------------------------------------------------------
+// Fleet / region status
+// ---------------------------------------------------------------------------
+
+// GET /roads/health
+message RoadsCacheHealth {
+  bool ready = 1;
+  uint32 regions_ready = 2;
+  uint32 regions_total = 3;
+  uint64 total_memory_bytes = 4;
+  repeated RegionRoadStatus regions = 5;
+}
+
+// Per-region row inside RoadsCacheHealth (also useful for diagnostics).
+message RegionRoadStatus {
+  uint32 region = 1;
+  // 0=unspecified 1=idle 2=loading 3=ready 4=error
+  uint32 state = 2;
+  bool connected = 3;
+  int64 loaded_at_unix_ms = 4;
+  int64 last_update_unix_ms = 5;
+  string error = 6;
+  uint64 memory_bytes = 7;
+  uint32 claim_count = 8;
+  uint32 paved_tile_count = 9;
+  uint32 claim_tile_count = 10;
+}
+
+enum RegionState {
+  REGION_STATE_UNSPECIFIED = 0;
+  REGION_STATE_IDLE = 1;
+  REGION_STATE_LOADING = 2;
+  REGION_STATE_READY = 3;
+  REGION_STATE_ERROR = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Atomic full-region map snapshot
+// GET /roads/region/{id}/map
+// ---------------------------------------------------------------------------
+
+// Single HTTP response carrying terrain, overlay, and claim index table
+// from the same read-lock snapshot — claim_index facets in overlay always
+// resolve against claim_table in this message.
+//
+// Overlay cell layout (u32 LE, row-major lz * REGION_SIDE + lx):
+//   bits  0-15: paving_type_id (0 = none)
+//   bits 16-31: claim_index (0 = none; index into claim_table)
+//
+// claim_entity_id = claim_index == 0 ? 0 : claim_table[claim_index]
+message RegionMapSnapshot {
+  uint32 region = 1;
+  uint64 generation = 2;
+  int64 last_update_unix_ms = 3;
+  int32 origin_x = 4;
+  int32 origin_z = 5;
+
+  // claim_table[0] = 0 sentinel; claim_table[i] = entity_id for i >= 1
+  repeated uint64 claim_table = 6 [packed = true];
+  repeated uint64 neutral_claim_ids = 7 [packed = true];
+
+  // SuperHexTerrainGrid: 2560×2560 u64 LE (~52.4 MiB)
+  bytes terrain = 8;
+  // TileOverlayGrid: 7680×7680 u32 LE (~225.9 MiB)
+  bytes overlay = 9;
+
+  // SHA-256 hex of terrain||overlay||claim_table bytes for ETag / If-None-Match
+  string etag = 10;
+}

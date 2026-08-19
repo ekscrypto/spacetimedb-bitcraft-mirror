@@ -21,6 +21,7 @@
 //! WebSocket-mode-only ingest trio [`discovery`] / [`shard`] / [`wire`].
 //! [`xp`] holds the vendored XP-threshold table.
 
+pub mod roads_serve;
 pub mod config;
 pub mod decode;
 pub mod discovery;
@@ -32,6 +33,7 @@ pub mod store;
 pub mod stream;
 pub mod wire;
 pub mod xp;
+pub mod roads;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

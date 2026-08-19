@@ -136,6 +136,7 @@ async fn main() -> Result<()> {
         shards,
         memory_pressure,
         interest,
+        roads: None,
     };
 
     let http_task = if args.bind.is_empty() {

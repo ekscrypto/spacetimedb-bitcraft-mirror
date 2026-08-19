@@ -43,6 +43,7 @@ sysinfo = { workspace = true }
 hashbrown = { workspace = true, features = ["default-hasher"] }
 hex = { workspace = true }
 reqwest = { workspace = true }
+sha2 = "0.10"
 
 # SpacetimeDB in-repo crates (this workspace's v2.7.1) — the mirror this crate
 # talks to (or embeds into) speaks exactly these wire formats. The
