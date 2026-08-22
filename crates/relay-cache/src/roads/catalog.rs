@@ -8,9 +8,8 @@ use std::sync::Arc;
 
 use super::coords::{region_origin, region_rx_rz, CHUNKS_PER_SIDE};
 use super::decode::{
-    decode_paving_desc, decode_region_name, decode_terraform_recipe, decode_world_region,
-    PavingDescRow, PAVING_TILE_DESC_TABLE, REGION_NAME_TABLE, TERRAFORM_RECIPE_DESC_TABLE,
-    WORLD_REGION_STATE_TABLE,
+    decode_paving_desc, decode_region_name, decode_terraform_recipe, decode_world_region, PavingDescRow,
+    PAVING_TILE_DESC_TABLE, REGION_NAME_TABLE, TERRAFORM_RECIPE_DESC_TABLE, WORLD_REGION_STATE_TABLE,
 };
 use super::meta::RoadsTableMeta;
 use super::store::{RegionRoadStatus, RoadsRegionHandle};
@@ -81,11 +80,7 @@ impl RoadsFleet {
     }
 
     pub fn region_handle(&self, region: u32) -> Option<Arc<RoadsRegionHandle>> {
-        self.regions
-            .lock()
-            .iter()
-            .find(|h| h.region == region)
-            .cloned()
+        self.regions.lock().iter().find(|h| h.region == region).cloned()
     }
 
     pub fn health(&self) -> RoadsFleetHealth {
@@ -175,8 +170,12 @@ pub fn apply_global_insert(
 ) -> anyhow::Result<()> {
     match table {
         PAVING_TILE_DESC_TABLE => {
-            let Some(cols) = meta.paving_desc else { return Ok(()); };
-            let Some(fields) = meta.paving_desc_fields.as_ref() else { return Ok(()); };
+            let Some(cols) = meta.paving_desc else {
+                return Ok(());
+            };
+            let Some(fields) = meta.paving_desc_fields.as_ref() else {
+                return Ok(());
+            };
             let r = decode_paving_desc(row, fields, cols, schema)?;
             if let Some(slot) = catalog.paving.iter_mut().find(|p| p.id == r.id) {
                 *slot = r;
@@ -185,8 +184,12 @@ pub fn apply_global_insert(
             }
         }
         TERRAFORM_RECIPE_DESC_TABLE => {
-            let Some(cols) = meta.terraform_recipe else { return Ok(()); };
-            let Some(fields) = meta.terraform_recipe_fields.as_ref() else { return Ok(()); };
+            let Some(cols) = meta.terraform_recipe else {
+                return Ok(());
+            };
+            let Some(fields) = meta.terraform_recipe_fields.as_ref() else {
+                return Ok(());
+            };
             let r = decode_terraform_recipe(row, fields, cols, schema)?;
             catalog.terraform.push(TerraformRecipeRow {
                 difference: r.difference,
@@ -196,14 +199,22 @@ pub fn apply_global_insert(
             });
         }
         REGION_NAME_TABLE => {
-            let Some(cols) = meta.region_name else { return Ok(()); };
-            let Some(fields) = meta.region_name_fields.as_ref() else { return Ok(()); };
+            let Some(cols) = meta.region_name else {
+                return Ok(());
+            };
+            let Some(fields) = meta.region_name_fields.as_ref() else {
+                return Ok(());
+            };
             let r = decode_region_name(row, fields, cols, schema)?;
             catalog.region_names.insert(r.id, r.name);
         }
         WORLD_REGION_STATE_TABLE => {
-            let Some(cols) = meta.world_region else { return Ok(()); };
-            let Some(fields) = meta.world_region_fields.as_ref() else { return Ok(()); };
+            let Some(cols) = meta.world_region else {
+                return Ok(());
+            };
+            let Some(fields) = meta.world_region_fields.as_ref() else {
+                return Ok(());
+            };
             let r = decode_world_region(row, fields, cols, schema)?;
             catalog.region_width_chunks = r.region_width_chunks as u32;
             catalog.region_height_chunks = r.region_height_chunks as u32;
@@ -223,14 +234,22 @@ pub fn apply_global_delete(
 ) -> anyhow::Result<()> {
     match table {
         PAVING_TILE_DESC_TABLE => {
-            let Some(cols) = meta.paving_desc else { return Ok(()); };
-            let Some(fields) = meta.paving_desc_fields.as_ref() else { return Ok(()); };
+            let Some(cols) = meta.paving_desc else {
+                return Ok(());
+            };
+            let Some(fields) = meta.paving_desc_fields.as_ref() else {
+                return Ok(());
+            };
             let r = decode_paving_desc(row, fields, cols, schema)?;
             catalog.paving.retain(|p| p.id != r.id);
         }
         REGION_NAME_TABLE => {
-            let Some(cols) = meta.region_name else { return Ok(()); };
-            let Some(fields) = meta.region_name_fields.as_ref() else { return Ok(()); };
+            let Some(cols) = meta.region_name else {
+                return Ok(());
+            };
+            let Some(fields) = meta.region_name_fields.as_ref() else {
+                return Ok(());
+            };
             let r = decode_region_name(row, fields, cols, schema)?;
             catalog.region_names.remove(&r.id);
         }

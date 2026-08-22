@@ -495,6 +495,21 @@ async fn internal_stats(State(fleet): State<Fleet>) -> impl IntoResponse {
             "lifetime_pushes": fleet.interest.lifetime_pushes(),
         },
         "regions": regions,
+        "roads": fleet.roads.as_ref().map(|roads| {
+            roads
+                .region_handles()
+                .iter()
+                .map(|h| {
+                    let g = h.grid.read();
+                    json!({
+                        "region": h.region,
+                        "ready": g.ready,
+                        "harvestable": g.harvestable.len(),
+                        "harvestable_located": g.harvestable.located_len(),
+                    })
+                })
+                .collect::<Vec<_>>()
+        }),
     }))
 }
 
@@ -2529,6 +2544,7 @@ mod tests {
         s.resource.upsert(ResourceRow {
             entity_id: 999,
             resource_id: DEPLETED_HEXITE_DEPOSIT_RESOURCE_ID,
+            direction_index: 0,
         });
         assert!(s.resource.set_location(999, 24521, 18473));
         s.growth.upsert(GrowthRow {
@@ -2593,6 +2609,7 @@ mod tests {
         s.resource.upsert(ResourceRow {
             entity_id: 999,
             resource_id: HEXITE_DEPOSIT_RESOURCE_ID,
+            direction_index: 0,
         });
         assert!(s.resource.set_location(999, 24521, 18473));
         let slot = s.claim.find(100).unwrap();
@@ -2636,6 +2653,7 @@ mod tests {
         s.resource.upsert(ResourceRow {
             entity_id: 999,
             resource_id: DEPLETED_HEXITE_DEPOSIT_RESOURCE_ID,
+            direction_index: 0,
         });
         assert!(s.resource.set_location(999, 24521, 18473));
         // No growth_state row — only a resource_growth_timer row.
@@ -2687,6 +2705,7 @@ mod tests {
         s.resource.upsert(ResourceRow {
             entity_id: 999,
             resource_id: DEPLETED_HEXITE_DEPOSIT_RESOURCE_ID,
+            direction_index: 0,
         });
         assert!(s.resource.set_location(999, 24521, 18473));
         // Stale legacy row (older timestamp).

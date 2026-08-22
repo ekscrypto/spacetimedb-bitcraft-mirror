@@ -8,10 +8,7 @@ pub const TERRAIN_BYTES: usize = (SUPER_SIDE as usize) * (SUPER_SIDE as usize) *
 pub const OVERLAY_BYTES: usize = (REGION_SIDE as usize) * (REGION_SIDE as usize) * 4;
 
 pub fn pack_terrain(elev: i16, orig: i16, water: i16, wbt: u8) -> u64 {
-    (elev as u16 as u64)
-        | ((orig as u16 as u64) << 16)
-        | ((water as u16 as u64) << 32)
-        | ((wbt as u64) << 48)
+    (elev as u16 as u64) | ((orig as u16 as u64) << 16) | ((water as u16 as u64) << 32) | ((wbt as u64) << 48)
 }
 
 pub fn pack_overlay(claim_index: u16, paving: u16) -> u32 {
@@ -56,21 +53,23 @@ impl SuperHexTerrainGrid {
     }
 
     pub fn get(&self, super_x: i32, super_z: i32) -> u64 {
-        terrain_index(super_x, super_z)
-            .map(|idx| self.cells[idx])
-            .unwrap_or(0)
+        terrain_index(super_x, super_z).map(|idx| self.cells[idx]).unwrap_or(0)
     }
 }
 
 impl std::fmt::Debug for SuperHexTerrainGrid {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SuperHexTerrainGrid").field("cells", &self.cells.len()).finish()
+        f.debug_struct("SuperHexTerrainGrid")
+            .field("cells", &self.cells.len())
+            .finish()
     }
 }
 
 impl std::fmt::Debug for TileOverlayGrid {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TileOverlayGrid").field("cells", &self.cells.len()).finish()
+        f.debug_struct("TileOverlayGrid")
+            .field("cells", &self.cells.len())
+            .finish()
     }
 }
 
@@ -100,9 +99,7 @@ impl TileOverlayGrid {
     }
 
     pub fn get(&self, lx: i32, lz: i32) -> u32 {
-        overlay_index(lx, lz)
-            .map(|idx| self.cells[idx])
-            .unwrap_or(0)
+        overlay_index(lx, lz).map(|idx| self.cells[idx]).unwrap_or(0)
     }
 
     pub fn paved_tile_count(&self) -> u32 {
@@ -121,12 +118,7 @@ impl Default for TileOverlayGrid {
 }
 
 fn bytemuck_cast<T: Sized>(slice: &[T]) -> &[u8] {
-    unsafe {
-        std::slice::from_raw_parts(
-            slice.as_ptr().cast::<u8>(),
-            std::mem::size_of_val(slice),
-        )
-    }
+    unsafe { std::slice::from_raw_parts(slice.as_ptr().cast::<u8>(), std::mem::size_of_val(slice)) }
 }
 
 #[cfg(test)]

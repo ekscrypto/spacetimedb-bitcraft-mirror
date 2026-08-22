@@ -184,9 +184,8 @@ impl FeedManager {
     }
 
     fn register_global(&self, database: &str, schema_json: &[u8]) -> Result<()> {
-        let schema = Arc::new(
-            parse_schema(schema_json).with_context(|| format!("parse global schema for `{database}`"))?,
-        );
+        let schema =
+            Arc::new(parse_schema(schema_json).with_context(|| format!("parse global schema for `{database}`"))?);
         let meta = Arc::new(RoadsTableMeta::from_schema_global(&schema)?);
         let catalog = self
             .roads_fleet
@@ -317,9 +316,10 @@ async fn run_worker(feed: Arc<RegionFeed>, mut rx: mpsc::Receiver<FeedMsg>) {
     let region = feed.region;
     let mut generation: u64 = 1;
     let mut phase = Phase::Seeding(Box::new(RegionStore::empty(region)));
-    let mut roads_phase = feed.roads.as_ref().map(|_| {
-        RoadsPhase::Seeding(Box::new(RoadsRegionGrid::new(region as u16)))
-    });
+    let mut roads_phase = feed
+        .roads
+        .as_ref()
+        .map(|_| RoadsPhase::Seeding(Box::new(RoadsRegionGrid::new(region as u16))));
 
     while let Some(msg) = rx.recv().await {
         match msg {
@@ -413,21 +413,36 @@ async fn run_global_worker(feed: Arc<GlobalFeed>, mut rx: mpsc::Receiver<GlobalF
                 feed.catalog.write().mark_ready();
                 seeding = false;
             }
-            GlobalFeedMsg::Updates { generation: gen, updates } if gen == generation => {
+            GlobalFeedMsg::Updates {
+                generation: gen,
+                updates,
+            } if gen == generation => {
                 for update in updates {
                     let mut catalog = feed.catalog.write();
                     for table in &update.tables {
                         for row in &table.delete_bytes {
-                            let _ = apply_global_delete(&mut catalog, &feed.meta, &feed.schema, &table.table_name, row);
+                            if let Err(e) =
+                                apply_global_delete(&mut catalog, &feed.meta, &feed.schema, &table.table_name, row)
+                            {
+                                tracing::warn!(
+                                    target: "relay_cache::feed",
+                                    table = %table.table_name,
+                                    error = %e,
+                                    "global catalog delete failed"
+                                );
+                            }
                         }
                         for row in &table.inserts {
-                            let _ = apply_global_insert(
-                                &mut catalog,
-                                &feed.meta,
-                                &feed.schema,
-                                &table.table_name,
-                                row,
-                            );
+                            if let Err(e) =
+                                apply_global_insert(&mut catalog, &feed.meta, &feed.schema, &table.table_name, row)
+                            {
+                                tracing::warn!(
+                                    target: "relay_cache::feed",
+                                    table = %table.table_name,
+                                    error = %e,
+                                    "global catalog insert failed"
+                                );
+                            }
                         }
                     }
                     drop(catalog);

@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use super::coords::region_origin;
 use super::decode::TerrainChunkRow;
 use super::grid::{OVERLAY_BYTES, TERRAIN_BYTES};
+use super::harvestable::HarvestableIndex;
 use super::index::ClaimIndexTable;
 use super::join::{EntityJoinMaps, TerrainWriter, OVERWORLD_DIMENSION};
 
@@ -34,6 +35,7 @@ pub struct RoadsRegionGrid {
     pub dim_hist: HashMap<u32, usize>,
     pub terrain_chunks: HashMap<(i32, i32), u32>,
     pub pending_terrain: Vec<TerrainChunkRow>,
+    pub harvestable: HarvestableIndex,
 }
 
 impl RoadsRegionGrid {
@@ -54,6 +56,7 @@ impl RoadsRegionGrid {
             dim_hist: HashMap::new(),
             terrain_chunks: HashMap::new(),
             pending_terrain: Vec::new(),
+            harvestable: HarvestableIndex::new(),
         }
     }
 

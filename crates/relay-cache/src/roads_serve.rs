@@ -4,12 +4,14 @@
 
 use std::sync::Arc;
 
+use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use prost::Message;
 
 use crate::roads::catalog::RoadsFleet;
+use crate::roads::harvestable::MAX_RESOURCE_QUERY_TILES;
 use crate::serve::Fleet;
 
 mod roads_pb {
@@ -23,27 +25,25 @@ mod bitcraft_roads_pb {
 const PROTOBUF_MIME: &str = "application/x-protobuf";
 
 pub fn roads_routes() -> axum::Router<Fleet> {
-    use axum::routing::get;
+    use axum::routing::{get, post};
     axum::Router::new()
         .route("/roads/health", get(roads_health))
         .route("/roads/regions", get(roads_regions))
         .route("/roads/paving-types", get(roads_paving_types))
         .route("/roads/terraform-recipes", get(roads_terraform_recipes))
         .route("/roads/region/:region/map", get(roads_region_map))
+        .route("/roads/region/:region/resources", post(roads_region_resources))
 }
 
 fn require_roads(fleet: &Fleet) -> Result<&Arc<RoadsFleet>, Response> {
-    fleet
-        .roads
-        .as_ref()
-        .ok_or_else(|| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                [(header::CONTENT_TYPE, "text/plain")],
-                "roads cache not enabled",
-            )
-                .into_response()
-        })
+    fleet.roads.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CONTENT_TYPE, "text/plain")],
+            "roads cache not enabled",
+        )
+            .into_response()
+    })
 }
 
 fn protobuf_response(status: StatusCode, bytes: Vec<u8>) -> Response {
@@ -158,11 +158,7 @@ async fn roads_terraform_recipes(State(fleet): State<Fleet>) -> Response {
     protobuf_response(StatusCode::OK, msg.encode_to_vec())
 }
 
-async fn roads_region_map(
-    State(fleet): State<Fleet>,
-    Path(region): Path<u32>,
-    headers: HeaderMap,
-) -> Response {
+async fn roads_region_map(State(fleet): State<Fleet>, Path(region): Path<u32>, headers: HeaderMap) -> Response {
     let Ok(roads) = require_roads(&fleet) else {
         return require_roads(&fleet).unwrap_err();
     };
@@ -197,9 +193,63 @@ async fn roads_region_map(
         etag: snap.etag.clone(),
     };
     let mut resp = protobuf_response(StatusCode::OK, msg.encode_to_vec());
-    resp.headers_mut()
-        .insert(header::ETAG, HeaderValue::from_str(&snap.etag).unwrap_or(HeaderValue::from_static("")));
+    resp.headers_mut().insert(
+        header::ETAG,
+        HeaderValue::from_str(&snap.etag).unwrap_or(HeaderValue::from_static("")),
+    );
     resp
+}
+
+async fn roads_region_resources(State(fleet): State<Fleet>, Path(region): Path<u32>, body: Bytes) -> Response {
+    let Ok(roads) = require_roads(&fleet) else {
+        return require_roads(&fleet).unwrap_err();
+    };
+    let Some(handle) = roads.region_handle(region) else {
+        return (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "text/plain")],
+            format!("unknown region {region}"),
+        )
+            .into_response();
+    };
+    let query = match roads_pb::ResourceQuery::decode(body.as_ref()) {
+        Ok(q) => q,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                [(header::CONTENT_TYPE, "text/plain")],
+                "invalid ResourceQuery protobuf",
+            )
+                .into_response();
+        }
+    };
+    if query.tiles.len() > MAX_RESOURCE_QUERY_TILES {
+        return (
+            StatusCode::BAD_REQUEST,
+            [(header::CONTENT_TYPE, "text/plain")],
+            format!("too many tiles ({} > {MAX_RESOURCE_QUERY_TILES})", query.tiles.len()),
+        )
+            .into_response();
+    }
+    let grid = handle.grid.read();
+    if !grid.ready {
+        return protobuf_response(StatusCode::ACCEPTED, Vec::new());
+    }
+    let mut nodes = Vec::new();
+    let mut seen = hashbrown::HashSet::with_capacity(query.tiles.len());
+    for tile in &query.tiles {
+        if !seen.insert((tile.x, tile.z)) {
+            continue;
+        }
+        for resource_id in grid.harvestable.resource_ids_on(tile.x, tile.z) {
+            nodes.push(roads_pb::ResourceNode {
+                x: tile.x,
+                z: tile.z,
+                resource_id,
+            });
+        }
+    }
+    protobuf_response(StatusCode::OK, roads_pb::ResourcesResponse { nodes }.encode_to_vec())
 }
 
 #[cfg(test)]
@@ -210,11 +260,14 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use parking_lot::RwLock;
+    use prost::Message;
     use tower::ServiceExt;
 
     use super::roads_routes;
     use crate::interest::InterestHub;
     use crate::roads::catalog::{GlobalRoadsCatalog, RoadsFleet};
+    use crate::roads::harvestable::MAX_RESOURCE_QUERY_TILES;
+    use crate::roads::store::{RoadsRegionGrid, RoadsRegionHandle};
     use crate::serve::Fleet;
 
     fn test_fleet() -> Fleet {
@@ -243,9 +296,90 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"unknown region 9");
+    }
+
+    #[tokio::test]
+    async fn region_resources_202_while_loading_then_sparse_lookup() {
+        let fleet = test_fleet();
+        let handle = Arc::new(RoadsRegionHandle {
+            region: 9,
+            grid: Arc::new(RwLock::new(RoadsRegionGrid::new(9))),
+        });
+        fleet.roads.as_ref().unwrap().push_region(handle.clone());
+
+        let query = super::roads_pb::ResourceQuery {
+            tiles: vec![super::roads_pb::Hex { x: 10, z: 20 }],
+        };
+        let app = roads_routes().with_state(fleet.clone());
+        let loading = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/roads/region/9/resources")
+                    .header("content-type", "application/x-protobuf")
+                    .body(Body::from(query.encode_to_vec()))
+                    .unwrap(),
+            )
             .await
             .unwrap();
-        assert_eq!(&body[..], b"unknown region 9");
+        assert_eq!(loading.status(), StatusCode::ACCEPTED);
+
+        {
+            let mut grid = handle.grid.write();
+            grid.harvestable.upsert(1, 5, 0, Some((10, 20)));
+            grid.harvestable.upsert(2, 3, 0, Some((10, 20)));
+            grid.mark_ready();
+        }
+
+        let app = roads_routes().with_state(fleet);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/roads/region/9/resources")
+                    .header("content-type", "application/x-protobuf")
+                    .body(Body::from(query.encode_to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let decoded = super::roads_pb::ResourcesResponse::decode(body.as_ref()).unwrap();
+        let mut ids: Vec<i32> = decoded.nodes.iter().map(|n| n.resource_id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![3, 5]);
+        assert!(decoded.nodes.iter().all(|n| n.x == 10 && n.z == 20));
+    }
+
+    #[tokio::test]
+    async fn region_resources_rejects_oversize() {
+        let fleet = test_fleet();
+        let handle = Arc::new(RoadsRegionHandle {
+            region: 9,
+            grid: Arc::new(RwLock::new(RoadsRegionGrid::new(9))),
+        });
+        handle.grid.write().mark_ready();
+        fleet.roads.as_ref().unwrap().push_region(handle);
+
+        let query = super::roads_pb::ResourceQuery {
+            tiles: (0..=MAX_RESOURCE_QUERY_TILES as i32)
+                .map(|i| super::roads_pb::Hex { x: i, z: 0 })
+                .collect(),
+        };
+        let app = roads_routes().with_state(fleet);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/roads/region/9/resources")
+                    .body(Body::from(query.encode_to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }

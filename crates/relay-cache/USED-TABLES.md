@@ -1,7 +1,8 @@
 # relay-cache: synchronized tables and endpoint usage
 
 `relay-cache` subscribes to **30 distinct upstream SpacetimeDB tables** per
-region and exposes them through **19 GET-only HTTP endpoints**. Every table is
+region and exposes them through **19 GET HTTP endpoints** plus
+`POST /roads/region/:id/resources`. Every table is
 read by at least one endpoint except two that are subscribed-but-unused
 (`rent_state`, `player_housing_desc`).
 
@@ -71,14 +72,14 @@ Canonical sources: table-name constants in `decode.rs`, subscribe SQL in
 
 | Upstream table | Store module | Description | Endpoints |
 |---|---|---|---|
-| `location_state` | `store/location_dim.rs` | Entity → dimension (filtered subscribe + hexite PK phase) | `/claim/:id/inventory`, `/player/:id/housing` |
+| `location_state` | `store/location_dim.rs` + `roads/apply.rs` | Entity → dimension (filtered subscribe + hexite PK phase). Embedded roads path also joins overworld x/z onto harvestables. | `/claim/:id/inventory`, `/player/:id/housing`, `POST /roads/region/:id/resources` |
 | `dimension_network_state` | `store/dimension_network.rs` | Dimension-network entrances | `/claim/:id/inventory`, `/player/:id/housing` |
 
 ### Resources / Growth / Forensics
 
 | Upstream table | Store module | Description | Endpoints |
 |---|---|---|---|
-| `resource_state` | `store/resource.rs` | Hexite deposit rows only (filtered subscribe) | `/deposits` |
+| `resource_state` | `store/resource.rs` (hexite) + `roads/harvestable.rs` (allowlisted) | Hexite deposits for `/deposits`; forestry/mining/clay/sand nodes for roads point lookup. Harvestable hex index expands `resource_desc.footprint` × `direction_index` onto every occupied odd-r tile. | `/deposits`, `POST /roads/region/:id/resources` |
 | `resource_growth_timer` | `store/resource_growth_timer.rs` | Respawn clock (`scheduled_at`) | `/deposits` |
 | `growth_state` | `store/growth.rs` | Legacy respawn snapshot (fallback) | `/deposits` |
 | `storage_log_state` | `store/storage_log.rs` | Deposit/withdraw history (~15–16 day retention) | `/storage-logs` |
@@ -104,6 +105,7 @@ Endpoints with **no** synchronized tables: `/cache-health`, `/proto`,
 | `/player/:id/crafts` | + progressive_action_*, passive_craft_state, crafting_recipe_desc, building_* |
 | `/deposits` | claim_state, claim_local_state, resource_state, resource_growth_timer, growth_state |
 | `/storage-logs` | storage_log_state, building_*, claim_state |
+| `POST /roads/region/:id/resources` | resource_state (allowlisted tags, including `direction_index`) ⋈ location_state (dim 1), expanded across vendored `resource_desc` footprints via `roads/harvestable.rs` |
 
 ---
 

@@ -443,9 +443,14 @@ fn cell_i32(cell: &Cell, ctx: &str) -> Result<i32> {
     }
 }
 
+/// I16 is mapped to `Cell::Smallint` by relay-protocol. Going through
+/// `cell_i32` (Integer) silently dropped every `terraform_recipe_desc` row.
 fn cell_i16(cell: &Cell, ctx: &str) -> Result<i16> {
-    let n = cell_i32(cell, ctx)?;
-    i16::try_from(n).map_err(|_| anyhow!("{ctx}: i16 overflow"))
+    match cell {
+        Cell::Smallint(Some(n)) => Ok(*n),
+        Cell::Smallint(None) => bail!("{ctx}: Smallint is NULL"),
+        other => bail!("{ctx}: expected Smallint, got {other:?}"),
+    }
 }
 
 fn cell_u32(cell: &Cell, ctx: &str) -> Result<u32> {
@@ -542,4 +547,67 @@ fn decode_consumed_stacks(cell: &Cell, ctx: &str) -> Result<Vec<(i32, u32, bool)
 fn json_i32(v: Option<&Value>, ctx: &str) -> Result<i32> {
     let n = v.and_then(Value::as_i64).ok_or_else(|| anyhow!("{ctx} missing"))?;
     i32::try_from(n).map_err(|_| anyhow!("{ctx} overflow"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use relay_protocol::{MirroredField, MirroredSchema, MirroredTable, MirroredType, TableAccess, TableKind};
+
+    fn terraform_schema() -> MirroredSchema {
+        MirroredSchema {
+            typespace: vec![MirroredType::Product(vec![
+                MirroredField {
+                    name: Some("difference".into()),
+                    ty: MirroredType::I16,
+                },
+                MirroredField {
+                    name: Some("actions_count".into()),
+                    ty: MirroredType::I32,
+                },
+                MirroredField {
+                    name: Some("stamina_per_action".into()),
+                    ty: MirroredType::F32,
+                },
+                MirroredField {
+                    name: Some("time_per_action".into()),
+                    ty: MirroredType::F32,
+                },
+            ])],
+            tables: vec![MirroredTable {
+                name: TERRAFORM_RECIPE_DESC_TABLE.into(),
+                product_type_ref: 0,
+                primary_key: vec![0],
+                access: TableAccess::Public,
+                kind: TableKind::User,
+            }],
+        }
+    }
+
+    fn encode_recipe(difference: i16, actions_count: i32, stamina: f32, time: f32) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(14);
+        buf.extend_from_slice(&difference.to_le_bytes());
+        buf.extend_from_slice(&actions_count.to_le_bytes());
+        buf.extend_from_slice(&stamina.to_le_bytes());
+        buf.extend_from_slice(&time.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn terraform_recipe_decodes_i16_difference() {
+        let schema = terraform_schema();
+        let cols = resolve_terraform_recipe_cols(&schema).expect("cols");
+        let tbl = schema
+            .tables
+            .iter()
+            .find(|t| t.name == TERRAFORM_RECIPE_DESC_TABLE)
+            .expect("table");
+        let fields = schema.table_product(tbl).expect("product");
+        let row = encode_recipe(-4, 8, 1.5, 0.25);
+        let decoded = decode_terraform_recipe(&row, fields, cols, &schema).expect("decode");
+        assert_eq!(decoded.difference, -4);
+        assert_eq!(decoded.actions_count, 8);
+        assert_eq!(decoded.stamina_per_action, 1.5);
+        assert_eq!(decoded.time_per_action, 0.25);
+    }
 }

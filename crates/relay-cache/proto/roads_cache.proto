@@ -75,3 +75,31 @@ message RegionMapSnapshot {
   // SHA-256 hex of terrain||overlay||claim_table bytes for ETag / If-None-Match
   string etag = 10;
 }
+
+// ---------------------------------------------------------------------------
+// Point lookup of allowlisted harvestable nodes on a hex list
+// POST /roads/region/{id}/resources
+//
+// Multi-hex resources (clay, sand, large trees, ore veins, …) are returned
+// on every occupied tile: resource_desc.footprint axial offsets, rotated by
+// resource_state.direction_index, converted onto the odd-r world lattice.
+// ---------------------------------------------------------------------------
+
+message Hex {
+  int32 x = 1;
+  int32 z = 2;
+}
+
+message ResourceQuery {
+  repeated Hex tiles = 1;
+}
+
+message ResourceNode {
+  int32 x = 1;
+  int32 z = 2;
+  int32 resource_id = 3;
+}
+
+message ResourcesResponse {
+  repeated ResourceNode nodes = 1;
+}

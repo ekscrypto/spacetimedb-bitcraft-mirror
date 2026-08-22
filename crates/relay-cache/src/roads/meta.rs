@@ -6,15 +6,14 @@ use anyhow::{anyhow, Result};
 use relay_protocol::{MirroredField, MirroredSchema};
 
 use super::decode::{
-    resolve_claim_state_roads_cols, resolve_claim_tile_cols, resolve_location_roads_cols,
-    resolve_paved_tile_cols, resolve_paving_desc_cols, resolve_region_name_cols,
-    resolve_terraform_recipe_cols, resolve_terrain_chunk_cols, resolve_world_region_cols,
-    ClaimStateRoadsCols, ClaimTileCols, LocationRoadsCols, PavedTileCols, PavingDescCols,
-    RegionNameCols, TerraformRecipeCols, TerrainChunkCols, WorldRegionCols,
-    CLAIM_STATE_TABLE, CLAIM_TILE_TABLE, LOCATION_TABLE, PAVED_TILE_TABLE,
-    PAVING_TILE_DESC_TABLE, REGION_NAME_TABLE, TERRAFORM_RECIPE_DESC_TABLE, TERRAIN_CHUNK_TABLE,
-    WORLD_REGION_STATE_TABLE,
+    resolve_claim_state_roads_cols, resolve_claim_tile_cols, resolve_location_roads_cols, resolve_paved_tile_cols,
+    resolve_paving_desc_cols, resolve_region_name_cols, resolve_terraform_recipe_cols, resolve_terrain_chunk_cols,
+    resolve_world_region_cols, ClaimStateRoadsCols, ClaimTileCols, LocationRoadsCols, PavedTileCols, PavingDescCols,
+    RegionNameCols, TerraformRecipeCols, TerrainChunkCols, WorldRegionCols, CLAIM_STATE_TABLE, CLAIM_TILE_TABLE,
+    LOCATION_TABLE, PAVED_TILE_TABLE, PAVING_TILE_DESC_TABLE, REGION_NAME_TABLE, TERRAFORM_RECIPE_DESC_TABLE,
+    TERRAIN_CHUNK_TABLE, WORLD_REGION_STATE_TABLE,
 };
+use crate::decode::{self, ResourceCols, ResourceFast, RESOURCE_TABLE};
 
 pub struct RoadsTableMeta {
     pub terrain_chunk: TerrainChunkCols,
@@ -31,6 +30,9 @@ pub struct RoadsTableMeta {
     pub claim_tile_fields: Vec<MirroredField>,
     pub claim_state_fields: Vec<MirroredField>,
     pub location_fields: Vec<MirroredField>,
+    pub resource: Option<ResourceCols>,
+    pub resource_fast: Option<ResourceFast>,
+    pub resource_fields: Vec<MirroredField>,
     pub paving_desc_fields: Option<Vec<MirroredField>>,
     pub terraform_recipe_fields: Option<Vec<MirroredField>>,
     pub region_name_fields: Option<Vec<MirroredField>>,
@@ -39,6 +41,7 @@ pub struct RoadsTableMeta {
 
 impl RoadsTableMeta {
     pub fn from_schema_regional(schema: &MirroredSchema) -> Result<Self> {
+        let resource_fields = fields_owned(schema, RESOURCE_TABLE)?;
         Ok(Self {
             terrain_chunk: resolve_terrain_chunk_cols(schema)?,
             paved_tile: resolve_paved_tile_cols(schema)?,
@@ -54,6 +57,9 @@ impl RoadsTableMeta {
             claim_tile_fields: fields_owned(schema, CLAIM_TILE_TABLE)?,
             claim_state_fields: fields_owned(schema, CLAIM_STATE_TABLE)?,
             location_fields: fields_owned(schema, LOCATION_TABLE)?,
+            resource: Some(decode::resolve_resource_cols(schema)?),
+            resource_fast: ResourceFast::try_from_fields(&resource_fields, schema),
+            resource_fields,
             paving_desc_fields: None,
             terraform_recipe_fields: None,
             region_name_fields: None,
@@ -77,6 +83,11 @@ impl RoadsTableMeta {
             claim_tile_fields: fields_owned(schema, CLAIM_TILE_TABLE).unwrap_or_default(),
             claim_state_fields: fields_owned(schema, CLAIM_STATE_TABLE).unwrap_or_default(),
             location_fields: fields_owned(schema, LOCATION_TABLE).unwrap_or_default(),
+            resource: decode::resolve_resource_cols(schema).ok(),
+            resource_fast: fields_owned(schema, RESOURCE_TABLE)
+                .ok()
+                .and_then(|fields| ResourceFast::try_from_fields(&fields, schema)),
+            resource_fields: fields_owned(schema, RESOURCE_TABLE).unwrap_or_default(),
             paving_desc_fields: fields_owned(schema, PAVING_TILE_DESC_TABLE).ok(),
             terraform_recipe_fields: fields_owned(schema, TERRAFORM_RECIPE_DESC_TABLE).ok(),
             region_name_fields: fields_owned(schema, REGION_NAME_TABLE).ok(),

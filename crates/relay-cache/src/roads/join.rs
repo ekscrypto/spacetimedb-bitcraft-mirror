@@ -103,10 +103,7 @@ impl TerrainWriter {
 
     pub fn note_chunk(&mut self, chunk_x: i32, chunk_z: i32) {
         if !self.absolute_chunks
-            && (chunk_x < 0
-                || chunk_z < 0
-                || chunk_x >= CHUNKS_PER_SIDE
-                || chunk_z >= CHUNKS_PER_SIDE)
+            && (chunk_x < 0 || chunk_z < 0 || chunk_x >= CHUNKS_PER_SIDE || chunk_z >= CHUNKS_PER_SIDE)
         {
             self.absolute_chunks = true;
         }
@@ -142,10 +139,7 @@ impl TerrainWriter {
         self.cell_side = side;
 
         let (base_cx, base_cz) = if self.absolute_chunks {
-            (
-                chunk_x - self.origin_chunk_x,
-                chunk_z - self.origin_chunk_z,
-            )
+            (chunk_x - self.origin_chunk_x, chunk_z - self.origin_chunk_z)
         } else {
             (chunk_x, chunk_z)
         };
@@ -167,19 +161,14 @@ impl TerrainWriter {
             terrain.set(super_x, super_z, packed);
         }
 
-        self.tracked_chunks.insert(
-            (chunk_x, chunk_z),
-            TerrainChunkKey { chunk_x, chunk_z },
-        );
+        self.tracked_chunks
+            .insert((chunk_x, chunk_z), TerrainChunkKey { chunk_x, chunk_z });
         let _ = region;
     }
 
     pub fn clear_chunk(&self, terrain: &mut SuperHexTerrainGrid, chunk_x: i32, chunk_z: i32) {
         let (base_cx, base_cz) = if self.absolute_chunks {
-            (
-                chunk_x - self.origin_chunk_x,
-                chunk_z - self.origin_chunk_z,
-            )
+            (chunk_x - self.origin_chunk_x, chunk_z - self.origin_chunk_z)
         } else {
             (chunk_x, chunk_z)
         };

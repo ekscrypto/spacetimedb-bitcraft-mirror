@@ -25,9 +25,7 @@ pub struct NamingSpec {
 impl NamingSpec {
     pub fn project(&self, stem: &str) -> String {
         let trimmed = match &self.stem_prefix {
-            Some(prefix) if !prefix.is_empty() && stem.starts_with(prefix) => {
-                &stem[prefix.len()..]
-            }
+            Some(prefix) if !prefix.is_empty() && stem.starts_with(prefix) => &stem[prefix.len()..],
             _ => stem,
         };
         match &self.template {

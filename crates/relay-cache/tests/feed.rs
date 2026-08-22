@@ -22,6 +22,8 @@ use spacetimedb_public_mirror_client::upstream::{UpstreamTableOps, UpstreamUpdat
 use relay_cache::decode;
 use relay_cache::feed::FeedManager;
 use relay_cache::interest::InterestHub;
+use relay_cache::roads::catalog::{apply_global_insert, GlobalRoadsCatalog};
+use relay_cache::roads::meta::RoadsTableMeta;
 
 const SCHEMA_JSON: &[u8] = include_bytes!("data/bitcraft-live-schema-v9.json");
 
@@ -158,7 +160,10 @@ fn real_schema_hot_tables_have_fixed_layouts_and_fast_readers_agree() {
     let resource_fast = decode::ResourceFast::try_from_fields(&resource_fields, &schema).expect("fixed layout");
     let row = resource_row(77, HEXITE_RESOURCE_ID);
     let fast = resource_fast.decode(&row).expect("fast decode");
-    assert_eq!((fast.entity_id, fast.resource_id), (77, HEXITE_RESOURCE_ID));
+    assert_eq!(
+        (fast.entity_id, fast.resource_id, fast.direction_index),
+        (77, HEXITE_RESOURCE_ID, 0)
+    );
     let generic =
         decode::decode_resource_with_fields(&row, &resource_fields, cols.resource, &schema).expect("generic decode");
     assert_eq!(fast, generic);
@@ -328,6 +333,46 @@ async fn feed_skips_global_database() {
         .expect("global dispatch is a no-op");
 }
 
+/// `terraform_recipe_desc.difference` is I16. Encoding it as Smallint and
+/// running it through the global catalog insert must populate recipes —
+/// the production empty `/roads/terraform-recipes` was this type mismatch.
+#[test]
+fn terraform_recipe_desc_i16_difference_inserts_into_catalog() {
+    let schema = schema();
+    let meta = RoadsTableMeta::from_schema_global(&schema).expect("global roads meta");
+    assert!(
+        meta.terraform_recipe.is_some(),
+        "v9 schema must resolve terraform_recipe_desc columns"
+    );
+
+    let mut catalog = GlobalRoadsCatalog::new();
+    let row = terraform_recipe_row(-4, 8, 1.5, 0.25);
+    apply_global_insert(&mut catalog, &meta, &schema, "terraform_recipe_desc", &row).expect("insert");
+    assert_eq!(catalog.terraform.len(), 1);
+    let recipe = catalog.terraform[0];
+    assert_eq!(recipe.difference, -4);
+    assert_eq!(recipe.actions_count, 8);
+    assert_eq!(recipe.stamina_per_action, 1.5);
+    assert_eq!(recipe.time_per_action, 0.25);
+}
+
+/// Hand-encode a `terraform_recipe_desc` row against the v9 product:
+/// difference i16, actions_count i32, tool_requirement Option (none),
+/// stamina_per_action f32, time_per_action f32, tool_mesh_index i32,
+/// recipe_performance_id i32, output_item_stacks Option (none).
+fn terraform_recipe_row(difference: i16, actions_count: i32, stamina: f32, time: f32) -> Bytes {
+    let mut buf = Vec::with_capacity(24);
+    buf.extend_from_slice(&difference.to_le_bytes());
+    buf.extend_from_slice(&actions_count.to_le_bytes());
+    buf.push(1u8); // tool_requirement: none
+    buf.extend_from_slice(&stamina.to_le_bytes());
+    buf.extend_from_slice(&time.to_le_bytes());
+    buf.extend_from_slice(&0i32.to_le_bytes()); // tool_mesh_index
+    buf.extend_from_slice(&0i32.to_le_bytes()); // recipe_performance_id
+    buf.push(1u8); // output_item_stacks: none
+    Bytes::from(buf)
+}
+
 #[test]
 fn feed_rejects_non_regional_database_names() {
     let interest = InterestHub::new();
@@ -336,4 +381,110 @@ fn feed_rejects_non_regional_database_names() {
         manager.register_region("something-else", SCHEMA_JSON).is_err(),
         "only bitcraft-live-<N> / bitcraft-live-global are valid"
     );
+}
+
+#[tokio::test]
+async fn feed_roads_joins_harvestable_location_before_resource() {
+    let interest = InterestHub::new();
+    let manager = FeedManager::new(interest);
+    let roads = manager.enable_roads();
+    let handle = manager
+        .register_region("bitcraft-live-7", SCHEMA_JSON)
+        .expect("register")
+        .expect("regional database yields a handle");
+
+    const SAPLING: i32 = 5; // Maple Sapling — allowlisted
+    let seed = seed_update(vec![
+        ops(
+            "location_state",
+            vec![],
+            vec![location_row(800, 10, 20, 1), location_row(801, 11, 21, 1)],
+        ),
+        ops(
+            "resource_state",
+            vec![],
+            vec![resource_row(800, SAPLING), resource_row(801, OTHER_RESOURCE_ID)],
+        ),
+    ]);
+    manager
+        .on_updates(Arc::from("bitcraft-live-7"), 1, vec![seed])
+        .await
+        .expect("dispatch seed");
+    manager
+        .on_live(Arc::from("bitcraft-live-7"), 1)
+        .await
+        .expect("dispatch live");
+    for _ in 0..200 {
+        if handle.store.read().ready {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(handle.store.read().ready);
+
+    let rh = roads.region_handle(7).expect("roads region");
+    for _ in 0..200 {
+        if rh.grid.read().ready {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let grid = rh.grid.read();
+    assert!(grid.ready);
+    assert_eq!(grid.harvestable.len(), 1);
+    assert_eq!(
+        grid.harvestable.resource_ids_on(10, 20).collect::<Vec<_>>(),
+        vec![SAPLING]
+    );
+    assert!(grid.harvestable.resource_ids_on(11, 21).next().is_none());
+    // Hexite ResourceSoA still ignores non-hexite rows.
+    assert_eq!(handle.store.read().resource.len(), 0);
+}
+
+#[tokio::test]
+async fn feed_roads_expands_clay_footprint_onto_neighbor_hexes() {
+    let interest = InterestHub::new();
+    let manager = FeedManager::new(interest);
+    let roads = manager.enable_roads();
+    let handle = manager
+        .register_region("bitcraft-live-7", SCHEMA_JSON)
+        .expect("register")
+        .expect("regional database yields a handle");
+
+    const MUD_MOUND: i32 = 66;
+    let seed = seed_update(vec![
+        ops("location_state", vec![], vec![location_row(800, 10, 1, 1)]),
+        ops("resource_state", vec![], vec![resource_row(800, MUD_MOUND)]),
+    ]);
+    manager
+        .on_updates(Arc::from("bitcraft-live-7"), 1, vec![seed])
+        .await
+        .expect("dispatch seed");
+    manager
+        .on_live(Arc::from("bitcraft-live-7"), 1)
+        .await
+        .expect("dispatch live");
+    for _ in 0..200 {
+        if handle.store.read().ready {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let rh = roads.region_handle(7).expect("roads region");
+    for _ in 0..200 {
+        if rh.grid.read().ready {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let grid = rh.grid.read();
+    assert!(grid.ready);
+    // Mud Mound: axial (0,0)/(0,-1)/(-1,0) around odd-r (10,1).
+    let mut hexes: Vec<_> = [(10, 1), (10, 0), (9, 1)]
+        .into_iter()
+        .filter(|&(x, z)| grid.harvestable.resource_ids_on(x, z).any(|id| id == MUD_MOUND))
+        .collect();
+    hexes.sort_unstable();
+    assert_eq!(hexes, vec![(9, 1), (10, 0), (10, 1)]);
 }

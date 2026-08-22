@@ -7,6 +7,7 @@ pub mod catalog;
 pub mod coords;
 pub mod decode;
 pub mod grid;
+pub mod harvestable;
 pub mod index;
 pub mod join;
 pub mod meta;

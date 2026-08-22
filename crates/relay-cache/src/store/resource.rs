@@ -176,6 +176,7 @@ mod tests {
         s.upsert(ResourceRow {
             entity_id: 10,
             resource_id: HEXITE_DEPOSIT_RESOURCE_ID,
+            direction_index: 0,
         });
         assert!(s.set_location(10, 8174, 6158));
         let slot = s.find_by_location(8174, 6158).unwrap();
@@ -188,6 +189,7 @@ mod tests {
         s.upsert(ResourceRow {
             entity_id: 10,
             resource_id: DEPLETED_HEXITE_DEPOSIT_RESOURCE_ID,
+            direction_index: 0,
         });
         assert!(!s.is_active(slot));
         // Location ignored for unknown entities.
@@ -200,6 +202,7 @@ mod tests {
         s.upsert(ResourceRow {
             entity_id: 10,
             resource_id: HEXITE_DEPOSIT_RESOURCE_ID,
+            direction_index: 0,
         });
         assert!(s.any_missing_location());
         assert!(s.set_location(10, 1, 2));
@@ -212,6 +215,7 @@ mod tests {
         s.upsert(ResourceRow {
             entity_id: 10,
             resource_id: HEXITE_DEPOSIT_RESOURCE_ID,
+            direction_index: 0,
         });
         // Coords that predate the resource row attach once…
         s.attach_location_if_missing(10, 7, 8);

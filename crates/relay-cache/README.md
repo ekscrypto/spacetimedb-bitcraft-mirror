@@ -167,6 +167,13 @@ curl -s 'http://127.0.0.1:8089/deposits?region=14'
 #        "respawn_at": "2026-07-26T08:43:52.011Z", "region": 13 }, ...
 #    ], "count": N }
 
+# Allowlisted harvestables on a hex list (trees/ore/rocks/clay/sand).
+# Multi-hex nodes (clay/sand/large trees/ore) are returned on every occupied
+# tile (resource_desc footprint × direction_index, odd-r converted).
+# Protobuf ResourceQuery { tiles: [{x,z}, ...] }, max 16384. 202 while seeding.
+# curl -sX POST http://127.0.0.1:8090/roads/region/14/resources \
+#   -H 'Content-Type: application/x-protobuf' --data-binary @query.pb
+
 # Storage logs (upstream retention ~15–16 days via storage_log_cleanup_loop).
 # Exactly one mode per request:
 #   storageId=…                         — full history for one chest

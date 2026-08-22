@@ -2,19 +2,19 @@
 
 //! Apply upstream table rows to a [`RoadsRegionGrid`].
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use hashbrown::HashMap;
 use relay_protocol::{MirroredField, MirroredSchema};
 
 use super::decode::{
-    self, decode_claim_state_roads, decode_claim_tile, decode_location_roads, decode_paved_tile,
-    decode_terrain_chunk, ClaimStateRoadsRow, CLAIM_STATE_TABLE, CLAIM_TILE_TABLE, LOCATION_TABLE,
-    PAVED_TILE_TABLE, TERRAIN_CHUNK_TABLE,
+    decode_claim_state_roads, decode_claim_tile, decode_location_roads, decode_paved_tile, decode_terrain_chunk,
+    CLAIM_STATE_TABLE, CLAIM_TILE_TABLE, LOCATION_TABLE, PAVED_TILE_TABLE, TERRAIN_CHUNK_TABLE,
 };
 use super::join::OVERWORLD_DIMENSION;
 use super::meta::RoadsTableMeta;
 use super::store::RoadsRegionGrid;
+use crate::decode::{self as cache_decode, ResourceRow, RESOURCE_TABLE};
 
 pub fn apply_roads_rows(
     grid: &mut RoadsRegionGrid,
@@ -68,8 +68,13 @@ fn apply_roads_delete(
             let r = decode_location_roads(row, &meta.location_fields, meta.location, schema)?;
             if r.dimension == OVERWORLD_DIMENSION {
                 grid.join.location_by_entity.remove(&r.entity_id);
+                grid.harvestable.clear_location(r.entity_id);
             }
             grid.bump_generation();
+        }
+        RESOURCE_TABLE => {
+            let r = decode_resource_row(meta, schema, row)?;
+            grid.harvestable.delete(r.entity_id);
         }
         _ => {}
     }
@@ -89,6 +94,7 @@ fn apply_roads_insert(
         CLAIM_TILE_TABLE => apply_claim_tile(grid, schema, meta, row)?,
         CLAIM_STATE_TABLE => apply_claim_state(grid, schema, meta, row)?,
         LOCATION_TABLE => apply_location(grid, schema, meta, row)?,
+        RESOURCE_TABLE => apply_resource(grid, schema, meta, row)?,
         _ => {}
     }
     Ok(())
@@ -134,12 +140,8 @@ fn apply_paved_tile(
 ) -> Result<()> {
     let r = decode_paved_tile(row, &meta.paved_tile_fields, meta.paved_tile, schema)?;
     grid.join.paving_by_entity.insert(r.entity_id, r.tile_type_id);
-    grid.join.recompute_cell(
-        grid.region,
-        &mut grid.overlay,
-        &mut grid.claim_index,
-        r.entity_id,
-    );
+    grid.join
+        .recompute_cell(grid.region, &mut grid.overlay, &mut grid.claim_index, r.entity_id);
     grid.bump_generation();
     Ok(())
 }
@@ -152,12 +154,8 @@ fn apply_claim_tile(
 ) -> Result<()> {
     let r = decode_claim_tile(row, &meta.claim_tile_fields, meta.claim_tile, schema)?;
     grid.join.claim_by_entity.insert(r.entity_id, r.claim_id);
-    grid.join.recompute_cell(
-        grid.region,
-        &mut grid.overlay,
-        &mut grid.claim_index,
-        r.entity_id,
-    );
+    grid.join
+        .recompute_cell(grid.region, &mut grid.overlay, &mut grid.claim_index, r.entity_id);
     grid.bump_generation();
     Ok(())
 }
@@ -189,14 +187,34 @@ fn apply_location(
         return Ok(());
     }
     grid.join.location_by_entity.insert(r.entity_id, (r.x, r.z));
-    grid.join.recompute_cell(
-        grid.region,
-        &mut grid.overlay,
-        &mut grid.claim_index,
-        r.entity_id,
-    );
+    grid.harvestable.set_location(r.entity_id, r.x, r.z);
+    grid.join
+        .recompute_cell(grid.region, &mut grid.overlay, &mut grid.claim_index, r.entity_id);
     grid.bump_generation();
     Ok(())
+}
+
+fn apply_resource(
+    grid: &mut RoadsRegionGrid,
+    schema: &MirroredSchema,
+    meta: &RoadsTableMeta,
+    row: &[u8],
+) -> Result<()> {
+    let r = decode_resource_row(meta, schema, row)?;
+    let loc = grid.join.location_by_entity.get(&r.entity_id).copied();
+    grid.harvestable
+        .upsert(r.entity_id, r.resource_id, r.direction_index, loc);
+    Ok(())
+}
+
+fn decode_resource_row(meta: &RoadsTableMeta, schema: &MirroredSchema, row: &[u8]) -> Result<ResourceRow> {
+    if let Some(decoded) = meta.resource_fast.and_then(|fast| fast.decode(row)) {
+        return Ok(decoded);
+    }
+    let cols = meta
+        .resource
+        .ok_or_else(|| anyhow!("roads meta has no resource_state columns"))?;
+    cache_decode::decode_resource_with_fields(row, &meta.resource_fields, cols, schema)
 }
 
 /// After seed completes, flush pending terrain rows with the chosen dimension.

@@ -248,6 +248,7 @@ pub struct LocationCols {
 pub struct ResourceCols {
     pub entity_id: usize,
     pub resource_id: usize,
+    pub direction_index: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -626,11 +627,12 @@ fn resolve_location_cols(schema: &MirroredSchema) -> Result<LocationCols> {
     })
 }
 
-fn resolve_resource_cols(schema: &MirroredSchema) -> Result<ResourceCols> {
+pub(crate) fn resolve_resource_cols(schema: &MirroredSchema) -> Result<ResourceCols> {
     let f = fields_of(schema, RESOURCE_TABLE)?;
     Ok(ResourceCols {
         entity_id: find_field(f, "entity_id", RESOURCE_TABLE)?,
         resource_id: find_field(f, "resource_id", RESOURCE_TABLE)?,
+        direction_index: find_field(f, "direction_index", RESOURCE_TABLE)?,
     })
 }
 
@@ -815,10 +817,12 @@ pub struct LocationRow {
     pub dimension: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ResourceRow {
     pub entity_id: u64,
     pub resource_id: i32,
+    /// `0..=5` — 60° CCW cube steps applied to `resource_desc.footprint`.
+    pub direction_index: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1187,6 +1191,7 @@ pub fn decode_resource_with_fields(
     Ok(ResourceRow {
         entity_id: cell_u64(&cells[cols.entity_id], "resource.entity_id")?,
         resource_id: cell_i32(&cells[cols.resource_id], "resource.resource_id")?,
+        direction_index: cell_i32(&cells[cols.direction_index], "resource.direction_index")?,
     })
 }
 
@@ -2093,6 +2098,7 @@ impl LocationFast {
 pub struct ResourceFast {
     entity_id: usize,
     resource_id: usize,
+    direction_index: usize,
 }
 
 impl ResourceFast {
@@ -2100,6 +2106,7 @@ impl ResourceFast {
         Some(Self {
             entity_id: fixed_field_offset(fields, schema, "entity_id")?,
             resource_id: fixed_field_offset(fields, schema, "resource_id")?,
+            direction_index: fixed_field_offset(fields, schema, "direction_index")?,
         })
     }
 
@@ -2108,6 +2115,7 @@ impl ResourceFast {
         Some(ResourceRow {
             entity_id: read_u64(row, self.entity_id)?,
             resource_id: read_i32(row, self.resource_id)?,
+            direction_index: read_i32(row, self.direction_index)?,
         })
     }
 }
