@@ -103,3 +103,42 @@ message ResourceNode {
 message ResourcesResponse {
   repeated ResourceNode nodes = 1;
 }
+
+// ---------------------------------------------------------------------------
+// Sparse map window over a world hex list
+// POST /roads/region/{id}/map
+//
+// Same payload as GET /roads/region/{id}/map, limited to the requested
+// tiles (world odd-r coords). Out-of-region tiles are silently skipped.
+// ---------------------------------------------------------------------------
+
+message MapQuery {
+  repeated Hex tiles = 1;
+}
+
+message MapTile {
+  int32 x = 1;                // world odd-r, echoed from the query
+  int32 z = 2;
+  uint32 paving_type_id = 3;  // 0 = none
+  uint64 claim_entity_id = 4; // 0 = unclaimed
+}
+
+// Super hex = 3x3 block of small hexes; x/z is the world coord of the
+// block's (0,0) tile, so the block covers x..x+2, z..z+2.
+message MapSuperHex {
+  int32 x = 1;
+  int32 z = 2;
+  // Same layout as RegionMapSnapshot terrain cells (pack_terrain):
+  // elev u16 | original u16<<16 | water u16<<32 | water_body_type u8<<48
+  uint64 terrain = 3;
+}
+
+message RegionMapWindow {
+  uint32 region = 1;
+  uint64 generation = 2;
+  int64 last_update_unix_ms = 3;
+  int32 origin_x = 4;
+  int32 origin_z = 5;
+  repeated MapSuperHex terrain = 6; // deduped, sorted by (x, z)
+  repeated MapTile tiles = 7;       // sorted by (x, z)
+}

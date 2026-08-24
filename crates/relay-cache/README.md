@@ -174,6 +174,14 @@ curl -s 'http://127.0.0.1:8089/deposits?region=14'
 # curl -sX POST http://127.0.0.1:8090/roads/region/14/resources \
 #   -H 'Content-Type: application/x-protobuf' --data-binary @query.pb
 
+# Sparse map window on a hex list — same data as GET /roads/region/{id}/map
+# (per-super-hex packed terrain u64 + per-tile paving_type_id/claim_entity_id),
+# limited to the requested world tiles (e.g. a settlement claim + surroundings).
+# Out-of-region and duplicate tiles are skipped. Protobuf MapQuery
+# { tiles: [{x,z}, ...] }, max 16384. 202 while seeding.
+# curl -sX POST http://127.0.0.1:8090/roads/region/14/map \
+#   -H 'Content-Type: application/x-protobuf' --data-binary @query.pb
+
 # Storage logs (upstream retention ~15–16 days via storage_log_cleanup_loop).
 # Exactly one mode per request:
 #   storageId=…                         — full history for one chest

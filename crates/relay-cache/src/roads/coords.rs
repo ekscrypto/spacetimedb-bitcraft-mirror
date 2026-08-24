@@ -7,6 +7,8 @@ pub const CHUNKS_PER_SIDE: i32 = 80;
 pub const DEFAULT_CHUNK_SIZE: i32 = 96;
 pub const REGION_SIDE: i32 = CHUNKS_PER_SIDE * DEFAULT_CHUNK_SIZE;
 pub const SUPER_SIDE: i32 = CHUNKS_PER_SIDE * 32;
+/// Small hexes per super-hex side (96 per chunk side / 32 terrain cells).
+pub const SMALL_PER_SUPER: i32 = REGION_SIDE / SUPER_SIDE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Hex {
@@ -106,6 +108,14 @@ pub fn world_to_local(region: u16, x: i32, z: i32) -> Option<(i32, i32)> {
         return None;
     }
     Some((lx, lz))
+}
+
+/// Region-local small-hex coords → super-hex coords covering the tile.
+pub fn small_to_super(lx: i32, lz: i32) -> (i32, i32) {
+    (
+        lx.div_euclid(SMALL_PER_SUPER),
+        lz.div_euclid(SMALL_PER_SUPER),
+    )
 }
 
 #[cfg(test)]

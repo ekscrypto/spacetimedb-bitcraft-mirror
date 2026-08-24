@@ -5,19 +5,21 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
 
-use super::coords::region_origin;
+use super::coords::{region_origin, small_to_super, world_to_local, SMALL_PER_SUPER};
 use super::decode::TerrainChunkRow;
-use super::grid::{OVERLAY_BYTES, TERRAIN_BYTES};
+use super::grid::{get_claim_index, get_paving, OVERLAY_BYTES, TERRAIN_BYTES};
 use super::harvestable::HarvestableIndex;
 use super::index::ClaimIndexTable;
 use super::join::{EntityJoinMaps, TerrainWriter, OVERWORLD_DIMENSION};
 
 pub const REGION_STATE_LOADING: u32 = 2;
 pub const REGION_STATE_READY: u32 = 3;
+/// Max hexes accepted by POST /roads/region/{id}/map.
+pub const MAX_MAP_QUERY_TILES: usize = 16384;
 
 #[derive(Debug)]
 pub struct RoadsRegionGrid {
@@ -111,6 +113,65 @@ impl RoadsRegionGrid {
         }
     }
 
+    /// Sparse window of the map data covering `tiles` (world odd-r coords).
+    ///
+    /// Same payload as [`snapshot`](Self::snapshot) but only for the
+    /// requested tiles: out-of-region and duplicate tiles are skipped.
+    pub fn window(&self, tiles: &[(i32, i32)]) -> RegionMapWindowData {
+        let origin = region_origin(self.region);
+        let claim_table = self.claim_index.claim_table();
+
+        let mut sorted = tiles.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+
+        let mut window = RegionMapWindowData {
+            region: self.region as u32,
+            generation: self.generation,
+            last_update_unix_ms: self.last_update_unix_ms,
+            origin_x: origin.x,
+            origin_z: origin.z,
+            terrain: Vec::new(),
+            tiles: Vec::with_capacity(sorted.len()),
+        };
+
+        let mut supers: HashSet<(i32, i32)> = HashSet::with_capacity(sorted.len());
+        for &(x, z) in &sorted {
+            let Some((lx, lz)) = world_to_local(self.region, x, z) else {
+                continue;
+            };
+            let cell = self.overlay.get(lx, lz);
+            let claim_index = get_claim_index(cell);
+            let claim_entity_id = if claim_index == 0 {
+                0
+            } else {
+                claim_table
+                    .get(claim_index as usize)
+                    .copied()
+                    .unwrap_or(0)
+            };
+            window.tiles.push(MapTileData {
+                x,
+                z,
+                paving_type_id: get_paving(cell),
+                claim_entity_id,
+            });
+            supers.insert(small_to_super(lx, lz));
+        }
+
+        let mut super_list: Vec<(i32, i32)> = supers.into_iter().collect();
+        super_list.sort_unstable();
+        window.terrain = super_list
+            .into_iter()
+            .map(|(sx, sz)| MapSuperHexData {
+                x: origin.x + sx * SMALL_PER_SUPER,
+                z: origin.z + sz * SMALL_PER_SUPER,
+                terrain: self.terrain.get(sx, sz),
+            })
+            .collect();
+        window
+    }
+
     pub fn status(&self) -> RegionRoadStatus {
         RegionRoadStatus {
             region: self.region as u32,
@@ -142,6 +203,33 @@ pub struct RegionMapSnapshot {
     pub terrain: Vec<u8>,
     pub overlay: Vec<u8>,
     pub etag: String,
+}
+
+#[derive(Debug)]
+pub struct MapTileData {
+    pub x: i32,
+    pub z: i32,
+    pub paving_type_id: u16,
+    pub claim_entity_id: u64,
+}
+
+#[derive(Debug)]
+pub struct MapSuperHexData {
+    /// World coord of the super-hex block's `(0, 0)` small tile.
+    pub x: i32,
+    pub z: i32,
+    pub terrain: u64,
+}
+
+#[derive(Debug)]
+pub struct RegionMapWindowData {
+    pub region: u32,
+    pub generation: u64,
+    pub last_update_unix_ms: i64,
+    pub origin_x: i32,
+    pub origin_z: i32,
+    pub terrain: Vec<MapSuperHexData>,
+    pub tiles: Vec<MapTileData>,
 }
 
 pub struct RegionRoadStatus {
@@ -183,7 +271,8 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::roads::grid::{get_claim_index, set_claim_index, set_paving};
+    use crate::roads::coords::terrain_index;
+    use crate::roads::grid::{get_claim_index, pack_terrain, set_claim_index, set_paving};
 
     #[test]
     fn snapshot_atomicity() {
@@ -201,5 +290,50 @@ mod tests {
         let cell = u32::from_le_bytes(snap.overlay[idx..idx + 4].try_into().unwrap());
         let claim_index = get_claim_index(cell);
         assert_eq!(snap.claim_table[claim_index as usize], 42);
+    }
+
+    #[test]
+    fn window_matches_full_snapshot() {
+        let mut grid = RoadsRegionGrid::new(1);
+        grid.claim_index.alloc_or_lookup(42);
+        grid.claim_index.alloc_or_lookup(99);
+        if let Some(cell) = grid.overlay.cell_mut(10, 20) {
+            set_paving(cell, 5);
+            set_claim_index(cell, 1);
+        }
+        if let Some(cell) = grid.overlay.cell_mut(12, 21) {
+            set_paving(cell, 7);
+            set_claim_index(cell, 2);
+        }
+        grid.terrain.set(3, 6, pack_terrain(10, -5, 20, 2));
+        grid.terrain.set(4, 7, pack_terrain(-3, 1, -2, 9));
+
+        // Duplicates, unsorted input, and an out-of-region tile are folded
+        // away; region 1's origin is (0, 0) so world == local here.
+        let window = grid.window(&[(12, 21), (10, 20), (10, 20), (-1, 0)]);
+        let snap = grid.snapshot();
+
+        assert_eq!((window.origin_x, window.origin_z), (snap.origin_x, snap.origin_z));
+        assert_eq!(window.generation, snap.generation);
+        assert_eq!(window.tiles.len(), 2);
+        assert_eq!((window.tiles[0].x, window.tiles[0].z), (10, 20));
+        assert_eq!(window.tiles[0].paving_type_id, 5);
+        assert_eq!(window.tiles[0].claim_entity_id, snap.claim_table[1]);
+        assert_eq!((window.tiles[1].x, window.tiles[1].z), (12, 21));
+        assert_eq!(window.tiles[1].paving_type_id, 7);
+        assert_eq!(window.tiles[1].claim_entity_id, snap.claim_table[2]);
+
+        // One super hex per distinct 3x3 block, matching the dense snapshot
+        // bytes at the covering terrain index.
+        assert_eq!(window.terrain.len(), 2);
+        assert_eq!((window.terrain[0].x, window.terrain[0].z), (9, 18));
+        assert_eq!(window.terrain[0].terrain, pack_terrain(10, -5, 20, 2));
+        assert_eq!((window.terrain[1].x, window.terrain[1].z), (12, 21));
+        assert_eq!(window.terrain[1].terrain, pack_terrain(-3, 1, -2, 9));
+        for super_hex in &window.terrain {
+            let idx = terrain_index(super_hex.x / 3, super_hex.z / 3).unwrap();
+            let bytes = &snap.terrain[idx * 8..idx * 8 + 8];
+            assert_eq!(super_hex.terrain, u64::from_le_bytes(bytes.try_into().unwrap()));
+        }
     }
 }
