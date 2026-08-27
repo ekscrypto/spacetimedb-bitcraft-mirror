@@ -19,9 +19,25 @@ use url::Url;
 use crate::coordinator_client::CoordinatorClient;
 
 use crate::observer::MirrorObserverRegistry;
-use crate::schema::public_user_table_names;
+use crate::schema::{fetch_and_parse_schema, public_user_table_names};
 use crate::status::{MirrorConnectivity, MirrorStatusHandle, MirrorStatusRegistry};
-use crate::upstream::{self, UpstreamConfig, UpstreamUpdate};
+use crate::upstream::{self, UpstreamConfig, UpstreamError, UpstreamUpdate};
+
+/// A successfully fetched upstream schema no longer matches the schema used to
+/// bootstrap this in-memory mirror.
+///
+/// The standalone process treats this as fatal so its service manager can
+/// restart it, recreating every mirror table and embedded-cache decoder from
+/// the new schemas before performing a full re-seed.
+#[derive(Debug, thiserror::Error)]
+#[error("upstream schema changed for `{database}`: {old_hash} -> {new_hash} (tables {old_tables} -> {new_tables})")]
+pub struct SchemaChanged {
+    pub database: String,
+    pub old_hash: spacetimedb_lib::Hash,
+    pub new_hash: spacetimedb_lib::Hash,
+    pub old_tables: usize,
+    pub new_tables: usize,
+}
 
 /// Configuration for the public-mirror upstream loop.
 #[derive(Debug, Clone)]
@@ -32,6 +48,78 @@ pub struct PublicMirrorConfig {
     /// When `None`, subscribe to all public user tables from the module def.
     pub tables: Option<Vec<String>>,
     pub connect_timeout: Duration,
+    /// Hash of the raw schema JSON used to bootstrap the local mirror.
+    pub bootstrap_schema_hash: spacetimedb_lib::Hash,
+}
+
+/// Errors that can be caused by continuing a session with an obsolete module
+/// definition. Network/connectivity failures keep their existing reconnect
+/// behavior and do not add a schema fetch to every transient outage.
+fn should_refetch_schema(error: &UpstreamError) -> bool {
+    matches!(
+        error,
+        UpstreamError::WebSocket(_)
+            | UpstreamError::Decode(_)
+            | UpstreamError::Subscription(_)
+            | UpstreamError::UnknownTable(_)
+            | UpstreamError::NotProduct(_)
+            | UpstreamError::Apply(_)
+            | UpstreamError::Closed(_)
+    )
+}
+
+async fn detect_schema_change(
+    config: &PublicMirrorConfig,
+    error: &UpstreamError,
+    old_tables: usize,
+) -> Option<SchemaChanged> {
+    if !should_refetch_schema(error) {
+        return None;
+    }
+
+    log::warn!(
+        "public-mirror: checking upstream schema after session error (database={}, error={error})",
+        config.database
+    );
+    let (schema_bytes, module_def) = match fetch_and_parse_schema(&config.upstream, &config.database).await {
+        Ok(schema) => schema,
+        Err(fetch_error) => {
+            log::warn!(
+                "public-mirror: schema re-fetch failed after session error; retaining reconnect behavior \
+                 (database={}, error={fetch_error})",
+                config.database
+            );
+            return None;
+        }
+    };
+
+    let new_hash = schema_program_hash(&schema_bytes);
+    if new_hash == config.bootstrap_schema_hash {
+        log::debug!(
+            "public-mirror: upstream schema hash unchanged after session error \
+             (database={}, schema_hash={new_hash})",
+            config.database
+        );
+        return None;
+    }
+
+    let change = SchemaChanged {
+        database: config.database.clone(),
+        old_hash: config.bootstrap_schema_hash,
+        new_hash,
+        old_tables,
+        new_tables: module_def.tables().count(),
+    };
+    log::error!(
+        "public-mirror: SCHEMA HASH CHANGED; requesting full daemon recycle \
+         (database={}, old_schema_hash={}, new_schema_hash={}, tables={} -> {})",
+        change.database,
+        change.old_hash,
+        change.new_hash,
+        change.old_tables,
+        change.new_tables
+    );
+    Some(change)
 }
 
 /// Resolve table name → [`TableId`] via the local relational DB.
@@ -105,8 +193,8 @@ pub async fn run_public_mirror_loop(
     coordinator_socket: Option<PathBuf>,
     observers: Option<Arc<MirrorObserverRegistry>>,
 ) -> anyhow::Result<()> {
-    let tables = match config.tables {
-        Some(t) if !t.is_empty() => t,
+    let tables = match &config.tables {
+        Some(t) if !t.is_empty() => t.clone(),
         _ => public_user_table_names(&module_def),
     };
     if tables.is_empty() {
@@ -126,9 +214,9 @@ pub async fn run_public_mirror_loop(
     let module_for_reset = module_host.clone();
 
     let upstream_cfg = UpstreamConfig {
-        host: config.upstream,
+        host: config.upstream.clone(),
         database: config.database.clone(),
-        auth_token: config.auth_token,
+        auth_token: config.auth_token.clone(),
         connect_timeout: config.connect_timeout,
     };
 
@@ -253,6 +341,11 @@ pub async fn run_public_mirror_loop(
         // Mark disconnected first so `public_mirror_accepts_clients_for`
         // rejects new WS for this database until its mirror is live again.
         status.set_disconnected(next_attempt_at);
+        if let Err(error) = &result
+            && let Some(change) = detect_schema_change(&config, error, module_def.tables().count()).await
+        {
+            return Err(change.into());
+        }
         match result {
             Ok(()) => {
                 log::warn!(
@@ -324,4 +417,65 @@ async fn acquire_subscribe_slot(
 /// Convenience: hash schema bytes into a SpacetimeDB [`spacetimedb_lib::Hash`].
 pub fn schema_program_hash(schema_bytes: &[u8]) -> spacetimedb_lib::Hash {
     spacetimedb_sats::hash::hash_bytes(schema_bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{should_refetch_schema, SchemaChanged};
+    use crate::upstream::UpstreamError;
+    use spacetimedb_lib::Hash;
+
+    #[test]
+    fn schema_shaped_errors_trigger_refetch() {
+        let errors = [
+            UpstreamError::Decode("unknown tag 0x4".into()),
+            UpstreamError::Subscription("unknown table".into()),
+            UpstreamError::UnknownTable("new_table".into()),
+            UpstreamError::NotProduct("changed_table".into()),
+            UpstreamError::Apply("row schema mismatch".into()),
+            UpstreamError::Closed("module updated".into()),
+        ];
+
+        for error in &errors {
+            assert!(should_refetch_schema(error), "{error} should trigger schema re-fetch");
+        }
+    }
+
+    #[test]
+    fn operational_errors_keep_normal_reconnect_behavior() {
+        let errors = [
+            UpstreamError::Connect("connection refused".into()),
+            UpstreamError::SubscribeTimeout("large_table".into(), Duration::from_secs(60)),
+            UpstreamError::SubscribeStalled("large_table".into(), Duration::from_secs(60)),
+            UpstreamError::Backlog { queued: 2, max: 1 },
+            UpstreamError::ProbeTimeout(30),
+        ];
+
+        for error in &errors {
+            assert!(
+                !should_refetch_schema(error),
+                "{error} should use normal reconnect behavior"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_change_error_includes_both_hashes() {
+        let old_hash = Hash::from_byte_array([0x11; 32]);
+        let new_hash = Hash::from_byte_array([0x22; 32]);
+        let error = SchemaChanged {
+            database: "bitcraft-live-7".into(),
+            old_hash,
+            new_hash,
+            old_tables: 274,
+            new_tables: 275,
+        }
+        .to_string();
+
+        assert!(error.contains(&old_hash.to_string()));
+        assert!(error.contains(&new_hash.to_string()));
+        assert!(error.contains("tables 274 -> 275"));
+    }
 }

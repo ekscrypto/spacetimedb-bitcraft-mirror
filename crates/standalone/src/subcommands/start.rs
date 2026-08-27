@@ -27,7 +27,9 @@ use spacetimedb_client_api_messages::name::DatabaseName;
 use spacetimedb_paths::cli::{PrivKeyPath, PubKeyPath};
 use spacetimedb_paths::server::{ConfigToml, ServerDataDir};
 use spacetimedb_public_mirror_client::observer::MirrorObserverRegistry;
-use spacetimedb_public_mirror_client::runtime::{run_public_mirror_loop, schema_program_hash, PublicMirrorConfig};
+use spacetimedb_public_mirror_client::runtime::{
+    run_public_mirror_loop, schema_program_hash, PublicMirrorConfig, SchemaChanged,
+};
 use spacetimedb_public_mirror_client::schema::fetch_and_parse_schema;
 use spacetimedb_public_mirror_client::schema::public_user_table_names;
 use std::str::FromStr;
@@ -984,6 +986,7 @@ async fn bootstrap_public_mirror(
         auth_token: token.map(str::to_string),
         tables,
         connect_timeout: Duration::from_secs(60),
+        bootstrap_schema_hash: initial_program,
     };
     let observers = cache.as_ref().map(|c| c.registry.clone());
     let mirror_status_registry = std::sync::Arc::clone(ctx.mirror_status_registry());
@@ -1000,6 +1003,22 @@ async fn bootstrap_public_mirror(
         )
         .await
         {
+            if let Some(change) = e.downcast_ref::<SchemaChanged>() {
+                log::error!(
+                    "public-mirror: schema drift requires process restart \
+                     (database={}, old_schema_hash={}, new_schema_hash={}, tables={} -> {}, exit_code=75)",
+                    change.database,
+                    change.old_hash,
+                    change.new_hash,
+                    change.old_tables,
+                    change.new_tables
+                );
+                // EX_TEMPFAIL: systemd's Restart=on-failure will rebuild all
+                // in-memory hosts and cache decoders from fresh schemas.
+                io::stdout().flush().ok();
+                io::stderr().flush().ok();
+                std::process::exit(75);
+            }
             log::error!("public-mirror upstream loop terminated: {e:#}");
         }
     });
