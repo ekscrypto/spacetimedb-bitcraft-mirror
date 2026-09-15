@@ -185,10 +185,27 @@ curl -s 'http://127.0.0.1:8089/bitme/session/1297036692699948124'
 #        "respawn_at": "2026-07-26T08:43:52.011Z", "region": 13 }, ...
 #    ], "count": N }
 
-# Allowlisted harvestables on a hex list (trees/ore/rocks/clay/sand).
-# Multi-hex nodes (clay/sand/large trees/ore) are returned on every occupied
-# tile (resource_desc footprint × direction_index, odd-r converted).
-# Protobuf ResourceQuery { tiles: [{x,z}, ...] }, max 16384. 202 while seeding.
+# Resource map window: packed 400x400 grid of every resource type around
+# the player (player at relative 200,200). 24-byte BMR1 header (origin
+# world tiles, region, dict_version) + 400x400 u16 LE tile words:
+# bits 0-9 dictionary index, bit 10 origin flag, bits 11-13
+# direction_index, bits 14-15 reserved. Full format + reconstruction
+# recipe: BITME-API.md §4.
+# curl -s http://127.0.0.1:8089/bitme/session/<player_entity_id>/resources -o window.bin
+
+# Resource dictionary for expanding window tiles: index -> resource_id +
+# name / gamedata / harvestable flag. Indices are per-deploy; refetch when
+# a window header's dict_version changes. BITME-API.md §5.
+# curl -s http://127.0.0.1:8089/bitme/region/7/resource-dictionary
+
+# Resources on a hex list — served from the dense per-region resource tile
+# map, so it returns ALL resource types (trees, ore, clay, sand, forageables,
+# event resources); filtering is the client's job (dictionary `harvestable`
+# flag). Multi-hex resources are stamped on every occupied tile
+# (resource_desc footprint × direction_index, odd-r converted). Each node
+# carries `direction` (0..=5) and `origin` (anchor tile) so clients can
+# reconstruct instances. Protobuf ResourceQuery { tiles: [{x,z}, ...] },
+# max 16384. 202 while seeding.
 # curl -sX POST http://127.0.0.1:8090/roads/region/14/resources \
 #   -H 'Content-Type: application/x-protobuf' --data-binary @query.pb
 

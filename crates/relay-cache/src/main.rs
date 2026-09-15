@@ -17,6 +17,14 @@
 //!   9. Hexite Deposits (neutral claim_state + growth_state)
 //!  10. public `/internal/dim-buildings/ws` — housing-interior building-id
 //!      push (primary consumer: bitcraft-streamd; nginx-proxied)
+//!
+//! Embedded mode (`standalone start --bitcraft-cache`) additionally serves:
+//!  11. roads terrain/paving/claim grids + resource tile map
+//!      (`/roads/*`; protobuf; see proto/roads_cache.proto and
+//!      `roads/resource_map.rs` for the tile-word layout)
+//!  12. Bit-Me mobile app API (`/bitme/*`; client reference: BITME-API.md)
+//!      — resolve, activity snapshot, packed resource-map window,
+//!      resource dictionary
 
 //! For the library (stores, decode, HTTP API, embedded feed) see `src/lib.rs`.
 
