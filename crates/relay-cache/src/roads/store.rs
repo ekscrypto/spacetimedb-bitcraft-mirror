@@ -12,9 +12,9 @@ use sha2::{Digest, Sha256};
 use super::coords::{region_origin, small_to_super, world_to_local, SMALL_PER_SUPER};
 use super::decode::TerrainChunkRow;
 use super::grid::{get_claim_index, get_paving, OVERLAY_BYTES, TERRAIN_BYTES};
-use super::harvestable::HarvestableIndex;
 use super::index::ClaimIndexTable;
 use super::join::{EntityJoinMaps, TerrainWriter, OVERWORLD_DIMENSION};
+use super::resource_map::{ResourceTileMap, RESOURCE_MAP_BYTES};
 
 pub const REGION_STATE_LOADING: u32 = 2;
 pub const REGION_STATE_READY: u32 = 3;
@@ -37,7 +37,7 @@ pub struct RoadsRegionGrid {
     pub dim_hist: HashMap<u32, usize>,
     pub terrain_chunks: HashMap<(i32, i32), u32>,
     pub pending_terrain: Vec<TerrainChunkRow>,
-    pub harvestable: HarvestableIndex,
+    pub resource_map: ResourceTileMap,
 }
 
 impl RoadsRegionGrid {
@@ -58,12 +58,12 @@ impl RoadsRegionGrid {
             dim_hist: HashMap::new(),
             terrain_chunks: HashMap::new(),
             pending_terrain: Vec::new(),
-            harvestable: HarvestableIndex::new(),
+            resource_map: ResourceTileMap::new(region),
         }
     }
 
     pub fn memory_bytes(&self) -> u64 {
-        (TERRAIN_BYTES + OVERLAY_BYTES) as u64 + 1_000_000
+        (TERRAIN_BYTES + OVERLAY_BYTES + RESOURCE_MAP_BYTES) as u64 + 1_000_000
     }
 
     pub fn bump_generation(&mut self) {
@@ -145,10 +145,7 @@ impl RoadsRegionGrid {
             let claim_entity_id = if claim_index == 0 {
                 0
             } else {
-                claim_table
-                    .get(claim_index as usize)
-                    .copied()
-                    .unwrap_or(0)
+                claim_table.get(claim_index as usize).copied().unwrap_or(0)
             };
             window.tiles.push(MapTileData {
                 x,

@@ -492,6 +492,7 @@ pub async fn exec(args: &ArgMatches, db_cores: JobCores) -> anyhow::Result<()> {
             memory_pressure: cache.memory_pressure.clone(),
             interest: cache.interest.clone(),
             roads: cache.roads.clone(),
+            bitme: cache.feed.bitme(),
         };
         tokio::spawn(async move {
             if let Err(e) = relay_cache::serve::serve(addr, fleet, std::future::pending()).await {

@@ -137,6 +137,9 @@ async fn main() -> Result<()> {
         memory_pressure,
         interest,
         roads: None,
+        // WS mode has no global feed (no Bit-Me resolve chain), but the
+        // region stores and session tracker still back `/bitme/session`.
+        bitme: relay_cache::bitme::BitmeHub::new(),
     };
 
     let http_task = if args.bind.is_empty() {

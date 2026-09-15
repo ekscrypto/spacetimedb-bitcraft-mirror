@@ -70,6 +70,55 @@ pub const GROWTH_TABLE: &str = "growth_state";
 pub const RESOURCE_GROWTH_TIMER_TABLE: &str = "resource_growth_timer";
 pub const STORAGE_LOG_TABLE: &str = "storage_log_state";
 
+// --- Bit-Me (mobile companion) session tables ------------------------------
+/// Per-entity stamina: `stamina` (F32, 0..=max) + the timestamp of the last
+/// decrease (regen clock). One row per entity that has spent stamina.
+pub const STAMINA_TABLE: &str = "stamina_state";
+/// Per-entity active buff list. Rows carry placeholder entries (start 0 /
+/// duration 0) for every buff type the entity has ever seen; only entries
+/// with a nonzero start or duration are live.
+pub const ACTIVE_BUFF_TABLE: &str = "active_buff_state";
+/// Per-entity in-progress/last action rows. PK is `auto_id`; a player can
+/// hold one row per action layer (Base + UpperBody). Rows persist after the
+/// action ends — `start_time`/`duration` (unix ms / ms) say whether it is
+/// still running, `last_action_result` how it ended.
+pub const PLAYER_ACTION_TABLE: &str = "player_action_state";
+/// Per-resource current health. ~one row per damageable resource entity
+/// (hundreds of thousands per region) — NOT stored wholesale; the Bit-Me
+/// tracker retains rows only for tracked action targets (`crate::bitme`).
+pub const RESOURCE_HEALTH_TABLE: &str = "resource_health_state";
+/// Static resource gamedata (name, max_health, despawn/respawn timers,
+/// destroy-yield resource chain). Replicated per region DB; ~few k rows.
+pub const RESOURCE_DESC_TABLE: &str = "resource_desc";
+/// Static extraction catalog: `recipe_id → resource_id` (+ yields, tool and
+/// skill requirements). ~650 rows, replicated per region DB. The Extract
+/// action's `recipe_id` joins here — the last-resort "what is being
+/// harvested" mapping for the Bit-Me session feed, used when the resource
+/// tile map has not seen the entity.
+pub const EXTRACTION_RECIPE_TABLE: &str = "extraction_recipe_desc";
+/// Static stat catalog; `stat_type` indexes `character_stats_state.values`.
+pub const CHARACTER_STAT_DESC_TABLE: &str = "character_stat_desc";
+/// Per-entity stat values; `values[stat_type]` (0 = Maximum Health,
+/// 1 = Maximum Stamina — resolved from `character_stat_desc` by name).
+pub const CHARACTER_STATS_TABLE: &str = "character_stats_state";
+
+// --- Bit-Me resolve chain (global module tables) ----------------------------
+/// Exact-match lowercase username → player entity_id (the name→id index the
+/// substring-scan `/player?name=` route lacks).
+pub const PLAYER_LOWERCASE_USERNAME_TABLE: &str = "player_lowercase_username_state";
+/// user identity (U256) → user entity_id. PK is `entity_id`.
+pub const USER_STATE_TABLE: &str = "user_state";
+/// user identity → home region id (U8). PK is `identity`.
+pub const USER_REGION_STATE_TABLE: &str = "user_region_state";
+/// region id (U8) → connection info (`host`, `module`).
+pub const REGION_CONNECTION_INFO_TABLE: &str = "region_connection_info";
+/// region id (U16) → player-facing region name.
+pub const WORLD_REGION_NAME_TABLE: &str = "world_region_name_state";
+/// Presence set of signed-in players (global; one row per online player).
+/// Global `player_state` is event-driven and effectively empty at seed time,
+/// so this table is the authoritative live sign-in signal.
+pub const SIGNED_IN_PLAYER_TABLE: &str = "signed_in_player_state";
+
 /// Hexite Deposit (`resource_desc.id`). Live / harvestable form.
 pub const HEXITE_DEPOSIT_RESOURCE_ID: i32 = 348497955;
 /// Depleted Hexite Deposit — same entity; respawn clock from
@@ -306,6 +355,140 @@ pub struct PlayerStateCols {
 pub struct MobileEntityCols {
     pub entity_id: usize,
     pub timestamp: usize,
+    pub location_x: usize,
+    pub location_z: usize,
+    pub destination_x: usize,
+    pub destination_z: usize,
+    pub dimension: usize,
+    pub is_walking: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct StaminaCols {
+    pub entity_id: usize,
+    pub last_stamina_decrease_timestamp: usize,
+    pub stamina: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct ActiveBuffCols {
+    pub entity_id: usize,
+    pub active_buffs: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct PlayerActionCols {
+    pub auto_id: usize,
+    pub entity_id: usize,
+    pub start_time: usize,
+    pub duration: usize,
+    pub target: usize,
+    pub recipe_id: usize,
+    pub action_type: usize,
+    pub layer: usize,
+    pub last_action_result: usize,
+    pub client_cancel: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct ResourceHealthCols {
+    pub entity_id: usize,
+    pub health: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct ResourceDescCols {
+    pub id: usize,
+    pub name: usize,
+    pub max_health: usize,
+    pub despawn_time: usize,
+    pub on_destroy_yield_resource_id: usize,
+    pub scheduled_respawn_time: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct ExtractionRecipeCols {
+    pub id: usize,
+    pub resource_id: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct CharacterStatDescCols {
+    pub stat_type: usize,
+    pub name: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct CharacterStatsCols {
+    pub entity_id: usize,
+    pub values: usize,
+}
+
+// --- Bit-Me resolve chain (global module) ----------------------------------
+
+/// Optional column bundle for the global resolve tables. Every field is
+/// `Option` because the global schema may legitimately lack a table (the
+/// resolve chain degrades, it does not fail the feed).
+#[derive(Clone, Copy, Default)]
+pub struct BitmeGlobalCols {
+    pub lowercase_username: Option<(usize, usize)>, // (entity_id, username_lowercase)
+    pub user_state: Option<(usize, usize)>,         // (entity_id, identity)
+    pub user_region: Option<(usize, usize)>,        // (identity, region_id)
+    pub region_connection: Option<(usize, usize, usize)>, // (id, host, module)
+    pub world_region_name: Option<(usize, usize)>,  // (id, player_facing_name)
+    pub signed_in_player: Option<usize>,            // (entity_id)
+}
+
+/// Resolve the global Bit-Me column bundle. Missing tables/columns yield
+/// `None` arms — a schema change degrades resolution instead of crashing.
+pub fn resolve_bitme_global_cols(schema: &MirroredSchema) -> Result<BitmeGlobalCols> {
+    fn pair(schema: &MirroredSchema, table: &str, a: &str, b: &str) -> Result<Option<(usize, usize)>> {
+        let Some(f) = schema.tables.iter().find(|t| t.name == table) else {
+            return Ok(None);
+        };
+        let f = schema
+            .table_product(f)
+            .ok_or_else(|| anyhow!("table `{table}` is not a Product"))?;
+        Ok(Some((find_field(f, a, table)?, find_field(f, b, table)?)))
+    }
+    let region_connection = {
+        let table = REGION_CONNECTION_INFO_TABLE;
+        match schema.tables.iter().find(|t| t.name == table) {
+            Some(t) => {
+                let f = schema
+                    .table_product(t)
+                    .ok_or_else(|| anyhow!("table `{table}` is not a Product"))?;
+                Some((
+                    find_field(f, "id", table)?,
+                    find_field(f, "host", table)?,
+                    find_field(f, "module", table)?,
+                ))
+            }
+            None => None,
+        }
+    };
+    let signed_in_player = match schema.tables.iter().find(|t| t.name == SIGNED_IN_PLAYER_TABLE) {
+        Some(t) => {
+            let f = schema
+                .table_product(t)
+                .ok_or_else(|| anyhow!("table `{SIGNED_IN_PLAYER_TABLE}` is not a Product"))?;
+            Some(find_field(f, "entity_id", SIGNED_IN_PLAYER_TABLE)?)
+        }
+        None => None,
+    };
+    Ok(BitmeGlobalCols {
+        lowercase_username: pair(
+            schema,
+            PLAYER_LOWERCASE_USERNAME_TABLE,
+            "entity_id",
+            "username_lowercase",
+        )?,
+        user_state: pair(schema, USER_STATE_TABLE, "entity_id", "identity")?,
+        user_region: pair(schema, USER_REGION_STATE_TABLE, "identity", "region_id")?,
+        region_connection,
+        world_region_name: pair(schema, WORLD_REGION_NAME_TABLE, "id", "player_facing_name")?,
+        signed_in_player,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -383,6 +566,14 @@ pub struct ColMaps {
     pub growth: GrowthCols,
     pub growth_timer: ResourceGrowthTimerCols,
     pub storage_log: StorageLogCols,
+    pub stamina: StaminaCols,
+    pub active_buff: ActiveBuffCols,
+    pub player_action: PlayerActionCols,
+    pub resource_health: ResourceHealthCols,
+    pub resource_desc: ResourceDescCols,
+    pub extraction_recipe: ExtractionRecipeCols,
+    pub character_stat_desc: CharacterStatDescCols,
+    pub character_stats: CharacterStatsCols,
 }
 
 /// Resolve column indices for the tables we hold. Errors if any expected
@@ -419,6 +610,14 @@ pub fn resolve_cols(schema: &MirroredSchema) -> Result<ColMaps> {
         growth: resolve_growth_cols(schema)?,
         growth_timer: resolve_resource_growth_timer_cols(schema)?,
         storage_log: resolve_storage_log_cols(schema)?,
+        stamina: resolve_stamina_cols(schema)?,
+        active_buff: resolve_active_buff_cols(schema)?,
+        player_action: resolve_player_action_cols(schema)?,
+        resource_health: resolve_resource_health_cols(schema)?,
+        resource_desc: resolve_resource_desc_cols(schema)?,
+        extraction_recipe: resolve_extraction_recipe_cols(schema)?,
+        character_stat_desc: resolve_character_stat_desc_cols(schema)?,
+        character_stats: resolve_character_stats_cols(schema)?,
     })
 }
 
@@ -687,7 +886,7 @@ fn resolve_player_username_cols(schema: &MirroredSchema) -> Result<PlayerUsernam
     })
 }
 
-fn resolve_player_state_cols(schema: &MirroredSchema) -> Result<PlayerStateCols> {
+pub(crate) fn resolve_player_state_cols(schema: &MirroredSchema) -> Result<PlayerStateCols> {
     let f = fields_of(schema, PLAYER_STATE_TABLE)?;
     Ok(PlayerStateCols {
         entity_id: find_field(f, "entity_id", PLAYER_STATE_TABLE)?,
@@ -702,6 +901,89 @@ fn resolve_mobile_entity_cols(schema: &MirroredSchema) -> Result<MobileEntityCol
     Ok(MobileEntityCols {
         entity_id: find_field(f, "entity_id", MOBILE_ENTITY_TABLE)?,
         timestamp: find_field(f, "timestamp", MOBILE_ENTITY_TABLE)?,
+        location_x: find_field(f, "location_x", MOBILE_ENTITY_TABLE)?,
+        location_z: find_field(f, "location_z", MOBILE_ENTITY_TABLE)?,
+        destination_x: find_field(f, "destination_x", MOBILE_ENTITY_TABLE)?,
+        destination_z: find_field(f, "destination_z", MOBILE_ENTITY_TABLE)?,
+        dimension: find_field(f, "dimension", MOBILE_ENTITY_TABLE)?,
+        is_walking: find_field(f, "is_walking", MOBILE_ENTITY_TABLE)?,
+    })
+}
+
+fn resolve_stamina_cols(schema: &MirroredSchema) -> Result<StaminaCols> {
+    let f = fields_of(schema, STAMINA_TABLE)?;
+    Ok(StaminaCols {
+        entity_id: find_field(f, "entity_id", STAMINA_TABLE)?,
+        last_stamina_decrease_timestamp: find_field(f, "last_stamina_decrease_timestamp", STAMINA_TABLE)?,
+        stamina: find_field(f, "stamina", STAMINA_TABLE)?,
+    })
+}
+
+fn resolve_active_buff_cols(schema: &MirroredSchema) -> Result<ActiveBuffCols> {
+    let f = fields_of(schema, ACTIVE_BUFF_TABLE)?;
+    Ok(ActiveBuffCols {
+        entity_id: find_field(f, "entity_id", ACTIVE_BUFF_TABLE)?,
+        active_buffs: find_field(f, "active_buffs", ACTIVE_BUFF_TABLE)?,
+    })
+}
+
+fn resolve_player_action_cols(schema: &MirroredSchema) -> Result<PlayerActionCols> {
+    let f = fields_of(schema, PLAYER_ACTION_TABLE)?;
+    Ok(PlayerActionCols {
+        auto_id: find_field(f, "auto_id", PLAYER_ACTION_TABLE)?,
+        entity_id: find_field(f, "entity_id", PLAYER_ACTION_TABLE)?,
+        start_time: find_field(f, "start_time", PLAYER_ACTION_TABLE)?,
+        duration: find_field(f, "duration", PLAYER_ACTION_TABLE)?,
+        target: find_field(f, "target", PLAYER_ACTION_TABLE)?,
+        recipe_id: find_field(f, "recipe_id", PLAYER_ACTION_TABLE)?,
+        action_type: find_field(f, "action_type", PLAYER_ACTION_TABLE)?,
+        layer: find_field(f, "layer", PLAYER_ACTION_TABLE)?,
+        last_action_result: find_field(f, "last_action_result", PLAYER_ACTION_TABLE)?,
+        client_cancel: find_field(f, "client_cancel", PLAYER_ACTION_TABLE)?,
+    })
+}
+
+pub(crate) fn resolve_resource_health_cols(schema: &MirroredSchema) -> Result<ResourceHealthCols> {
+    let f = fields_of(schema, RESOURCE_HEALTH_TABLE)?;
+    Ok(ResourceHealthCols {
+        entity_id: find_field(f, "entity_id", RESOURCE_HEALTH_TABLE)?,
+        health: find_field(f, "health", RESOURCE_HEALTH_TABLE)?,
+    })
+}
+
+fn resolve_resource_desc_cols(schema: &MirroredSchema) -> Result<ResourceDescCols> {
+    let f = fields_of(schema, RESOURCE_DESC_TABLE)?;
+    Ok(ResourceDescCols {
+        id: find_field(f, "id", RESOURCE_DESC_TABLE)?,
+        name: find_field(f, "name", RESOURCE_DESC_TABLE)?,
+        max_health: find_field(f, "max_health", RESOURCE_DESC_TABLE)?,
+        despawn_time: find_field(f, "despawn_time", RESOURCE_DESC_TABLE)?,
+        on_destroy_yield_resource_id: find_field(f, "on_destroy_yield_resource_id", RESOURCE_DESC_TABLE)?,
+        scheduled_respawn_time: find_field(f, "scheduled_respawn_time", RESOURCE_DESC_TABLE)?,
+    })
+}
+
+fn resolve_extraction_recipe_cols(schema: &MirroredSchema) -> Result<ExtractionRecipeCols> {
+    let f = fields_of(schema, EXTRACTION_RECIPE_TABLE)?;
+    Ok(ExtractionRecipeCols {
+        id: find_field(f, "id", EXTRACTION_RECIPE_TABLE)?,
+        resource_id: find_field(f, "resource_id", EXTRACTION_RECIPE_TABLE)?,
+    })
+}
+
+fn resolve_character_stat_desc_cols(schema: &MirroredSchema) -> Result<CharacterStatDescCols> {
+    let f = fields_of(schema, CHARACTER_STAT_DESC_TABLE)?;
+    Ok(CharacterStatDescCols {
+        stat_type: find_field(f, "stat_type", CHARACTER_STAT_DESC_TABLE)?,
+        name: find_field(f, "name", CHARACTER_STAT_DESC_TABLE)?,
+    })
+}
+
+fn resolve_character_stats_cols(schema: &MirroredSchema) -> Result<CharacterStatsCols> {
+    let f = fields_of(schema, CHARACTER_STATS_TABLE)?;
+    Ok(CharacterStatsCols {
+        entity_id: find_field(f, "entity_id", CHARACTER_STATS_TABLE)?,
+        values: find_field(f, "values", CHARACTER_STATS_TABLE)?,
     })
 }
 
@@ -887,6 +1169,102 @@ pub struct MobileEntityRow {
     pub entity_id: u64,
     /// Unix milliseconds (`mobile_entity_state.timestamp` is U64).
     pub timestamp_ms: u64,
+    /// World position in milli-units (1000 = one tile). Players standing in
+    /// an interior dimension keep their overworld row untouched.
+    pub location_x: i32,
+    pub location_z: i32,
+    pub destination_x: i32,
+    pub destination_z: i32,
+    pub dimension: u32,
+    pub is_walking: bool,
+}
+
+/// One live entry of `active_buff_state.active_buffs`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BuffEntry {
+    pub buff_id: i32,
+    /// Unix seconds when the buff started (0 = inactive placeholder).
+    pub start_timestamp: i32,
+    /// Duration in seconds (0 = inactive placeholder / permanent marker).
+    pub duration: i32,
+    /// Raw stat-modifier values; meaning is per `buff_desc` gamedata.
+    pub values: Box<[f32]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ActiveBuffRow {
+    pub entity_id: u64,
+    pub buffs: Box<[BuffEntry]>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StaminaRow {
+    pub entity_id: u64,
+    /// Unix micros of the last stamina decrease (regen clock).
+    pub last_decrease_micros: i64,
+    pub stamina: f32,
+}
+
+/// One `player_action_state` row. `target` is the acted-on entity (resource,
+/// building, …) when present; `recipe_id` for craft/extract actions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayerActionRow {
+    pub auto_id: u64,
+    pub entity_id: u64,
+    /// Unix milliseconds.
+    pub start_time_ms: u64,
+    /// Milliseconds; `start_time_ms + duration_ms` is the completion instant.
+    pub duration_ms: u64,
+    pub target: Option<u64>,
+    pub recipe_id: Option<i32>,
+    /// Upstream sum variant, e.g. `Extract`, `Craft`, `None`.
+    pub action_type: String,
+    /// `Base` or `UpperBody`.
+    pub layer: String,
+    /// `Success`, `TimingFail`, `Fail` or `Cancel`.
+    pub last_action_result: String,
+    pub client_cancel: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceHealthRow {
+    pub entity_id: u64,
+    pub health: i32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResourceDescRow {
+    pub id: i32,
+    pub name: String,
+    pub max_health: i32,
+    /// Seconds the resource lingers after its despawn clock starts (F32).
+    pub despawn_time: f32,
+    /// Resource spawned in this one's place when destroyed (growth cycle).
+    pub on_destroy_yield_resource_id: i32,
+    /// Seconds until a depleted resource reappears (F32).
+    pub scheduled_respawn_time: f32,
+}
+
+/// The two identity fields of `extraction_recipe_desc` (the full row has
+/// ~23 columns of yields/requirements we don't need).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractionRecipeRow {
+    pub id: i32,
+    pub resource_id: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CharacterStatDescRow {
+    pub stat_type: i32,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CharacterStatsRow {
+    pub entity_id: u64,
+    /// Indexed by `character_stat_desc.stat_type` (0 = Maximum Health,
+    /// 1 = Maximum Stamina).
+    pub values: Box<[f32]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1350,7 +1728,319 @@ pub fn decode_mobile_entity_with_fields(
     Ok(MobileEntityRow {
         entity_id: cell_u64(&cells[cols.entity_id], "mobile_entity.entity_id")?,
         timestamp_ms: cell_u64(&cells[cols.timestamp], "mobile_entity.timestamp")?,
+        location_x: cell_i32(&cells[cols.location_x], "mobile_entity.location_x")?,
+        location_z: cell_i32(&cells[cols.location_z], "mobile_entity.location_z")?,
+        destination_x: cell_i32(&cells[cols.destination_x], "mobile_entity.destination_x")?,
+        destination_z: cell_i32(&cells[cols.destination_z], "mobile_entity.destination_z")?,
+        dimension: cell_u32(&cells[cols.dimension], "mobile_entity.dimension")?,
+        is_walking: cell_bool(&cells[cols.is_walking], "mobile_entity.is_walking")?,
     })
+}
+
+pub fn decode_stamina_with_fields(
+    row: &[u8],
+    fields: &[MirroredField],
+    cols: StaminaCols,
+    schema: &MirroredSchema,
+) -> Result<StaminaRow> {
+    let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
+    Ok(StaminaRow {
+        entity_id: cell_u64(&cells[cols.entity_id], "stamina.entity_id")?,
+        last_decrease_micros: decode_timestamp_micros(
+            &cells[cols.last_stamina_decrease_timestamp],
+            "stamina.last_stamina_decrease_timestamp",
+        )?,
+        stamina: cell_f32(&cells[cols.stamina], "stamina.stamina")?,
+    })
+}
+
+pub fn decode_active_buff_with_fields(
+    row: &[u8],
+    fields: &[MirroredField],
+    cols: ActiveBuffCols,
+    schema: &MirroredSchema,
+) -> Result<ActiveBuffRow> {
+    let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
+    Ok(ActiveBuffRow {
+        entity_id: cell_u64(&cells[cols.entity_id], "active_buff.entity_id")?,
+        buffs: decode_buff_entries(&cells[cols.active_buffs])?,
+    })
+}
+
+/// `active_buffs` is an array of products rendered as JSON:
+/// `{"buff_id": 5, "buff_start_timestamp": {"value": 1778354880},
+///   "buff_duration": 300, "values": [-0.4, -0.4, -0.4]}`.
+fn decode_buff_entries(cell: &Cell) -> Result<Box<[BuffEntry]>> {
+    let json = cell_json(cell)?;
+    let Value::Array(arr) = json else {
+        bail!("active_buffs is not a JSON array: {json}");
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, entry) in arr.iter().enumerate() {
+        let Value::Object(obj) = entry else {
+            bail!("active_buffs[{i}] is not an object: {entry}");
+        };
+        let buff_id = json_i32(obj.get("buff_id"), &format!("active_buffs[{i}].buff_id"))?;
+        let start_timestamp = match obj.get("buff_start_timestamp") {
+            Some(Value::Object(t)) => json_i32(t.get("value"), &format!("active_buffs[{i}].buff_start_timestamp"))?,
+            Some(v) if v.is_i64() => v.as_i64().unwrap_or(0) as i32,
+            other => bail!("active_buffs[{i}].buff_start_timestamp unexpected: {other:?}"),
+        };
+        let duration = json_i32(obj.get("buff_duration"), &format!("active_buffs[{i}].buff_duration"))?;
+        let values = decode_f32_array(obj.get("values"), &format!("active_buffs[{i}].values"))?;
+        out.push(BuffEntry {
+            buff_id,
+            start_timestamp,
+            duration,
+            values,
+        });
+    }
+    Ok(out.into())
+}
+
+fn decode_f32_array(v: Option<&Value>, ctx: &str) -> Result<Box<[f32]>> {
+    let Some(Value::Array(arr)) = v else {
+        bail!("{ctx}: expected JSON array");
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, v) in arr.iter().enumerate() {
+        let n = v
+            .as_f64()
+            .ok_or_else(|| anyhow!("{ctx}[{i}]: expected number, got {v}"))?;
+        out.push(n as f32);
+    }
+    Ok(out.into())
+}
+
+pub fn decode_player_action_with_fields(
+    row: &[u8],
+    fields: &[MirroredField],
+    cols: PlayerActionCols,
+    schema: &MirroredSchema,
+) -> Result<PlayerActionRow> {
+    let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
+    Ok(PlayerActionRow {
+        auto_id: cell_u64(&cells[cols.auto_id], "player_action.auto_id")?,
+        entity_id: cell_u64(&cells[cols.entity_id], "player_action.entity_id")?,
+        start_time_ms: cell_u64(&cells[cols.start_time], "player_action.start_time")?,
+        duration_ms: cell_u64(&cells[cols.duration], "player_action.duration")?,
+        target: cell_opt_u64_sum(&cells[cols.target], "player_action.target")?,
+        recipe_id: cell_opt_i32_sum(&cells[cols.recipe_id], "player_action.recipe_id")?,
+        action_type: sum_variant_pascal(&cells[cols.action_type], "player_action.action_type")?,
+        layer: sum_variant_pascal(&cells[cols.layer], "player_action.layer")?,
+        last_action_result: sum_variant_pascal(&cells[cols.last_action_result], "player_action.last_action_result")?,
+        client_cancel: cell_bool(&cells[cols.client_cancel], "player_action.client_cancel")?,
+    })
+}
+
+pub fn decode_resource_health_with_fields(
+    row: &[u8],
+    fields: &[MirroredField],
+    cols: ResourceHealthCols,
+    schema: &MirroredSchema,
+) -> Result<ResourceHealthRow> {
+    let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
+    Ok(ResourceHealthRow {
+        entity_id: cell_u64(&cells[cols.entity_id], "resource_health.entity_id")?,
+        health: cell_i32(&cells[cols.health], "resource_health.health")?,
+    })
+}
+
+pub fn decode_resource_desc_with_fields(
+    row: &[u8],
+    fields: &[MirroredField],
+    cols: ResourceDescCols,
+    schema: &MirroredSchema,
+) -> Result<ResourceDescRow> {
+    let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
+    Ok(ResourceDescRow {
+        id: cell_i32(&cells[cols.id], "resource_desc.id")?,
+        name: cell_string(&cells[cols.name], "resource_desc.name")?,
+        max_health: cell_i32(&cells[cols.max_health], "resource_desc.max_health")?,
+        despawn_time: cell_f32(&cells[cols.despawn_time], "resource_desc.despawn_time")?,
+        on_destroy_yield_resource_id: cell_i32(
+            &cells[cols.on_destroy_yield_resource_id],
+            "resource_desc.on_destroy_yield_resource_id",
+        )?,
+        scheduled_respawn_time: cell_f32(
+            &cells[cols.scheduled_respawn_time],
+            "resource_desc.scheduled_respawn_time",
+        )?,
+    })
+}
+
+pub fn decode_extraction_recipe_with_fields(
+    row: &[u8],
+    fields: &[MirroredField],
+    cols: ExtractionRecipeCols,
+    schema: &MirroredSchema,
+) -> Result<ExtractionRecipeRow> {
+    let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
+    Ok(ExtractionRecipeRow {
+        id: cell_i32(&cells[cols.id], "extraction_recipe.id")?,
+        resource_id: cell_i32(&cells[cols.resource_id], "extraction_recipe.resource_id")?,
+    })
+}
+
+pub fn decode_character_stat_desc_with_fields(
+    row: &[u8],
+    fields: &[MirroredField],
+    cols: CharacterStatDescCols,
+    schema: &MirroredSchema,
+) -> Result<CharacterStatDescRow> {
+    let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
+    Ok(CharacterStatDescRow {
+        stat_type: cell_i32(&cells[cols.stat_type], "character_stat_desc.stat_type")?,
+        name: cell_string(&cells[cols.name], "character_stat_desc.name")?,
+    })
+}
+
+pub fn decode_character_stats_with_fields(
+    row: &[u8],
+    fields: &[MirroredField],
+    cols: CharacterStatsCols,
+    schema: &MirroredSchema,
+) -> Result<CharacterStatsRow> {
+    let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
+    Ok(CharacterStatsRow {
+        entity_id: cell_u64(&cells[cols.entity_id], "character_stats.entity_id")?,
+        values: decode_f32_array(Some(cell_json(&cells[cols.values])?), "character_stats.values")?,
+    })
+}
+
+// --- Bit-Me resolve chain row decoders (global module) ----------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BitmeLowercaseUsernameRow {
+    pub entity_id: u64,
+    pub username_lowercase: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BitmeUserRow {
+    pub entity_id: u64,
+    /// Raw little-endian identity bytes (canonical hex via [`identity_hex`]).
+    pub identity: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BitmeUserRegionRow {
+    pub identity: [u8; 32],
+    pub region_id: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BitmeRegionConnectionRow {
+    pub id: u8,
+    pub host: String,
+    pub module: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BitmeWorldRegionNameRow {
+    pub id: u16,
+    pub player_facing_name: String,
+}
+
+pub fn decode_bitme_lowercase_username(
+    row: &[u8],
+    fields: &[MirroredField],
+    cols: (usize, usize),
+    schema: &MirroredSchema,
+) -> Result<BitmeLowercaseUsernameRow> {
+    let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
+    Ok(BitmeLowercaseUsernameRow {
+        entity_id: cell_u64(&cells[cols.0], "player_lowercase_username.entity_id")?,
+        username_lowercase: cell_string(&cells[cols.1], "player_lowercase_username.username_lowercase")?,
+    })
+}
+
+pub fn decode_bitme_user(
+    row: &[u8],
+    fields: &[MirroredField],
+    cols: (usize, usize),
+    schema: &MirroredSchema,
+) -> Result<BitmeUserRow> {
+    let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
+    Ok(BitmeUserRow {
+        entity_id: cell_u64(&cells[cols.0], "user_state.entity_id")?,
+        identity: cell_identity(&cells[cols.1], "user_state.identity")?,
+    })
+}
+
+pub fn decode_bitme_user_region(
+    row: &[u8],
+    fields: &[MirroredField],
+    cols: (usize, usize),
+    schema: &MirroredSchema,
+) -> Result<BitmeUserRegionRow> {
+    let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
+    Ok(BitmeUserRegionRow {
+        identity: cell_identity(&cells[cols.0], "user_region_state.identity")?,
+        region_id: cell_u8(&cells[cols.1], "user_region_state.region_id")?,
+    })
+}
+
+pub fn decode_bitme_region_connection(
+    row: &[u8],
+    fields: &[MirroredField],
+    cols: (usize, usize, usize),
+    schema: &MirroredSchema,
+) -> Result<BitmeRegionConnectionRow> {
+    let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
+    Ok(BitmeRegionConnectionRow {
+        id: cell_u8(&cells[cols.0], "region_connection_info.id")?,
+        host: cell_string(&cells[cols.1], "region_connection_info.host")?,
+        module: cell_string(&cells[cols.2], "region_connection_info.module")?,
+    })
+}
+
+/// `signed_in_player_state` PK (entity_id) — presence means signed in.
+pub fn decode_bitme_signed_in_player(
+    row: &[u8],
+    fields: &[MirroredField],
+    col: usize,
+    schema: &MirroredSchema,
+) -> Result<u64> {
+    let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
+    cell_u64(&cells[col], "signed_in_player.entity_id")
+}
+
+pub fn decode_bitme_world_region_name(
+    row: &[u8],
+    fields: &[MirroredField],
+    cols: (usize, usize),
+    schema: &MirroredSchema,
+) -> Result<BitmeWorldRegionNameRow> {
+    let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
+    let id = cell_u16(&cells[cols.0], "world_region_name_state.id")?;
+    Ok(BitmeWorldRegionNameRow {
+        id,
+        player_facing_name: cell_string(&cells[cols.1], "world_region_name_state.player_facing_name")?,
+    })
+}
+
+/// Identity cells are the `__identity__` U256 wrapper — relay-protocol
+/// unwraps it to a 32-byte `Cell::Bytea`.
+fn cell_identity(cell: &Cell, ctx: &str) -> Result<[u8; 32]> {
+    let bytes = match cell {
+        Cell::Bytea(Some(b)) => b,
+        _ => bail!("{ctx}: expected Bytea, got {cell:?}"),
+    };
+    if bytes.len() != 32 {
+        bail!("{ctx}: expected 32-byte identity, got {} bytes", bytes.len());
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(bytes);
+    Ok(arr)
+}
+
+/// U16 is mapped to `Cell::Integer` by relay-protocol.
+fn cell_u16(cell: &Cell, ctx: &str) -> Result<u16> {
+    match cell {
+        Cell::Integer(Some(n)) => u16::try_from(*n).map_err(|_| anyhow!("{ctx}: Integer {n} out of u16 range")),
+        _ => bail!("{ctx}: expected Integer, got {cell:?}"),
+    }
 }
 
 pub fn decode_deployable_with_fields(
@@ -2007,6 +2697,81 @@ fn cell_bool(cell: &Cell, ctx: &str) -> Result<bool> {
     }
 }
 
+/// `Option<U64>` — relay-protocol unwraps options to a nullable cell
+/// (`Cell::Bytea(Some(8 LE bytes))` / `Bytea(None)`); the wrapped
+/// `{"some": …}` sum form is tolerated for tests / older dumps.
+fn cell_opt_u64_sum(cell: &Cell, ctx: &str) -> Result<Option<u64>> {
+    match cell {
+        Cell::Bytea(None) | Cell::Jsonb(Value::Null) => Ok(None),
+        Cell::Bytea(Some(b)) => {
+            if b.len() != 8 {
+                bail!("{ctx}: expected 8-byte Bytea, got {} bytes", b.len());
+            }
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(b);
+            Ok(Some(u64::from_le_bytes(arr)))
+        }
+        Cell::Jsonb(Value::Object(obj)) => {
+            if let Some(v) = obj.get("some") {
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| anyhow!("{ctx}.some: expected hex string, got {v}"))?;
+                let bytes = hex::decode(s).map_err(|e| anyhow!("{ctx}.some: hex decode: {e}"))?;
+                if bytes.len() != 8 {
+                    bail!("{ctx}.some: expected 8 bytes, got {}", bytes.len());
+                }
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(&bytes);
+                return Ok(Some(u64::from_le_bytes(arr)));
+            }
+            if obj.contains_key("none") {
+                return Ok(None);
+            }
+            bail!("{ctx}: unknown option shape {obj:?}")
+        }
+        other => bail!("{ctx}: expected optional u64, got {other:?}"),
+    }
+}
+
+/// `Option<I32>` — nullable cell (`Cell::Integer(Some/None)`), with the
+/// wrapped `{"some": n}` form tolerated.
+fn cell_opt_i32_sum(cell: &Cell, ctx: &str) -> Result<Option<i32>> {
+    match cell {
+        Cell::Integer(None) | Cell::Jsonb(Value::Null) => Ok(None),
+        Cell::Integer(Some(n)) => Ok(Some(*n)),
+        Cell::Jsonb(Value::Object(obj)) => {
+            if let Some(v) = obj.get("some") {
+                let n = v.as_i64().ok_or_else(|| anyhow!("{ctx}.some: expected i64, got {v}"))?;
+                return Ok(Some(i32::try_from(n).map_err(|_| anyhow!("{ctx}.some: i32 overflow"))?));
+            }
+            if obj.contains_key("none") {
+                return Ok(None);
+            }
+            bail!("{ctx}: unknown option shape {obj:?}")
+        }
+        other => bail!("{ctx}: expected optional i32, got {other:?}"),
+    }
+}
+
+/// Sum unit variants decode as `{"VariantName":{}}`; keep the upstream
+/// PascalCase spelling (client gamedata keys on it).
+fn sum_variant_pascal(cell: &Cell, ctx: &str) -> Result<String> {
+    let json = cell_json(cell)?;
+    let Value::Object(obj) = json else {
+        bail!("{ctx}: expected object, got {json}");
+    };
+    let key = obj.keys().next().ok_or_else(|| anyhow!("{ctx}: empty sum object"))?;
+    Ok(key.clone())
+}
+
+/// Identity (U256) raw little-endian bytes → canonical hex, matching how
+/// SpacetimeDB prints identities elsewhere (`hex(c2007a…)`).
+pub fn identity_hex(le_bytes: [u8; 32]) -> String {
+    let mut be = le_bytes;
+    be.reverse();
+    hex::encode(be)
+}
+
 // ---------------------------------------------------------------------------
 // Fixed-offset fast readers
 //
@@ -2116,6 +2881,32 @@ impl ResourceFast {
             entity_id: read_u64(row, self.entity_id)?,
             resource_id: read_i32(row, self.resource_id)?,
             direction_index: read_i32(row, self.direction_index)?,
+        })
+    }
+}
+
+/// Fixed-offset reader for `extraction_recipe_desc` identity fields —
+/// `id` and `resource_id` are the row's two leading I32s, so both offsets
+/// are fixed. Yields/requirements after them are never decoded.
+#[derive(Debug, Clone, Copy)]
+pub struct ExtractionRecipeFast {
+    id: usize,
+    resource_id: usize,
+}
+
+impl ExtractionRecipeFast {
+    pub fn try_from_fields(fields: &[MirroredField], schema: &MirroredSchema) -> Option<Self> {
+        Some(Self {
+            id: fixed_field_offset(fields, schema, "id")?,
+            resource_id: fixed_field_offset(fields, schema, "resource_id")?,
+        })
+    }
+
+    #[inline]
+    pub fn decode(&self, row: &[u8]) -> Option<ExtractionRecipeRow> {
+        Some(ExtractionRecipeRow {
+            id: read_i32(row, self.id)?,
+            resource_id: read_i32(row, self.resource_id)?,
         })
     }
 }

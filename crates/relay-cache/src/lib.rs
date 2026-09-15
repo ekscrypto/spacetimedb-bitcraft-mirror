@@ -21,6 +21,8 @@
 //! WebSocket-mode-only ingest trio [`discovery`] / [`shard`] / [`wire`].
 //! [`xp`] holds the vendored XP-threshold table.
 
+pub mod bitme;
+pub mod bitme_serve;
 pub mod config;
 pub mod decode;
 pub mod discovery;

@@ -5,9 +5,12 @@
 //! response DTOs, and release; the shard's WS task holds the write lock
 //! briefly to apply each `TransactionUpdate`.
 
+pub mod active_buff;
 pub mod building;
 pub mod building_desc;
 pub mod building_nickname;
+pub mod character_stat_desc;
+pub mod character_stats;
 pub mod claim;
 pub mod claim_local;
 pub mod claim_member;
@@ -17,12 +20,14 @@ pub mod crafting_recipe_desc;
 pub mod deployable;
 pub mod dimension_network;
 pub mod experience;
+pub mod extraction_recipe;
 pub mod growth;
 pub mod hexite;
 pub mod inventory;
 pub mod location_dim;
 pub mod mobile_entity;
 pub mod passive_craft;
+pub mod player_action;
 pub mod player_housing;
 pub mod player_state;
 pub mod player_username;
@@ -30,13 +35,18 @@ pub mod progressive_action;
 pub mod public_progressive_action;
 pub mod rent;
 pub mod resource;
+pub mod resource_desc;
 pub mod resource_growth_timer;
 pub mod skill_desc;
+pub mod stamina;
 pub mod storage_log;
 
+pub use active_buff::ActiveBuffSoA;
 pub use building::BuildingSoA;
 pub use building_desc::BuildingDescStore;
 pub use building_nickname::BuildingNicknameStore;
+pub use character_stat_desc::CharacterStatDescStore;
+pub use character_stats::CharacterStatsSoA;
 pub use claim::ClaimSoA;
 pub use claim_local::ClaimLocalSoA;
 pub use claim_member::ClaimMemberSoA;
@@ -46,12 +56,14 @@ pub use crafting_recipe_desc::CraftingRecipeDescStore;
 pub use deployable::{DeployableDescStore, DeployableSoA};
 pub use dimension_network::DimensionNetworkStore;
 pub use experience::ExperienceSoA;
+pub use extraction_recipe::ExtractionRecipeStore;
 pub use growth::GrowthStore;
 pub use hexite::HexiteIndex;
 pub use inventory::{InventorySoA, Pocket};
 pub use location_dim::LocationDimStore;
 pub use mobile_entity::MobileEntitySoA;
 pub use passive_craft::PassiveCraftSoA;
+pub use player_action::PlayerActionSoA;
 pub use player_housing::{PlayerHousingDescStore, PlayerHousingSoA};
 pub use player_state::PlayerStateSoA;
 pub use player_username::PlayerUsernameSoA;
@@ -59,8 +71,10 @@ pub use progressive_action::ProgressiveActionSoA;
 pub use public_progressive_action::PublicProgressiveActionStore;
 pub use rent::RentSoA;
 pub use resource::ResourceSoA;
+pub use resource_desc::ResourceDescStore;
 pub use resource_growth_timer::ResourceGrowthTimerStore;
 pub use skill_desc::SkillDescStore;
+pub use stamina::StaminaSoA;
 pub use storage_log::StorageLogSoA;
 
 /// One region's worth of in-memory state. The `ready` flag is `false`
@@ -100,6 +114,15 @@ pub struct RegionStore {
     pub growth: GrowthStore,
     pub growth_timer: ResourceGrowthTimerStore,
     pub storage_log: StorageLogSoA,
+    /// Bit-Me session feed stores (one-row-per-entity tables; bounded and
+    /// small — see `crates/relay-cache/USED-TABLES.md`).
+    pub stamina: StaminaSoA,
+    pub active_buff: ActiveBuffSoA,
+    pub player_action: PlayerActionSoA,
+    pub character_stats: CharacterStatsSoA,
+    pub character_stat_desc: CharacterStatDescStore,
+    pub resource_desc: ResourceDescStore,
+    pub extraction_recipe: ExtractionRecipeStore,
     /// Hexite-deposit claim world coords (see `hexite.rs`) — lets
     /// `location_state` rows that stream before `resource_state` (table
     /// -alphabetical seed order in the embedded feed) attach to their
@@ -142,6 +165,13 @@ impl RegionStore {
             growth: GrowthStore::new(),
             growth_timer: ResourceGrowthTimerStore::new(),
             storage_log: StorageLogSoA::with_capacity(0),
+            stamina: StaminaSoA::with_capacity(0),
+            active_buff: ActiveBuffSoA::with_capacity(0),
+            player_action: PlayerActionSoA::with_capacity(0),
+            character_stats: CharacterStatsSoA::with_capacity(0),
+            character_stat_desc: CharacterStatDescStore::new(),
+            resource_desc: ResourceDescStore::new(),
+            extraction_recipe: ExtractionRecipeStore::new(),
             hexite: HexiteIndex::default(),
         }
     }

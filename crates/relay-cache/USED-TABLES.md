@@ -1,7 +1,8 @@
 # relay-cache: synchronized tables and endpoint usage
 
-`relay-cache` subscribes to **30 distinct upstream SpacetimeDB tables** per
-region and exposes them through **19 GET HTTP endpoints** plus
+`relay-cache` subscribes to **36 distinct upstream SpacetimeDB tables** per
+region (plus 6 global-module tables for the Bit-Me resolve chain) and exposes
+them through **21 GET HTTP endpoints** plus
 `POST /roads/region/:id/resources`. Every table is
 read by at least one endpoint except two that are subscribed-but-unused
 (`rent_state`, `player_housing_desc`).
@@ -40,7 +41,15 @@ Canonical sources: table-name constants in `decode.rs`, subscribe SQL in
 |---|---|---|---|
 | `player_username_state` | `store/player_username.rs` | Player → username map | `/claim`, `/claim/:id`, `/claim/:id/crafts`, `/player`, `/player/:id`, `/player/:id/inventory`, `/player/:id/housing`, `/player/:id/skills`, `/player/:id/crafts` |
 | `player_state` | `store/player_state.rs` | Login/session timestamps | `/claim/:id/members` (+aliases), `/player`, `/player/:id`, … |
-| `mobile_entity_state` | `store/mobile_entity.rs` | Last-move timestamp (public proxy for private `player_timestamp_state`) | same as `player_state` |
+| `mobile_entity_state` | `store/mobile_entity.rs` | Last-move timestamp + live world position (milli-units; public proxy for private `player_timestamp_state`) | same as `player_state`, `/bitme/session/:id` |
+| `stamina_state` | `store/stamina.rs` | Current stamina (F32) + last-decrease clock | `/bitme/session/:id` |
+| `active_buff_state` | `store/active_buff.rs` | Per-entity buff lists (zeroed placeholders filtered at read) | `/bitme/session/:id` |
+| `player_action_state` | `store/player_action.rs` | Action lifecycle per layer (start/duration/target/result); rows persist after completion | `/bitme/session/:id` |
+| `character_stats_state` | `store/character_stats.rs` | Stat values array (index 0 = max health, 1 = max stamina) | `/bitme/session/:id` |
+| `character_stat_desc` | `store/character_stat_desc.rs` | Stat catalog; resolves the max-health/max-stamina indices by name | `/bitme/session/:id` |
+| `extraction_recipe_desc` | `store/extraction_recipe.rs` | Extraction catalog (`recipe_id → resource_id`); runtime-authoritative identity for forageable targets | `/bitme/session/:id` |
+| `resource_desc` | `store/resource_desc.rs` + `roads/decode.rs` (footprint offsets) | Static resource gamedata (name, max health, despawn/respawn, destroy-yield chain); footprint feeds the resource tile map | `/bitme/session/:id`, spawn watch-set, resource tile map |
+| `resource_health_state` | *(tracker-scoped, `src/bitme.rs`)* | Per-resource current health — hundreds of thousands of rows per region, so NOT stored wholesale; retained only for Bit-Me tracked action targets | `/bitme/session/:id` |
 | `experience_state` | `store/experience.rs` | Player → skill XP stacks | `/claim/:id/members` (+aliases), `/player/:id/skills` |
 
 ### Player Housing / Rent
@@ -72,14 +81,14 @@ Canonical sources: table-name constants in `decode.rs`, subscribe SQL in
 
 | Upstream table | Store module | Description | Endpoints |
 |---|---|---|---|
-| `location_state` | `store/location_dim.rs` + `roads/apply.rs` | Entity → dimension (filtered subscribe + hexite PK phase). Embedded roads path also joins overworld x/z onto harvestables. | `/claim/:id/inventory`, `/player/:id/housing`, `POST /roads/region/:id/resources` |
+| `location_state` | `store/location_dim.rs` + `roads/apply.rs` | Entity → dimension (filtered subscribe + hexite PK phase). Embedded roads path also joins overworld x/z onto the resource tile map. | `/claim/:id/inventory`, `/player/:id/housing`, `POST /roads/region/:id/resources`, `/bitme/session/:id/resources` |
 | `dimension_network_state` | `store/dimension_network.rs` | Dimension-network entrances | `/claim/:id/inventory`, `/player/:id/housing` |
 
 ### Resources / Growth / Forensics
 
 | Upstream table | Store module | Description | Endpoints |
 |---|---|---|---|
-| `resource_state` | `store/resource.rs` (hexite) + `roads/harvestable.rs` (allowlisted) | Hexite deposits for `/deposits`; forestry/mining/clay/sand nodes for roads point lookup. Harvestable hex index expands `resource_desc.footprint` × `direction_index` onto every occupied odd-r tile. | `/deposits`, `POST /roads/region/:id/resources` |
+| `resource_state` | `store/resource.rs` (hexite) + `roads/resource_map.rs` (all types) | Hexite deposits for `/deposits`; **every** resource entity stamped onto the dense per-region tile map (u16/tile: 10-bit dictionary index + 3-bit direction + origin flag), footprints from `resource_desc.footprint` × `direction_index`. | `/deposits`, `POST /roads/region/:id/resources`, `/bitme/session/:id/resources` |
 | `resource_growth_timer` | `store/resource_growth_timer.rs` | Respawn clock (`scheduled_at`) | `/deposits` |
 | `growth_state` | `store/growth.rs` | Legacy respawn snapshot (fallback) | `/deposits` |
 | `storage_log_state` | `store/storage_log.rs` | Deposit/withdraw history (~15–16 day retention) | `/storage-logs` |
@@ -105,7 +114,11 @@ Endpoints with **no** synchronized tables: `/cache-health`, `/proto`,
 | `/player/:id/crafts` | + progressive_action_*, passive_craft_state, crafting_recipe_desc, building_* |
 | `/deposits` | claim_state, claim_local_state, resource_state, resource_growth_timer, growth_state |
 | `/storage-logs` | storage_log_state, building_*, claim_state |
-| `POST /roads/region/:id/resources` | resource_state (allowlisted tags, including `direction_index`) ⋈ location_state (dim 1), expanded across vendored `resource_desc` footprints via `roads/harvestable.rs` |
+| `POST /roads/region/:id/resources` | resource_map (`roads/resource_map.rs`: **all** `resource_state` types ⋈ location_state dim 1, footprints from `resource_desc.footprint` × `direction_index`); raw resource ids, client-side harvestable filtering |
+| `/bitme/resolve?name=` | global: player_lowercase_username_state ⋈ user_state ⋈ user_region_state ⋈ region_connection_info (+ world_region_name_state, signed_in_player_state); region shards for display username / sign-in fallback |
+| `/bitme/session/:id` | mobile_entity_state (position), claim overlay via roads grid, stamina_state, character_stats_state ⋈ character_stat_desc, active_buff_state, player_action_state, resource_health_state (tracker-scoped), resource_desc + extraction_recipe_desc (gamedata), live resource_state spawn log (`bitme.rs`) |
+| `/bitme/session/:id/resources` | mobile_entity_state (player anchor tile) + resource tile map (`roads/resource_map.rs`: all resource_state ⋈ location_state); packed u16/tile binary window |
+| `/bitme/region/:id/resource-dictionary` | resource tile map dictionary (resource_id ↔ 10-bit index) ⋈ resource_desc (names, timers); `harvestable` flag from vendored `harvestable_resource_ids.json` |
 
 ---
 
@@ -118,3 +131,19 @@ Endpoints with **no** synchronized tables: `/cache-health`, `/proto`,
 - **`/claim/:id/citizens` and `/hexcoins`** are deprecated aliases of `/members`.
 - **Live WebSocket:** `/internal/dim-buildings/ws` only; inventory/housing/crafts
   are HTTP/protobuf.
+- **Bit-Me (`/bitme/*`):** poll-only JSON; a GET on `/bitme/session/:id` registers
+  the session (15 min TTL). Watched spawns = destroy-yield chain targets plus the
+  vendored citric bush ids (`data/bitme_watched_resource_ids.json`).
+- **Resource tile map (`roads/resource_map.rs`):** dense u16-per-tile map of the
+  whole 7680×7680 region (112.5 MiB/region, included in `memory_bytes()`),
+  fed by all `resource_state` + overworld `location_state` rows and
+  `resource_desc.footprint`. One resource per tile: multi-hex shapes
+  overwrite their tiles; a single-hex newcomer onto an occupied tile (the
+  world does spawn forageables under multi-hex resources) is not stamped;
+  clears only zero words the entity actually wrote. Tile word: bits 0–9
+  dictionary index, bit 10 origin flag, bits 11–13 `direction_index`,
+  bits 14–15 reserved. Backs both `POST /roads/region/:id/resources` (all
+  types now — harvestable filtering is client-side via the dictionary's
+  `harvestable` flag from `data/harvestable_resource_ids.json`) and
+  `GET /bitme/session/:id/resources` (400×400 packed window). The former
+  `roads/harvestable.rs` 215-id allowlist index is retired.

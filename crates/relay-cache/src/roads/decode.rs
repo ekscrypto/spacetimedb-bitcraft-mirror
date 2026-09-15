@@ -12,6 +12,7 @@ pub const PAVED_TILE_TABLE: &str = "paved_tile_state";
 pub const CLAIM_TILE_TABLE: &str = "claim_tile_state";
 pub const CLAIM_STATE_TABLE: &str = "claim_state";
 pub const LOCATION_TABLE: &str = "location_state";
+pub const RESOURCE_DESC_TABLE: &str = "resource_desc";
 pub const PAVING_TILE_DESC_TABLE: &str = "paving_tile_desc";
 pub const TERRAFORM_RECIPE_DESC_TABLE: &str = "terraform_recipe_desc";
 pub const WORLD_REGION_STATE_TABLE: &str = "world_region_state";
@@ -83,6 +84,12 @@ pub struct WorldRegionCols {
     pub region_width_chunks: usize,
     pub region_height_chunks: usize,
     pub region_count_sqrt: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct ResourceDescFootprintCols {
+    pub id: usize,
+    pub footprint: usize,
 }
 
 pub struct RoadsColMaps {
@@ -215,6 +222,14 @@ pub fn resolve_world_region_cols(schema: &MirroredSchema) -> Result<WorldRegionC
     })
 }
 
+pub fn resolve_resource_desc_footprint_cols(schema: &MirroredSchema) -> Result<ResourceDescFootprintCols> {
+    let f = fields_of(schema, RESOURCE_DESC_TABLE)?;
+    Ok(ResourceDescFootprintCols {
+        id: find_field(f, "id", RESOURCE_DESC_TABLE)?,
+        footprint: find_field(f, "footprint", RESOURCE_DESC_TABLE)?,
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct TerrainChunkRow {
     pub chunk_x: i32,
@@ -281,6 +296,15 @@ pub struct WorldRegionRow {
     pub region_width_chunks: u16,
     pub region_height_chunks: u16,
     pub region_count_sqrt: u8,
+}
+
+/// `resource_desc` projection for the resource tile map: id + axial
+/// footprint offsets. `footprint_type` per element is ignored — every
+/// offset occupies its tile regardless of hitbox/walkable classification.
+#[derive(Debug, Clone)]
+pub struct ResourceDescFootprintRow {
+    pub id: i32,
+    pub tiles: Vec<(i32, i32)>,
 }
 
 pub fn decode_terrain_chunk(
@@ -413,6 +437,45 @@ pub fn decode_world_region(
         region_height_chunks: cell_u16(&cells[cols.region_height_chunks], "region_height_chunks")?,
         region_count_sqrt: cell_u8(&cells[cols.region_count_sqrt], "region_count_sqrt")?,
     })
+}
+
+pub fn decode_resource_desc_footprint(
+    row: &[u8],
+    fields: &[MirroredField],
+    cols: ResourceDescFootprintCols,
+    schema: &MirroredSchema,
+) -> Result<ResourceDescFootprintRow> {
+    let cells = bsatn::decode_row(row, fields, schema).map_err(|e| anyhow!("bsatn: {e}"))?;
+    Ok(ResourceDescFootprintRow {
+        id: cell_i32(&cells[cols.id], "resource_desc.id")?,
+        tiles: decode_footprint_offsets(&cells[cols.footprint], "footprint"),
+    })
+}
+
+/// `Array<{x: i32, z: i32, footprint_type}>` arrives as a JSON array of
+/// objects; elements missing usable x/z coordinates are skipped rather than
+/// failing the whole desc row.
+fn decode_footprint_offsets(cell: &Cell, ctx: &str) -> Vec<(i32, i32)> {
+    let Ok(json) = cell_json(cell) else {
+        return Vec::new();
+    };
+    let Value::Array(arr) = json else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for element in arr {
+        let Value::Object(obj) = element else {
+            continue;
+        };
+        let (Ok(x), Ok(z)) = (
+            json_i32(obj.get("x"), &format!("{ctx}.x")),
+            json_i32(obj.get("z"), &format!("{ctx}.z")),
+        ) else {
+            continue;
+        };
+        out.push((x, z));
+    }
+    out
 }
 
 fn cell_json(cell: &Cell) -> Result<&Value> {

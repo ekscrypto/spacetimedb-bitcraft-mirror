@@ -16,13 +16,16 @@ use spacetimedb_client_api_messages::websocket::v2::{
 use url::Url;
 
 use crate::decode::{
-    self, ColMaps, BUILDING_DESC_TABLE, BUILDING_NICKNAME_TABLE, BUILDING_TABLE, CLAIM_LOCAL_TABLE, CLAIM_MEMBER_TABLE,
-    CLAIM_TABLE, CLAIM_TECH_DESC_TABLE, CLAIM_TECH_STATE_TABLE, CLAIM_TILE_COST_TABLE, CRAFTING_RECIPE_DESC_TABLE,
+    self, ColMaps, ACTIVE_BUFF_TABLE, BUILDING_DESC_TABLE, BUILDING_NICKNAME_TABLE, BUILDING_TABLE,
+    CHARACTER_STATS_TABLE, CHARACTER_STAT_DESC_TABLE, CLAIM_LOCAL_TABLE, CLAIM_MEMBER_TABLE, CLAIM_TABLE,
+    CLAIM_TECH_DESC_TABLE, CLAIM_TECH_STATE_TABLE, CLAIM_TILE_COST_TABLE, CRAFTING_RECIPE_DESC_TABLE,
     DEPLETED_HEXITE_DEPOSIT_RESOURCE_ID, DEPLOYABLE_DESC_TABLE, DEPLOYABLE_TABLE, DIMENSION_NETWORK_TABLE,
-    EXPERIENCE_TABLE, GROWTH_TABLE, HEXITE_DEPOSIT_RESOURCE_ID, INVENTORY_TABLE, LOCATION_TABLE, MOBILE_ENTITY_TABLE,
-    OVERWORLD_DIMENSION, PASSIVE_CRAFT_TABLE, PLAYER_HOUSING_DESC_TABLE, PLAYER_HOUSING_TABLE, PLAYER_STATE_TABLE,
-    PLAYER_USERNAME_TABLE, PROGRESSIVE_ACTION_TABLE, PUBLIC_PROGRESSIVE_ACTION_TABLE, RENT_TABLE,
-    RESOURCE_GROWTH_TIMER_TABLE, RESOURCE_TABLE, SKILL_DESC_TABLE, STORAGE_LOG_TABLE,
+    EXPERIENCE_TABLE, EXTRACTION_RECIPE_TABLE, GROWTH_TABLE, HEXITE_DEPOSIT_RESOURCE_ID, INVENTORY_TABLE,
+    LOCATION_TABLE, MOBILE_ENTITY_TABLE, OVERWORLD_DIMENSION, PASSIVE_CRAFT_TABLE, PLAYER_ACTION_TABLE,
+    PLAYER_HOUSING_DESC_TABLE, PLAYER_HOUSING_TABLE, PLAYER_STATE_TABLE, PLAYER_USERNAME_TABLE,
+    PROGRESSIVE_ACTION_TABLE, PUBLIC_PROGRESSIVE_ACTION_TABLE, RENT_TABLE, RESOURCE_DESC_TABLE,
+    RESOURCE_GROWTH_TIMER_TABLE, RESOURCE_HEALTH_TABLE, RESOURCE_TABLE, SKILL_DESC_TABLE, STAMINA_TABLE,
+    STORAGE_LOG_TABLE,
 };
 use crate::discovery::RegionBackend;
 use crate::interest::{InterestHub, TouchBatch};
@@ -82,6 +85,14 @@ pub(crate) struct TableMeta {
     growth_fields: Vec<MirroredField>,
     growth_timer_fields: Vec<MirroredField>,
     storage_log_fields: Vec<MirroredField>,
+    stamina_fields: Vec<MirroredField>,
+    active_buff_fields: Vec<MirroredField>,
+    player_action_fields: Vec<MirroredField>,
+    resource_desc_fields: Vec<MirroredField>,
+    extraction_recipe_fields: Vec<MirroredField>,
+    extraction_recipe_fast: Option<decode::ExtractionRecipeFast>,
+    character_stat_desc_fields: Vec<MirroredField>,
+    character_stats_fields: Vec<MirroredField>,
     /// Fixed-offset fast readers for the two all-primitive hot tables
     /// (`location_state` ~13M rows/seed, `resource_state`). `None` = layout
     /// not fixed-width; the generic [`crate::decode`] path is used instead.
@@ -128,6 +139,17 @@ impl TableMeta {
             growth_fields: fields_owned(schema, GROWTH_TABLE)?,
             growth_timer_fields: fields_owned(schema, RESOURCE_GROWTH_TIMER_TABLE)?,
             storage_log_fields: fields_owned(schema, STORAGE_LOG_TABLE)?,
+            stamina_fields: fields_owned(schema, STAMINA_TABLE)?,
+            active_buff_fields: fields_owned(schema, ACTIVE_BUFF_TABLE)?,
+            player_action_fields: fields_owned(schema, PLAYER_ACTION_TABLE)?,
+            resource_desc_fields: fields_owned(schema, RESOURCE_DESC_TABLE)?,
+            extraction_recipe_fields: fields_owned(schema, EXTRACTION_RECIPE_TABLE)?,
+            extraction_recipe_fast: decode::ExtractionRecipeFast::try_from_fields(
+                &fields_owned(schema, EXTRACTION_RECIPE_TABLE)?,
+                schema,
+            ),
+            character_stat_desc_fields: fields_owned(schema, CHARACTER_STAT_DESC_TABLE)?,
+            character_stats_fields: fields_owned(schema, CHARACTER_STATS_TABLE)?,
             location_fast,
             resource_fast,
         })
@@ -753,6 +775,17 @@ fn base_subscribe_queries() -> Vec<String> {
         // Append-only deposit/withdraw history; upstream cleanup_loop deletes
         // rows older than the retention window (~15–16 days).
         format!("SELECT * FROM {STORAGE_LOG_TABLE}"),
+        // Bit-Me session tables (one-row-per-entity, bounded — see
+        // USED-TABLES.md). `resource_health_state` is intentionally NOT
+        // subscribed here (per-resource rows are far too many at seed); the
+        // embedded feed hands tracker-scoped rows to `crate::bitme` instead.
+        format!("SELECT * FROM {STAMINA_TABLE}"),
+        format!("SELECT * FROM {ACTIVE_BUFF_TABLE}"),
+        format!("SELECT * FROM {PLAYER_ACTION_TABLE}"),
+        format!("SELECT * FROM {RESOURCE_DESC_TABLE}"),
+        format!("SELECT * FROM {EXTRACTION_RECIPE_TABLE}"),
+        format!("SELECT * FROM {CHARACTER_STAT_DESC_TABLE}"),
+        format!("SELECT * FROM {CHARACTER_STATS_TABLE}"),
     ]
 }
 
@@ -866,6 +899,24 @@ fn decode_location_row(meta: &TableMeta, row: &[u8], schema: &MirroredSchema) ->
         return Ok(decoded);
     }
     decode::decode_location_with_fields(row, &meta.location_fields, meta.cols.location, schema)
+}
+
+/// Decode one `extraction_recipe_desc` row's identity fields: fixed-offset
+/// fast path (id + resource_id are the leading I32s), generic otherwise.
+fn decode_extraction_recipe_row(
+    meta: &TableMeta,
+    schema: &MirroredSchema,
+    row: &[u8],
+) -> Result<decode::ExtractionRecipeRow> {
+    if let Some(decoded) = meta.extraction_recipe_fast.and_then(|fast| fast.decode(row)) {
+        return Ok(decoded);
+    }
+    decode::decode_extraction_recipe_with_fields(
+        row,
+        &meta.extraction_recipe_fields,
+        meta.cols.extraction_recipe,
+        schema,
+    )
 }
 
 /// Decode one `resource_state` row: fixed-offset fast path when the layout
@@ -1581,6 +1632,168 @@ pub(crate) fn apply_rows(
                     ),
                 }
             }
+        }
+        STAMINA_TABLE => {
+            for row in deletes {
+                match decode::decode_stamina_with_fields(row, &meta.stamina_fields, meta.cols.stamina, schema) {
+                    Ok(decoded) => store.stamina.delete(decoded.entity_id),
+                    Err(e) => tracing::debug!(target: "relay_cache::shard", error = %e, "skip stamina delete"),
+                }
+            }
+            for row in inserts {
+                match decode::decode_stamina_with_fields(row, &meta.stamina_fields, meta.cols.stamina, schema) {
+                    Ok(decoded) => store.stamina.upsert(decoded),
+                    Err(e) => tracing::debug!(target: "relay_cache::shard", error = %e, "skip stamina insert"),
+                }
+            }
+        }
+        ACTIVE_BUFF_TABLE => {
+            for row in deletes {
+                match decode::decode_active_buff_with_fields(
+                    row,
+                    &meta.active_buff_fields,
+                    meta.cols.active_buff,
+                    schema,
+                ) {
+                    Ok(decoded) => store.active_buff.delete(decoded.entity_id),
+                    Err(e) => tracing::debug!(target: "relay_cache::shard", error = %e, "skip active_buff delete"),
+                }
+            }
+            for row in inserts {
+                match decode::decode_active_buff_with_fields(
+                    row,
+                    &meta.active_buff_fields,
+                    meta.cols.active_buff,
+                    schema,
+                ) {
+                    Ok(decoded) => store.active_buff.upsert(decoded),
+                    Err(e) => tracing::debug!(target: "relay_cache::shard", error = %e, "skip active_buff insert"),
+                }
+            }
+        }
+        PLAYER_ACTION_TABLE => {
+            for row in deletes {
+                match decode::decode_player_action_with_fields(
+                    row,
+                    &meta.player_action_fields,
+                    meta.cols.player_action,
+                    schema,
+                ) {
+                    Ok(decoded) => store.player_action.delete(decoded.auto_id),
+                    Err(e) => tracing::debug!(target: "relay_cache::shard", error = %e, "skip player_action delete"),
+                }
+            }
+            for row in inserts {
+                match decode::decode_player_action_with_fields(
+                    row,
+                    &meta.player_action_fields,
+                    meta.cols.player_action,
+                    schema,
+                ) {
+                    Ok(decoded) => store.player_action.upsert(decoded),
+                    Err(e) => tracing::debug!(target: "relay_cache::shard", error = %e, "skip player_action insert"),
+                }
+            }
+        }
+        RESOURCE_DESC_TABLE => {
+            for row in deletes {
+                match decode::decode_resource_desc_with_fields(
+                    row,
+                    &meta.resource_desc_fields,
+                    meta.cols.resource_desc,
+                    schema,
+                ) {
+                    Ok(decoded) => store.resource_desc.delete(decoded.id),
+                    Err(e) => tracing::debug!(target: "relay_cache::shard", error = %e, "skip resource_desc delete"),
+                }
+            }
+            for row in inserts {
+                match decode::decode_resource_desc_with_fields(
+                    row,
+                    &meta.resource_desc_fields,
+                    meta.cols.resource_desc,
+                    schema,
+                ) {
+                    Ok(decoded) => store.resource_desc.upsert(decoded),
+                    Err(e) => tracing::debug!(target: "relay_cache::shard", error = %e, "skip resource_desc insert"),
+                }
+            }
+        }
+        EXTRACTION_RECIPE_TABLE => {
+            for row in deletes {
+                match decode_extraction_recipe_row(meta, schema, row) {
+                    Ok(decoded) => store.extraction_recipe.delete(decoded.id),
+                    Err(e) => {
+                        tracing::debug!(target: "relay_cache::shard", error = %e, "skip extraction_recipe delete")
+                    }
+                }
+            }
+            for row in inserts {
+                match decode_extraction_recipe_row(meta, schema, row) {
+                    Ok(decoded) => store.extraction_recipe.upsert(decoded),
+                    Err(e) => {
+                        tracing::debug!(target: "relay_cache::shard", error = %e, "skip extraction_recipe insert")
+                    }
+                }
+            }
+        }
+        CHARACTER_STAT_DESC_TABLE => {
+            for row in deletes {
+                match decode::decode_character_stat_desc_with_fields(
+                    row,
+                    &meta.character_stat_desc_fields,
+                    meta.cols.character_stat_desc,
+                    schema,
+                ) {
+                    Ok(decoded) => store.character_stat_desc.delete(decoded.stat_type),
+                    Err(e) => {
+                        tracing::debug!(target: "relay_cache::shard", error = %e, "skip character_stat_desc delete")
+                    }
+                }
+            }
+            for row in inserts {
+                match decode::decode_character_stat_desc_with_fields(
+                    row,
+                    &meta.character_stat_desc_fields,
+                    meta.cols.character_stat_desc,
+                    schema,
+                ) {
+                    Ok(decoded) => store.character_stat_desc.upsert(decoded),
+                    Err(e) => {
+                        tracing::debug!(target: "relay_cache::shard", error = %e, "skip character_stat_desc insert")
+                    }
+                }
+            }
+        }
+        CHARACTER_STATS_TABLE => {
+            for row in deletes {
+                match decode::decode_character_stats_with_fields(
+                    row,
+                    &meta.character_stats_fields,
+                    meta.cols.character_stats,
+                    schema,
+                ) {
+                    Ok(decoded) => store.character_stats.delete(decoded.entity_id),
+                    Err(e) => tracing::debug!(target: "relay_cache::shard", error = %e, "skip character_stats delete"),
+                }
+            }
+            for row in inserts {
+                match decode::decode_character_stats_with_fields(
+                    row,
+                    &meta.character_stats_fields,
+                    meta.cols.character_stats,
+                    schema,
+                ) {
+                    Ok(decoded) => store.character_stats.upsert(decoded),
+                    Err(e) => tracing::debug!(target: "relay_cache::shard", error = %e, "skip character_stats insert"),
+                }
+            }
+        }
+        RESOURCE_HEALTH_TABLE => {
+            // Deliberately not stored per-row (hundreds of thousands of
+            // resources per region). The Bit-Me tracker retains values only
+            // for tracked action targets — see `crate::bitme` observe hook
+            // in the feed layer.
         }
         other => {
             tracing::debug!(

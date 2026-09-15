@@ -264,6 +264,7 @@ nul
 # AI agent config
 .codex
 .claude
+.zcode
 
 # Any local file
 *.local

@@ -18,6 +18,7 @@ use spacetimedb_public_mirror_client::observer::{MirrorObserver, ObserverFuture}
 use spacetimedb_public_mirror_client::upstream::UpstreamUpdate;
 use tokio::sync::mpsc;
 
+use crate::bitme::{BitmeGlobalMeta, BitmeHub, BitmeRegionMeta};
 use crate::interest::{InterestHub, TouchBatch};
 use crate::roads::apply::{apply_roads_rows, finalize_terrain_seed};
 use crate::roads::catalog::{apply_global_delete, apply_global_insert, GlobalRoadsCatalog, RoadsFleet};
@@ -63,7 +64,9 @@ struct RegionFeed {
     schema: Arc<MirroredSchema>,
     meta: Arc<TableMeta>,
     roads_meta: Option<Arc<RoadsTableMeta>>,
+    bitme_meta: Option<Arc<BitmeRegionMeta>>,
     interest: Arc<InterestHub>,
+    bitme: Arc<BitmeHub>,
     handle: Arc<ShardHandle>,
     roads: Option<Arc<RoadsRegionHandle>>,
 }
@@ -72,13 +75,16 @@ struct GlobalFeed {
     database: Arc<str>,
     schema: Arc<MirroredSchema>,
     meta: Arc<RoadsTableMeta>,
-    catalog: Arc<RwLock<GlobalRoadsCatalog>>,
+    bitme_meta: Arc<BitmeGlobalMeta>,
+    catalog: Option<Arc<RwLock<GlobalRoadsCatalog>>>,
+    bitme: Arc<BitmeHub>,
 }
 
 /// Owns one [`RegionFeed`] worker per registered database and implements
 /// [`MirrorObserver`] for all of them.
 pub struct FeedManager {
     interest: Arc<InterestHub>,
+    bitme: Arc<BitmeHub>,
     feeds: Mutex<HashMap<Arc<str>, mpsc::Sender<FeedMsg>>>,
     global_tx: Mutex<Option<mpsc::Sender<GlobalFeedMsg>>>,
     shards: Mutex<Vec<Arc<ShardHandle>>>,
@@ -89,11 +95,17 @@ impl FeedManager {
     pub fn new(interest: Arc<InterestHub>) -> Arc<Self> {
         Arc::new(Self {
             interest,
+            bitme: BitmeHub::new(),
             feeds: Mutex::new(HashMap::new()),
             global_tx: Mutex::new(None),
             shards: Mutex::new(Vec::new()),
             roads_fleet: Mutex::new(None),
         })
+    }
+
+    /// Shared Bit-Me session/resolve hub (also held by the HTTP `Fleet`).
+    pub fn bitme(&self) -> Arc<BitmeHub> {
+        self.bitme.clone()
     }
 
     /// Enable dense roads grids (~289 MiB/region) and global recipe catalogs.
@@ -114,15 +126,7 @@ impl FeedManager {
 
     pub fn register_region(&self, database: &str, schema_json: &[u8]) -> Result<Option<Arc<ShardHandle>>> {
         if database == DATABASE_GLOBAL {
-            if self.roads_enabled() {
-                self.register_global(database, schema_json)?;
-            } else {
-                tracing::debug!(
-                    target: "relay_cache::feed",
-                    database,
-                    "global database carries no regional tables; no cache feed"
-                );
-            }
+            self.register_global(database, schema_json)?;
             return Ok(None);
         }
         let region: u32 = database
@@ -143,6 +147,18 @@ impl FeedManager {
             Some(Arc::new(RoadsTableMeta::from_schema_regional(&schema)?))
         } else {
             None
+        };
+        let bitme_meta = match BitmeRegionMeta::from_schema(&schema) {
+            Ok(m) => Some(Arc::new(m)),
+            Err(e) => {
+                tracing::warn!(
+                    target: "relay_cache::feed",
+                    database,
+                    error = %e,
+                    "Bit-Me region meta unavailable; session tracking disabled for this region"
+                );
+                None
+            }
         };
 
         let roads_handle = if self.roads_enabled() {
@@ -168,16 +184,20 @@ impl FeedManager {
             schema,
             meta,
             roads_meta,
+            bitme_meta,
             interest: self.interest.clone(),
+            bitme: self.bitme.clone(),
             handle: handle.clone(),
             roads: roads_handle,
         });
+        let bitme_enabled = feed.bitme_meta.is_some();
         tokio::spawn(run_worker(feed, rx));
         tracing::info!(
             target: "relay_cache::feed",
             database,
             region,
             roads = self.roads_enabled(),
+            bitme = bitme_enabled,
             "embedded feed registered"
         );
         Ok(Some(handle))
@@ -187,27 +207,29 @@ impl FeedManager {
         let schema =
             Arc::new(parse_schema(schema_json).with_context(|| format!("parse global schema for `{database}`"))?);
         let meta = Arc::new(RoadsTableMeta::from_schema_global(&schema)?);
-        let catalog = self
-            .roads_fleet
-            .lock()
-            .as_ref()
-            .map(|f| f.catalog.clone())
-            .ok_or_else(|| anyhow!("roads fleet missing during global register"))?;
+        let bitme_meta = Arc::new(BitmeGlobalMeta::from_schema_global(&schema));
+        // The roads catalog is optional; the Bit-Me resolve chain is not
+        // roads-dependent, so the global feed runs unconditionally.
+        let catalog = self.roads_fleet.lock().as_ref().map(|f| f.catalog.clone());
 
         let (tx, rx) = mpsc::channel::<GlobalFeedMsg>(FEED_CHANNEL_CAPACITY);
         *self.global_tx.lock() = Some(tx);
 
+        let roads_enabled = catalog.is_some();
         let feed = Arc::new(GlobalFeed {
             database: Arc::from(database),
             schema,
             meta,
+            bitme_meta,
             catalog,
+            bitme: self.bitme.clone(),
         });
         tokio::spawn(run_global_worker(feed, rx));
         tracing::info!(
             target: "relay_cache::feed",
             database,
-            "global roads catalog feed registered"
+            roads = roads_enabled,
+            "global catalog feed registered"
         );
         Ok(())
     }
@@ -330,6 +352,7 @@ async fn run_worker(feed: Arc<RegionFeed>, mut rx: mpsc::Receiver<FeedMsg>) {
                 generation = next;
                 phase = Phase::Seeding(Box::new(RegionStore::empty(region)));
                 *feed.handle.store.write() = RegionStore::empty(region);
+                feed.bitme.clear_region(region);
                 if let Some(rh) = &feed.roads {
                     roads_phase = Some(RoadsPhase::Seeding(Box::new(RoadsRegionGrid::new(region as u16))));
                     *rh.grid.write() = RoadsRegionGrid::new(region as u16);
@@ -365,6 +388,7 @@ async fn run_worker(feed: Arc<RegionFeed>, mut rx: mpsc::Receiver<FeedMsg>) {
                     if update.is_seed {
                         if !matches!(phase, Phase::Seeding(_)) {
                             phase = Phase::Seeding(Box::new(RegionStore::empty(region)));
+                            feed.bitme.clear_region(region);
                         }
                         let Phase::Seeding(staging) = &mut phase else {
                             unreachable!();
@@ -406,11 +430,17 @@ async fn run_global_worker(feed: Arc<GlobalFeed>, mut rx: mpsc::Receiver<GlobalF
                 if next >= generation {
                     generation = next;
                     seeding = true;
-                    *feed.catalog.write() = GlobalRoadsCatalog::new();
+                    if let Some(catalog) = &feed.catalog {
+                        *catalog.write() = GlobalRoadsCatalog::new();
+                    }
+                    feed.bitme.global().write().clear();
                 }
             }
             GlobalFeedMsg::Live { generation: gen } if gen == generation => {
-                feed.catalog.write().mark_ready();
+                if let Some(catalog) = &feed.catalog {
+                    catalog.write().mark_ready();
+                }
+                feed.bitme.global().write().mark_ready();
                 seeding = false;
             }
             GlobalFeedMsg::Updates {
@@ -418,34 +448,45 @@ async fn run_global_worker(feed: Arc<GlobalFeed>, mut rx: mpsc::Receiver<GlobalF
                 updates,
             } if gen == generation => {
                 for update in updates {
-                    let mut catalog = feed.catalog.write();
-                    for table in &update.tables {
-                        for row in &table.delete_bytes {
-                            if let Err(e) =
-                                apply_global_delete(&mut catalog, &feed.meta, &feed.schema, &table.table_name, row)
-                            {
-                                tracing::warn!(
-                                    target: "relay_cache::feed",
-                                    table = %table.table_name,
-                                    error = %e,
-                                    "global catalog delete failed"
-                                );
+                    if let Some(catalog) = &feed.catalog {
+                        let mut catalog = catalog.write();
+                        for table in &update.tables {
+                            for row in &table.delete_bytes {
+                                if let Err(e) =
+                                    apply_global_delete(&mut catalog, &feed.meta, &feed.schema, &table.table_name, row)
+                                {
+                                    tracing::warn!(
+                                        target: "relay_cache::feed",
+                                        table = %table.table_name,
+                                        error = %e,
+                                        "global catalog delete failed"
+                                    );
+                                }
                             }
-                        }
-                        for row in &table.inserts {
-                            if let Err(e) =
-                                apply_global_insert(&mut catalog, &feed.meta, &feed.schema, &table.table_name, row)
-                            {
-                                tracing::warn!(
-                                    target: "relay_cache::feed",
-                                    table = %table.table_name,
-                                    error = %e,
-                                    "global catalog insert failed"
-                                );
+                            for row in &table.inserts {
+                                if let Err(e) =
+                                    apply_global_insert(&mut catalog, &feed.meta, &feed.schema, &table.table_name, row)
+                                {
+                                    tracing::warn!(
+                                        target: "relay_cache::feed",
+                                        table = %table.table_name,
+                                        error = %e,
+                                        "global catalog insert failed"
+                                    );
+                                }
                             }
                         }
                     }
-                    drop(catalog);
+                    for table in &update.tables {
+                        for row in &table.delete_bytes {
+                            feed.bitme
+                                .apply_global(&feed.bitme_meta, &feed.schema, &table.table_name, None, Some(row));
+                        }
+                        for row in &table.inserts {
+                            feed.bitme
+                                .apply_global(&feed.bitme_meta, &feed.schema, &table.table_name, Some(row), None);
+                        }
+                    }
                     if seeding {
                         continue;
                     }
@@ -539,6 +580,13 @@ fn apply_live_update(feed: &RegionFeed, update: &UpstreamUpdate) {
     }
     if let Some(batch) = touches {
         batch.flush();
+    }
+    // Bit-Me session feed: tracker-scoped resource health + watched spawn
+    // log. Runs after the store write lock is released (it re-locks reads).
+    if let Some(bitme_meta) = &feed.bitme_meta {
+        let store = feed.handle.store.read();
+        feed.bitme
+            .observe_live(feed.region, update, bitme_meta, &feed.schema, &store);
     }
 }
 

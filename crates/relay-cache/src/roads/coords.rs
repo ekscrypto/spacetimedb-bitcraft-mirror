@@ -112,10 +112,7 @@ pub fn world_to_local(region: u16, x: i32, z: i32) -> Option<(i32, i32)> {
 
 /// Region-local small-hex coords → super-hex coords covering the tile.
 pub fn small_to_super(lx: i32, lz: i32) -> (i32, i32) {
-    (
-        lx.div_euclid(SMALL_PER_SUPER),
-        lz.div_euclid(SMALL_PER_SUPER),
-    )
+    (lx.div_euclid(SMALL_PER_SUPER), lz.div_euclid(SMALL_PER_SUPER))
 }
 
 #[cfg(test)]

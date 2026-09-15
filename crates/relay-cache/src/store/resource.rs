@@ -42,6 +42,11 @@ impl ResourceSoA {
         self.pk.len()
     }
 
+    /// Slot of one tracked (hexite) resource by entity id.
+    pub fn find(&self, entity_id: u64) -> Option<u32> {
+        self.pk.get(&entity_id).copied()
+    }
+
     /// Find a hexite resource whose `location_state` x/z match (world coords).
     pub fn find_by_location(&self, x: i32, z: i32) -> Option<u32> {
         for &slot in self.pk.values() {

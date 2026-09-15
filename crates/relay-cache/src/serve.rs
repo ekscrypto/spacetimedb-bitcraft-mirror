@@ -70,6 +70,8 @@ pub struct Fleet {
     pub interest: Arc<InterestHub>,
     /// Present when `--roads-cache` is enabled.
     pub roads: Option<Arc<crate::roads::RoadsFleet>>,
+    /// Bit-Me session tracker + global resolve chain (`/bitme/*` routes).
+    pub bitme: Arc<crate::bitme::BitmeHub>,
 }
 
 pub async fn serve(
@@ -104,6 +106,7 @@ pub async fn serve(
         .route("/deposits", get(hexite_deposits))
         .route("/storage-logs", get(storage_logs))
         .merge(crate::roads_serve::roads_routes())
+        .merge(crate::bitme_serve::bitme_routes())
         .layer(CorsLayer::permissive())
         .with_state(fleet);
 
@@ -132,22 +135,32 @@ fn accept_wants_protobuf(accept: &str) -> bool {
     })
 }
 
-fn no_store_json(body: Value) -> impl IntoResponse {
+pub(crate) fn no_store_json(body: Value) -> impl IntoResponse {
     let mut headers = HeaderMap::new();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     (headers, axum::Json(body))
 }
 
-fn no_store_status(status: StatusCode, body: Value) -> impl IntoResponse {
+pub(crate) fn no_store_status(status: StatusCode, body: Value) -> Response {
     let mut headers = HeaderMap::new();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    (status, headers, axum::Json(body))
+    (status, headers, axum::Json(body)).into_response()
 }
 
 fn no_store_protobuf(bytes: Vec<u8>) -> Response {
     let mut headers = HeaderMap::new();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(PROTOBUF_MIME));
+    (headers, bytes).into_response()
+}
+
+pub(crate) fn no_store_octets(bytes: Vec<u8>) -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
     (headers, bytes).into_response()
 }
 
@@ -504,12 +517,13 @@ async fn internal_stats(State(fleet): State<Fleet>) -> impl IntoResponse {
                     json!({
                         "region": h.region,
                         "ready": g.ready,
-                        "harvestable": g.harvestable.len(),
-                        "harvestable_located": g.harvestable.located_len(),
+                        "resources": g.resource_map.len(),
+                        "resources_located": g.resource_map.located_len(),
                     })
                 })
                 .collect::<Vec<_>>()
         }),
+        "bitme": fleet.bitme.stats(),
     }))
 }
 
@@ -546,6 +560,13 @@ fn region_rows(s: &RegionStore) -> Value {
         "growth": s.growth.len(),
         "resource_growth_timer": s.growth_timer.len(),
         "storage_log_state": s.storage_log.len(),
+        "stamina": s.stamina.len(),
+        "active_buff": s.active_buff.len(),
+        "player_action": s.player_action.len(),
+        "character_stats": s.character_stats.len(),
+        "character_stat_desc": s.character_stat_desc.len(),
+        "resource_desc": s.resource_desc.len(),
+        "extraction_recipe": s.extraction_recipe.len(),
     })
 }
 
@@ -1311,7 +1332,7 @@ fn deposit_from_claim_slot(s: &RegionStore, slot: u32) -> Option<pb::HexiteDepos
 }
 
 /// Format unix microseconds as `YYYY-MM-DDTHH:MM:SS.mmmZ` (BitJita-compatible).
-fn format_rfc3339_millis(micros: i64) -> String {
+pub(crate) fn format_rfc3339_millis(micros: i64) -> String {
     let millis_total = micros.div_euclid(1000);
     let secs = millis_total.div_euclid(1000);
     let millis = (millis_total.rem_euclid(1000)) as u32;
@@ -2475,6 +2496,7 @@ mod tests {
             memory_pressure: Arc::new(AtomicBool::new(false)),
             interest: InterestHub::new(),
             roads: None,
+            bitme: crate::bitme::BitmeHub::new(),
         }
     }
 

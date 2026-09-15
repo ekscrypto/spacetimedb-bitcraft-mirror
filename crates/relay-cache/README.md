@@ -159,6 +159,24 @@ curl -s 'http://127.0.0.1:8089/player/1297036692699996362/crafts?completed=true'
 # Depleted with no timer/growth row: `status: "respawning"`.
 curl -s 'http://127.0.0.1:8089/deposits'
 curl -s 'http://127.0.0.1:8089/deposits?region=14'
+
+# ---------------------------------------------------------------------------
+# Bit-Me mobile app (`/bitme/*`) — poll-only JSON, no SpacetimeDB socket.
+# Full client reference: BITME-API.md (same directory).
+#
+# `GET /bitme/resolve?name=<lowercase>` — exact-match global chain:
+# player_lowercase_username_state ⋈ user_state ⋈ user_region_state ⋈
+# region_connection_info (+ world_region_name_state, signed_in_player_state).
+# Region-shard fallbacks fill display username / sign-in / home region.
+#
+# `GET /bitme/session/:player_entity_id` — the GET itself registers the
+# session (15 min TTL). Returns position (+ claim via the roads overlay),
+# stamina (current/max), live buffs, action lifecycle, action-target identity
+# + tracked health, and watched spawns (destroy-yield chains + citric bushes)
+# scoped to the player's claim/wilderness area. `resource_health_state` is
+# retained only for tracked targets (see `src/bitme.rs`).
+curl -s 'http://127.0.0.1:8089/bitme/resolve?name=strawberry'
+curl -s 'http://127.0.0.1:8089/bitme/session/1297036692699948124'
 # → { "deposits": [
 #      { "north": 6158, "east": 8174, "entity_id": "...",
 #        "name": "Hexite Deposit (N: 6158, E: 8174)", "region": 14 },
@@ -269,3 +287,8 @@ The ceiling is an alarm, not a load shedder. Approaching it logs a warning
 and flips `/cache-health` `ready=false`, but queries keep serving with whatever
 data is loaded. Projected resident grows with player/deployable/rent/
 `experience_state` tables on top of the prior claim/inventory set.
+
+Roads grids are fully dense per region and now include the resource tile map
+(`roads/resource_map.rs`, 7680×7680 u16 = 112.5 MiB/region on top of the
+~275 MiB terrain/overlay), ~+1.5 GiB across the 13 mirrored regions — budget
+for that in `--mem-ceiling-bytes`.

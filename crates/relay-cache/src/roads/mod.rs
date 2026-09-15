@@ -7,10 +7,10 @@ pub mod catalog;
 pub mod coords;
 pub mod decode;
 pub mod grid;
-pub mod harvestable;
 pub mod index;
 pub mod join;
 pub mod meta;
+pub mod resource_map;
 pub mod store;
 
 pub use catalog::{GlobalRoadsCatalog, RoadsFleet};

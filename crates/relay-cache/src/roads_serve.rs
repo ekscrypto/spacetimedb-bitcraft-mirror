@@ -11,7 +11,8 @@ use axum::response::{IntoResponse, Response};
 use prost::Message;
 
 use crate::roads::catalog::RoadsFleet;
-use crate::roads::harvestable::MAX_RESOURCE_QUERY_TILES;
+use crate::roads::coords::world_to_local;
+use crate::roads::resource_map::MAX_RESOURCE_QUERY_TILES;
 use crate::roads::store::MAX_MAP_QUERY_TILES;
 use crate::serve::Fleet;
 
@@ -311,11 +312,16 @@ async fn roads_region_resources(State(fleet): State<Fleet>, Path(region): Path<u
         if !seen.insert((tile.x, tile.z)) {
             continue;
         }
-        for resource_id in grid.harvestable.resource_ids_on(tile.x, tile.z) {
+        let Some((lx, lz)) = world_to_local(handle.region as u16, tile.x, tile.z) else {
+            continue;
+        };
+        if let Some(t) = grid.resource_map.resource_at_local(lx, lz) {
             nodes.push(roads_pb::ResourceNode {
                 x: tile.x,
                 z: tile.z,
-                resource_id,
+                resource_id: t.resource_id,
+                direction: t.direction as u32,
+                origin: t.is_origin,
             });
         }
     }
@@ -337,7 +343,7 @@ mod tests {
     use crate::interest::InterestHub;
     use crate::roads::catalog::{GlobalRoadsCatalog, RoadsFleet};
     use crate::roads::grid::{pack_terrain, set_claim_index, set_paving};
-    use crate::roads::harvestable::MAX_RESOURCE_QUERY_TILES;
+    use crate::roads::resource_map::MAX_RESOURCE_QUERY_TILES;
     use crate::roads::store::{RoadsRegionGrid, RoadsRegionHandle, MAX_MAP_QUERY_TILES};
     use crate::serve::Fleet;
 
@@ -349,6 +355,7 @@ mod tests {
             roads: Some(Arc::new(RoadsFleet::new(Arc::new(RwLock::new(
                 GlobalRoadsCatalog::new(),
             ))))),
+            bitme: crate::bitme::BitmeHub::new(),
         }
     }
 
@@ -485,8 +492,13 @@ mod tests {
         });
         fleet.roads.as_ref().unwrap().push_region(handle.clone());
 
+        // Region 9's origin is (23040, 7680): world tiles for region-local
+        // (10, 20) / (10, 21).
         let query = super::roads_pb::ResourceQuery {
-            tiles: vec![super::roads_pb::Hex { x: 10, z: 20 }],
+            tiles: vec![
+                super::roads_pb::Hex { x: 23050, z: 7700 },
+                super::roads_pb::Hex { x: 23050, z: 7701 },
+            ],
         };
         let app = roads_routes().with_state(fleet.clone());
         let loading = app
@@ -504,8 +516,12 @@ mod tests {
 
         {
             let mut grid = handle.grid.write();
-            grid.harvestable.upsert(1, 5, 0, Some((10, 20)));
-            grid.harvestable.upsert(2, 3, 0, Some((10, 20)));
+            // All resource types land in the map now — a forageable and a
+            // sapling, on distinct tiles (upstream guarantees no overlap).
+            grid.resource_map.note_desc(74, &[]);
+            grid.resource_map.note_desc(5, &[]);
+            grid.resource_map.upsert(1, 74, 0, Some((23050, 7700)));
+            grid.resource_map.upsert(2, 5, 3, Some((23050, 7701)));
             grid.mark_ready();
         }
 
@@ -526,8 +542,17 @@ mod tests {
         let decoded = super::roads_pb::ResourcesResponse::decode(body.as_ref()).unwrap();
         let mut ids: Vec<i32> = decoded.nodes.iter().map(|n| n.resource_id).collect();
         ids.sort_unstable();
-        assert_eq!(ids, vec![3, 5]);
-        assert!(decoded.nodes.iter().all(|n| n.x == 10 && n.z == 20));
+        assert_eq!(ids, vec![5, 74]);
+        let by_id: std::collections::HashMap<i32, &super::roads_pb::ResourceNode> =
+            decoded.nodes.iter().map(|n| (n.resource_id, n)).collect();
+        let mushroom = by_id[&74];
+        assert_eq!((mushroom.x, mushroom.z), (23050, 7700));
+        assert_eq!(mushroom.direction, 0);
+        assert!(mushroom.origin);
+        let sapling = by_id[&5];
+        assert_eq!((sapling.x, sapling.z), (23050, 7701));
+        assert_eq!(sapling.direction, 3);
+        assert!(sapling.origin);
     }
 
     #[tokio::test]

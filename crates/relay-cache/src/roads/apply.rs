@@ -8,8 +8,9 @@ use hashbrown::HashMap;
 use relay_protocol::{MirroredField, MirroredSchema};
 
 use super::decode::{
-    decode_claim_state_roads, decode_claim_tile, decode_location_roads, decode_paved_tile, decode_terrain_chunk,
-    CLAIM_STATE_TABLE, CLAIM_TILE_TABLE, LOCATION_TABLE, PAVED_TILE_TABLE, TERRAIN_CHUNK_TABLE,
+    decode_claim_state_roads, decode_claim_tile, decode_location_roads, decode_paved_tile,
+    decode_resource_desc_footprint, decode_terrain_chunk, CLAIM_STATE_TABLE, CLAIM_TILE_TABLE, LOCATION_TABLE,
+    PAVED_TILE_TABLE, RESOURCE_DESC_TABLE, TERRAIN_CHUNK_TABLE,
 };
 use super::join::OVERWORLD_DIMENSION;
 use super::meta::RoadsTableMeta;
@@ -68,13 +69,13 @@ fn apply_roads_delete(
             let r = decode_location_roads(row, &meta.location_fields, meta.location, schema)?;
             if r.dimension == OVERWORLD_DIMENSION {
                 grid.join.location_by_entity.remove(&r.entity_id);
-                grid.harvestable.clear_location(r.entity_id);
+                grid.resource_map.clear_location(r.entity_id);
             }
             grid.bump_generation();
         }
         RESOURCE_TABLE => {
             let r = decode_resource_row(meta, schema, row)?;
-            grid.harvestable.delete(r.entity_id);
+            grid.resource_map.delete(r.entity_id);
         }
         _ => {}
     }
@@ -95,6 +96,7 @@ fn apply_roads_insert(
         CLAIM_STATE_TABLE => apply_claim_state(grid, schema, meta, row)?,
         LOCATION_TABLE => apply_location(grid, schema, meta, row)?,
         RESOURCE_TABLE => apply_resource(grid, schema, meta, row)?,
+        RESOURCE_DESC_TABLE => apply_resource_desc(grid, schema, meta, row)?,
         _ => {}
     }
     Ok(())
@@ -187,7 +189,7 @@ fn apply_location(
         return Ok(());
     }
     grid.join.location_by_entity.insert(r.entity_id, (r.x, r.z));
-    grid.harvestable.set_location(r.entity_id, r.x, r.z);
+    grid.resource_map.set_location(r.entity_id, r.x, r.z);
     grid.join
         .recompute_cell(grid.region, &mut grid.overlay, &mut grid.claim_index, r.entity_id);
     grid.bump_generation();
@@ -202,8 +204,22 @@ fn apply_resource(
 ) -> Result<()> {
     let r = decode_resource_row(meta, schema, row)?;
     let loc = grid.join.location_by_entity.get(&r.entity_id).copied();
-    grid.harvestable
+    grid.resource_map
         .upsert(r.entity_id, r.resource_id, r.direction_index, loc);
+    Ok(())
+}
+
+fn apply_resource_desc(
+    grid: &mut RoadsRegionGrid,
+    schema: &MirroredSchema,
+    meta: &RoadsTableMeta,
+    row: &[u8],
+) -> Result<()> {
+    let (Some(cols), Some(fields)) = (&meta.resource_desc_footprint, &meta.resource_desc_footprint_fields) else {
+        return Ok(());
+    };
+    let r = decode_resource_desc_footprint(row, fields, *cols, schema)?;
+    grid.resource_map.note_desc(r.id, &r.tiles);
     Ok(())
 }
 

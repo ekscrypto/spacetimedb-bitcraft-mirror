@@ -7,10 +7,11 @@ use relay_protocol::{MirroredField, MirroredSchema};
 
 use super::decode::{
     resolve_claim_state_roads_cols, resolve_claim_tile_cols, resolve_location_roads_cols, resolve_paved_tile_cols,
-    resolve_paving_desc_cols, resolve_region_name_cols, resolve_terraform_recipe_cols, resolve_terrain_chunk_cols,
-    resolve_world_region_cols, ClaimStateRoadsCols, ClaimTileCols, LocationRoadsCols, PavedTileCols, PavingDescCols,
-    RegionNameCols, TerraformRecipeCols, TerrainChunkCols, WorldRegionCols, CLAIM_STATE_TABLE, CLAIM_TILE_TABLE,
-    LOCATION_TABLE, PAVED_TILE_TABLE, PAVING_TILE_DESC_TABLE, REGION_NAME_TABLE, TERRAFORM_RECIPE_DESC_TABLE,
+    resolve_paving_desc_cols, resolve_region_name_cols, resolve_resource_desc_footprint_cols,
+    resolve_terraform_recipe_cols, resolve_terrain_chunk_cols, resolve_world_region_cols, ClaimStateRoadsCols,
+    ClaimTileCols, LocationRoadsCols, PavedTileCols, PavingDescCols, RegionNameCols, ResourceDescFootprintCols,
+    TerraformRecipeCols, TerrainChunkCols, WorldRegionCols, CLAIM_STATE_TABLE, CLAIM_TILE_TABLE, LOCATION_TABLE,
+    PAVED_TILE_TABLE, PAVING_TILE_DESC_TABLE, REGION_NAME_TABLE, RESOURCE_DESC_TABLE, TERRAFORM_RECIPE_DESC_TABLE,
     TERRAIN_CHUNK_TABLE, WORLD_REGION_STATE_TABLE,
 };
 use crate::decode::{self, ResourceCols, ResourceFast, RESOURCE_TABLE};
@@ -37,6 +38,8 @@ pub struct RoadsTableMeta {
     pub terraform_recipe_fields: Option<Vec<MirroredField>>,
     pub region_name_fields: Option<Vec<MirroredField>>,
     pub world_region_fields: Option<Vec<MirroredField>>,
+    pub resource_desc_footprint: Option<ResourceDescFootprintCols>,
+    pub resource_desc_footprint_fields: Option<Vec<MirroredField>>,
 }
 
 impl RoadsTableMeta {
@@ -64,6 +67,8 @@ impl RoadsTableMeta {
             terraform_recipe_fields: None,
             region_name_fields: None,
             world_region_fields: None,
+            resource_desc_footprint: resolve_resource_desc_footprint_cols(schema).ok(),
+            resource_desc_footprint_fields: fields_owned(schema, RESOURCE_DESC_TABLE).ok(),
         })
     }
 
@@ -92,6 +97,8 @@ impl RoadsTableMeta {
             terraform_recipe_fields: fields_owned(schema, TERRAFORM_RECIPE_DESC_TABLE).ok(),
             region_name_fields: fields_owned(schema, REGION_NAME_TABLE).ok(),
             world_region_fields: fields_owned(schema, WORLD_REGION_STATE_TABLE).ok(),
+            resource_desc_footprint: resolve_resource_desc_footprint_cols(schema).ok(),
+            resource_desc_footprint_fields: fields_owned(schema, RESOURCE_DESC_TABLE).ok(),
         })
     }
 }

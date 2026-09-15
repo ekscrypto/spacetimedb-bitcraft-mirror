@@ -77,12 +77,23 @@ message RegionMapSnapshot {
 }
 
 // ---------------------------------------------------------------------------
-// Point lookup of allowlisted harvestable nodes on a hex list
+// Point lookup of resource nodes on a hex list
 // POST /roads/region/{id}/resources
 //
-// Multi-hex resources (clay, sand, large trees, ore veins, …) are returned
-// on every occupied tile: resource_desc.footprint axial offsets, rotated by
-// resource_state.direction_index, converted onto the odd-r world lattice.
+// Backed by the dense per-region resource tile map (roads/resource_map.rs),
+// which carries ALL resource_state rows (every resource type, including
+// forageables and event resources) — filtering to harvestable tags is the
+// client's job now. Multi-hex resources (clay, sand, large trees, ore
+// veins, giant bushes, …) are stamped on every occupied tile:
+// resource_desc.footprint axial offsets, rotated by
+// resource_state.direction_index, onto the odd-r world lattice.
+//
+// direction + origin let clients reconstruct full resource instances from
+// per-tile rows: origin tiles anchor an instance, direction (0..=5) gives
+// the rotated shape. The world does overlap single-hex forageables with
+// multi-hex resources; the tile map keeps one resource per tile — the
+// multi-hex shape wins, and a single-hex newcomer onto an occupied tile is
+// not stamped (the long-standing occupant stays visible).
 // ---------------------------------------------------------------------------
 
 message Hex {
@@ -98,6 +109,10 @@ message ResourceNode {
   int32 x = 1;
   int32 z = 2;
   int32 resource_id = 3;
+  // resource_state.direction_index of the owning resource (0..=5).
+  uint32 direction = 4;
+  // True when this tile is the resource's anchor (origin) tile.
+  bool origin = 5;
 }
 
 message ResourcesResponse {
