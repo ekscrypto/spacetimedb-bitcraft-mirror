@@ -341,17 +341,20 @@ not just the old roads harvestable list. Poll counts as session activity
 
 | Bits | Meaning |
 |---|---|
-| 0–9 | Resource dictionary index (`0` = empty tile; expand via the dictionary) |
+| 0–9 | Dictionary index (`0` = empty tile; expand via the dictionary) |
 | 10 | **Origin flag** — this tile is the resource's anchor tile |
 | 11–13 | `direction_index` (0–5), repeated on every tile of the footprint |
-| 14–15 | Reserved (zero) |
+| 14 | **Paving flag** — the tile is player-paved; bits 0–9 then hold a **paving index** (the dictionary lists these as entries with `"paving": true` and a `paving_type_id`) |
+| 15 | **Water flag** — the tile's terrain sits below its water level. Terrain never flips water↔land, so this is filled once from the terrain seed and rides along on every word — including otherwise-empty tiles (`0x8000` alone = water, nothing on it). Resolution is the 3×3-tile terrain super-hex. |
 
 The server stamps every occupied tile of a multi-hex resource
 (`resource_desc.footprint` × `direction`), so per-tile rendering needs no
 footprint math. To render one icon per resource instead, reconstruct
 instances client-side: each tile with the **origin flag** anchors an
 instance of `direction`-rotated shape; adjacent same-type resources are
-disambiguated by their origin tiles. Tile word `0` also marks tiles
+disambiguated by their origin tiles. Paved tiles fill otherwise-empty
+tiles (a tile never holds both — in the rare collision the resource wins);
+paving has no direction/origin bits. Tile word `0` also marks tiles
 outside the mirrored region (windows overhang region borders; there is no
 cross-region stitching).
 
@@ -391,7 +394,14 @@ are **stable per deploy but not across deploys**.
       "harvestable": false,
       "max_health": 10000,
       "despawn_time_secs": 0.0,
-      "respawn_time_secs": 600.0
+      "respawn_time_secs": 600.0,
+      "paving": false
+    },
+    {
+      "index": 1,
+      "paving_type_id": 59838,
+      "name": "Cobblestone Road",
+      "paving": true
     }
   ]
 }
@@ -399,8 +409,9 @@ are **stable per deploy but not across deploys**.
 
 | Field | Meaning |
 |---|---|
-| `index` | The 10-bit value carried in tile words (index `0` is the empty sentinel and is not listed) |
-| `name` / `max_health` / `despawn_time_secs` / `respawn_time_secs` | `resource_desc` gamedata (`null` if the desc row is missing) |
+| `index` | The 10-bit value carried in tile words (index `0` is the empty sentinel and is not listed). Resource and paving entries use **separate index namespaces** — the tile word's bit 14 says which list a tile refers to, so equal indices never collide |
+| `paving` / `paving_type_id` | `true` on paving entries, which carry the raw `paving_type_id` instead of `resource_id` (names from the global `paving_tile_desc` catalog; `null` until streamed) |
+| `name` / `max_health` / `despawn_time_secs` / `respawn_time_secs` | `resource_desc` gamedata on resource entries (`null` if the desc row is missing) |
 | `harvestable` | The old roads-side forestry/mining/clay/sand classification — use this to filter the map client-side; the window itself includes **all** resource types |
 
 ### Errors

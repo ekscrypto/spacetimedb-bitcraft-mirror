@@ -137,13 +137,19 @@ Endpoints with **no** synchronized tables: `/cache-health`, `/proto`,
 - **Resource tile map (`roads/resource_map.rs`):** dense u16-per-tile map of the
   whole 7680×7680 region (112.5 MiB/region, included in `memory_bytes()`),
   fed by all `resource_state` + overworld `location_state` rows and
-  `resource_desc.footprint`. One resource per tile: multi-hex shapes
-  overwrite their tiles; a single-hex newcomer onto an occupied tile (the
-  world does spawn forageables under multi-hex resources) is not stamped;
-  clears only zero words the entity actually wrote. Tile word: bits 0–9
-  dictionary index, bit 10 origin flag, bits 11–13 `direction_index`,
-  bits 14–15 reserved. Backs both `POST /roads/region/:id/resources` (all
-  types now — harvestable filtering is client-side via the dictionary's
-  `harvestable` flag from `data/harvestable_resource_ids.json`) and
-  `GET /bitme/session/:id/resources` (400×400 packed window). The former
+  `resource_desc.footprint`, plus paved tiles from `paved_tile_state`
+  ⋈ location (stamped only into empty tiles — resources win the rare
+  collision) and the water flag from `terrain_chunk_state`
+  (elevation < water level per 3×3 super-hex; static, filled at seed).
+  One resource per tile: multi-hex shapes overwrite their
+  tiles; a single-hex newcomer onto an occupied tile (the world does spawn
+  forageables under multi-hex resources) is not stamped; clears only zero
+  words the writer actually wrote. Tile word: bits 0–9 dictionary index,
+  bit 10 origin flag, bits 11–13 `direction_index`, bit 14 paving flag
+  (separate paving index namespace), bit 15 water flag (terrain below water
+  level; filled once from the terrain seed, static). Backs both
+  `POST /roads/region/:id/resources` (all types now — harvestable
+  filtering is client-side via the dictionary's `harvestable` flag from
+  `data/harvestable_resource_ids.json`) and `GET
+  /bitme/session/:id/resources` (400×400 packed window). The former
   `roads/harvestable.rs` 215-id allowlist index is retired.

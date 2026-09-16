@@ -51,7 +51,13 @@ fn apply_roads_delete(
         PAVED_TILE_TABLE => {
             let r = decode_paved_tile(row, &meta.paved_tile_fields, meta.paved_tile, schema)?;
             grid.join.paving_by_entity.remove(&r.entity_id);
+            // Same location source the overlay's clear uses — captured
+            // before anything can remove it from the join map.
+            let loc = grid.join.location_by_entity.get(&r.entity_id).copied();
             grid.join.clear_paving_at(grid.region, &mut grid.overlay, r.entity_id);
+            if let Some((x, z)) = loc {
+                grid.resource_map.clear_paving(x, z, r.tile_type_id);
+            }
             grid.bump_generation();
         }
         CLAIM_TILE_TABLE => {
@@ -126,6 +132,8 @@ fn apply_terrain_chunk(
                 &r.water_levels,
                 &r.water_body_types,
             );
+            // Terrain (re)written live: refresh the static water bits.
+            grid.resource_map.fill_water_from_terrain(&grid.terrain);
             grid.bump_generation();
         }
     } else {
@@ -144,6 +152,9 @@ fn apply_paved_tile(
     grid.join.paving_by_entity.insert(r.entity_id, r.tile_type_id);
     grid.join
         .recompute_cell(grid.region, &mut grid.overlay, &mut grid.claim_index, r.entity_id);
+    if let Some(&(x, z)) = grid.join.location_by_entity.get(&r.entity_id) {
+        grid.resource_map.stamp_paving(x, z, r.tile_type_id);
+    }
     grid.bump_generation();
     Ok(())
 }
@@ -190,6 +201,11 @@ fn apply_location(
     }
     grid.join.location_by_entity.insert(r.entity_id, (r.x, r.z));
     grid.resource_map.set_location(r.entity_id, r.x, r.z);
+    // A paved tile whose location row arrives after its `paved_tile_state`
+    // row stamps here — idempotent, the map only writes into empty tiles.
+    if let Some(paving) = grid.join.paving_by_entity.get(&r.entity_id).copied() {
+        grid.resource_map.stamp_paving(r.x, r.z, paving);
+    }
     grid.join
         .recompute_cell(grid.region, &mut grid.overlay, &mut grid.claim_index, r.entity_id);
     grid.bump_generation();
@@ -233,7 +249,10 @@ fn decode_resource_row(meta: &RoadsTableMeta, schema: &MirroredSchema, row: &[u8
     cache_decode::decode_resource_with_fields(row, &meta.resource_fields, cols, schema)
 }
 
-/// After seed completes, flush pending terrain rows with the chosen dimension.
+/// After seed completes, flush pending terrain rows with the chosen
+/// dimension, then fill the resource map's static water bits from the
+/// terrain grid (terrain never flips water↔land, so this runs once per
+/// seed; live terrain writes re-run it for safety).
 pub fn finalize_terrain_seed(grid: &mut RoadsRegionGrid) {
     let dim = grid.best_terrain_dimension();
     grid.terrain_writer.set_best_dimension(dim);
@@ -254,6 +273,7 @@ pub fn finalize_terrain_seed(grid: &mut RoadsRegionGrid) {
             &r.water_body_types,
         );
     }
+    grid.resource_map.fill_water_from_terrain(&grid.terrain);
 }
 
 /// Decode PK entity_id from delete row for tables keyed by entity_id.

@@ -11,6 +11,15 @@ pub fn pack_terrain(elev: i16, orig: i16, water: i16, wbt: u8) -> u64 {
     (elev as u16 as u64) | ((orig as u16 as u64) << 16) | ((water as u16 as u64) << 32) | ((wbt as u64) << 48)
 }
 
+/// `(elevation, water_level)` of a packed terrain cell (both signed). A tile
+/// is underwater when `elevation < water_level`; missing water data arrives
+/// as `i16::MIN`, which never classifies as water.
+pub fn unpack_terrain_water(packed: u64) -> (i16, i16) {
+    let elev = (packed & 0xFFFF) as u16 as i16;
+    let water = ((packed >> 32) & 0xFFFF) as u16 as i16;
+    (elev, water)
+}
+
 pub fn pack_overlay(claim_index: u16, paving: u16) -> u32 {
     (paving as u32) | ((claim_index as u32) << 16)
 }

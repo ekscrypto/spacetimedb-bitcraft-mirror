@@ -285,9 +285,11 @@ async fn bitme_session_resources(State(fleet): State<Fleet>, Path(entity_id): Pa
 }
 
 /// `GET /bitme/region/:region/resource-dictionary` — the resource_id ↔
-/// 10-bit tile index map plus gamedata, so clients can expand
-/// `/bitme/session/:id/resources` windows. Refetch when `dict_version`
-/// changes (indices are per-deploy, first-sight order).
+/// 10-bit tile index map (plus the paving namespace — tile words with bit 14
+/// set — as entries carrying `paving_type_id` and `paving: true`) plus
+/// gamedata, so clients can expand `/bitme/session/:id/resources` windows.
+/// Refetch when `dict_version` changes (indices are per-deploy, first-sight
+/// order).
 async fn bitme_region_resource_dictionary(State(fleet): State<Fleet>, Path(region): Path<String>) -> Response {
     let Ok(region) = region.parse::<u32>() else {
         return no_store_status(StatusCode::BAD_REQUEST, json!({"error": "region must be a u32"})).into_response();
@@ -307,7 +309,7 @@ async fn bitme_region_resource_dictionary(State(fleet): State<Fleet>, Path(regio
         .into_response();
     };
 
-    let (dict_version, indexed_ids) = {
+    let (dict_version, indexed_ids, indexed_paving_ids) = {
         let grid = handle.grid.read();
         if !grid.ready {
             return (StatusCode::ACCEPTED, Vec::<u8>::new()).into_response();
@@ -319,6 +321,13 @@ async fn bitme_region_resource_dictionary(State(fleet): State<Fleet>, Path(regio
                 .iter()
                 .enumerate()
                 .skip(1) // index 0 = empty-tile sentinel
+                .map(|(index, id)| (index as u32, *id))
+                .collect::<Vec<_>>(),
+            grid.resource_map
+                .dict_paving_ids()
+                .iter()
+                .enumerate()
+                .skip(1)
                 .map(|(index, id)| (index as u32, *id))
                 .collect::<Vec<_>>(),
         )
@@ -349,7 +358,17 @@ async fn bitme_region_resource_dictionary(State(fleet): State<Fleet>, Path(regio
         })
         .unwrap_or_default();
 
-    let entries: Vec<Value> = indexed_ids
+    // Paving names come from the global paving_tile_desc catalog; ids the
+    // catalog has not streamed yet degrade to null names.
+    let paving_names: hashbrown::HashMap<i32, String> = roads
+        .catalog
+        .read()
+        .paving
+        .iter()
+        .map(|p| (p.id, p.name.clone()))
+        .collect();
+
+    let mut entries: Vec<Value> = indexed_ids
         .iter()
         .map(|(index, id)| {
             let d = descs.get(id);
@@ -361,9 +380,20 @@ async fn bitme_region_resource_dictionary(State(fleet): State<Fleet>, Path(regio
                 "max_health": d.map(|(_, max_health, ..)| *max_health),
                 "despawn_time_secs": d.map(|(_, _, despawn, _)| *despawn),
                 "respawn_time_secs": d.map(|(_, _, _, respawn)| *respawn),
+                "paving": false,
             })
         })
         .collect();
+    // Paving namespace: indices are separate from resource indices; window
+    // tile words with bit 14 set refer to these entries.
+    entries.extend(indexed_paving_ids.iter().map(|(index, id)| {
+        json!({
+            "index": index,
+            "paving_type_id": id,
+            "name": paving_names.get(id).map(String::as_str),
+            "paving": true,
+        })
+    }));
 
     no_store_json(json!({
         "region": region,
@@ -704,8 +734,17 @@ mod tests {
                 let mut grid = handle.grid.write();
                 grid.resource_map.note_desc(74, &[]);
                 grid.resource_map.upsert(100, 74, 2, Some((7690, 7700)));
+                grid.resource_map.stamp_paving(7691, 7700, 59838);
                 grid.mark_ready();
             }
+            roads.catalog.write().paving.push(crate::roads::decode::PavingDescRow {
+                id: 59838,
+                name: "Cobblestone Road".into(),
+                paving_duration: 0.0,
+                tier: 0,
+                input_cargo_id: 0,
+                consumed: vec![],
+            });
             roads.push_region(handle);
             Some(roads)
         } else {
@@ -752,6 +791,13 @@ mod tests {
         assert_eq!(word & 0x03FF, 1);
         assert_eq!(word >> 11, 2);
         assert_ne!(word & (1 << 10), 0);
+
+        // The paved tile one column east carries bit 14 + paving index 1.
+        let off = 24 + (200 * 400 + 201) * 2;
+        let word = u16::from_le_bytes(body[off..off + 2].try_into().unwrap());
+        assert_ne!(word & (1 << 14), 0, "paving flag set");
+        assert_eq!(word & 0x03FF, 1, "paving index (separate namespace)");
+        assert_eq!((word >> 11) & 7, 0, "paving has no direction");
     }
 
     #[tokio::test]
@@ -871,6 +917,20 @@ mod tests {
         assert_eq!(entry["harvestable"], false);
         assert_eq!(entry["max_health"], 200);
         assert_eq!(entry["respawn_time_secs"], 600.0);
+        assert_eq!(entry["paving"], false);
+
+        // Paving namespace: separate index space, flagged on the entry,
+        // named from the global paving catalog.
+        let paving_entry = v["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["paving"] == json!(true))
+            .expect("paving entry");
+        assert_eq!(paving_entry["paving_type_id"], 59838);
+        assert_eq!(paving_entry["name"], "Cobblestone Road");
+        // Index namespaces are independent — both start at 1; the tile
+        // word's bit 14 is what tells them apart on the wire.
 
         // Unknown region → 404; garbage region id → 400.
         let resp = app

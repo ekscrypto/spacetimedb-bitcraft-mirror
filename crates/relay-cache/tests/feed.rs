@@ -104,6 +104,16 @@ fn resource_row(entity_id: u64, resource_id: i32) -> Bytes {
     Bytes::from(buf)
 }
 
+/// Hand-encode a `paved_tile_state` row. Real field order: entity_id u64,
+/// tile_type_id i32, related_entity_id u64 (20 bytes).
+fn paved_tile_row(entity_id: u64, tile_type_id: i32) -> Bytes {
+    let mut buf = Vec::with_capacity(20);
+    buf.extend_from_slice(&entity_id.to_le_bytes());
+    buf.extend_from_slice(&tile_type_id.to_le_bytes());
+    buf.extend_from_slice(&0u64.to_le_bytes()); // related_entity_id
+    Bytes::from(buf)
+}
+
 fn seed_update(tables: Vec<UpstreamTableOps>) -> UpstreamUpdate {
     UpstreamUpdate {
         provenance: None,
@@ -941,4 +951,57 @@ async fn bitme_global_resolve_chain_builds_from_global_feed() {
         .expect("delete username");
     settle().await;
     assert!(bitme.global().read().resolve("strawberry").is_none());
+}
+
+#[tokio::test]
+async fn feed_roads_stamps_and_clears_paving() {
+    let interest = InterestHub::new();
+    let manager = FeedManager::new(interest);
+    let roads = manager.enable_roads();
+    let handle = manager
+        .register_region("bitcraft-live-7", SCHEMA_JSON)
+        .expect("register")
+        .expect("regional database yields a handle");
+
+    // Region-local (12, 34) → world (7692, 7714). The location row seeds
+    // ahead of the paved tile (alphabetical table order).
+    let seed = seed_update(vec![
+        ops("location_state", vec![], vec![location_row(900, 7692, 7714, 1)]),
+        ops("paved_tile_state", vec![], vec![paved_tile_row(900, 59838)]),
+    ]);
+    manager
+        .on_updates(Arc::from("bitcraft-live-7"), 1, vec![seed])
+        .await
+        .expect("dispatch seed");
+    manager
+        .on_live(Arc::from("bitcraft-live-7"), 1)
+        .await
+        .expect("dispatch live");
+    let rh = roads.region_handle(7).expect("roads region");
+    for _ in 0..200 {
+        if rh.grid.read().ready {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    {
+        let grid = rh.grid.read();
+        assert!(grid.ready);
+        // Paved tile lands in the resource map with its paving-type index…
+        assert_eq!(grid.resource_map.paving_at_local(12, 34), Some(59838));
+        // …and is invisible to the resource lookup.
+        assert!(grid.resource_map.resource_at_local(12, 34).is_none());
+    }
+
+    // Removing the paved tile clears the map word.
+    let live = live_update(vec![ops("paved_tile_state", vec![paved_tile_row(900, 59838)], vec![])]);
+    manager
+        .on_updates(Arc::from("bitcraft-live-7"), 1, vec![live])
+        .await
+        .expect("dispatch delete");
+    settle().await;
+
+    let grid = rh.grid.read();
+    assert_eq!(grid.resource_map.paving_at_local(12, 34), None);
 }

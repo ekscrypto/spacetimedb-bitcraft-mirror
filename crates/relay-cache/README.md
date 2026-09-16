@@ -189,13 +189,17 @@ curl -s 'http://127.0.0.1:8089/bitme/session/1297036692699948124'
 # the player (player at relative 200,200). 24-byte BMR1 header (origin
 # world tiles, region, dict_version) + 400x400 u16 LE tile words:
 # bits 0-9 dictionary index, bit 10 origin flag, bits 11-13
-# direction_index, bits 14-15 reserved. Full format + reconstruction
-# recipe: BITME-API.md §4.
+# direction_index, bit 14 paving flag (bits 0-9 then hold a paving index
+# from the dictionary's paving namespace; player-paved tiles fill empty
+# tiles only), bit 15 water flag (terrain below water level; filled once
+# from the terrain seed, static). Full format + reconstruction recipe:
+# BITME-API.md §4.
 # curl -s http://127.0.0.1:8089/bitme/session/<player_entity_id>/resources -o window.bin
 
 # Resource dictionary for expanding window tiles: index -> resource_id +
-# name / gamedata / harvestable flag. Indices are per-deploy; refetch when
-# a window header's dict_version changes. BITME-API.md §5.
+# name / gamedata / harvestable flag, plus paving entries (paving: true,
+# paving_type_id). Indices are per-deploy; refetch when a window header's
+# dict_version changes. BITME-API.md §5.
 # curl -s http://127.0.0.1:8089/bitme/region/7/resource-dictionary
 
 # Resources on a hex list — served from the dense per-region resource tile

@@ -11,7 +11,19 @@
 //!   bit  10   : origin flag — the resource's anchor tile
 //!   bits 11-13: `resource_state.direction_index` (0..=5), repeated on
 //!               every footprint tile so any tile can seed reconstruction
-//!   bits 14-15: reserved, zero
+//!   bit  14   : paving flag — the tile is player-paved; bits 0-9 then hold
+//!               a paving index from the separate paving namespace
+//!               ([`Self::stamp_paving`], exposed via the dictionary's
+//!               paving entries). Resources and paving share one tile word:
+//!               a tile can't genuinely hold both (verified: 24 in 416k
+//!               sampled tiles, always a multi-hex formation over pavement),
+//!               and the resource wins those — paving stamps only into
+//!               empty tiles.
+//!   bit  15   : water flag — the tile's terrain elevation is below its
+//!               water level. Filled once from the terrain seed
+//!               ([`Self::fill_water_from_terrain`], one bit per 3×3-tile
+//!               super-hex) and preserved by every later write; terrain
+//!               never flips water↔land.
 //!
 //! Footprints come from `resource_desc.footprint` (axial offsets, rotated by
 //! direction via [`footprint_world_hexes`]) and are stamped server-side onto
@@ -36,7 +48,8 @@ use std::sync::OnceLock;
 
 use hashbrown::HashMap;
 
-use super::coords::{footprint_world_hexes, overlay_index, world_to_local, REGION_SIDE};
+use super::coords::{footprint_world_hexes, overlay_index, world_to_local, REGION_SIDE, SUPER_SIDE};
+use super::grid::{unpack_terrain_water, SuperHexTerrainGrid};
 
 pub const RESOURCE_MAP_BYTES: usize = (REGION_SIDE as usize) * (REGION_SIDE as usize) * 2;
 
@@ -46,16 +59,36 @@ pub const MAX_RESOURCE_QUERY_TILES: usize = 16384;
 const INDEX_MASK: u16 = 0x03FF;
 const ORIGIN_BIT: u16 = 1 << 10;
 const DIRECTION_SHIFT: u16 = 11;
+/// Paving namespace flag: when set, bits 0-9 hold a paving index (separate
+/// [`ResourceTileMap::intern_paving`] namespace), not a resource index.
+pub const PAVING_BIT: u16 = 1 << 14;
+/// Water flag: the tile's terrain is below its water level. Terrain is
+/// static, so this is filled once from the terrain seed
+/// ([`ResourceTileMap::fill_water_from_terrain`]) and every later write
+/// into the tile preserves it — it is metadata about the ground, not
+/// content, so an otherwise-empty water tile reads as `WATER_BIT` alone.
+pub const WATER_BIT: u16 = 1 << 15;
+/// Everything a resource/paving write owns: index + flags, excluding the
+/// terrain water bit.
+const CONTENT_MASK: u16 = 0x7FFF;
 /// Dictionary capacity: 10-bit index, 0 reserved for "empty".
 pub const MAX_RESOURCE_INDEX: u16 = 1023;
+/// Same capacity for the separate paving index namespace.
+pub const MAX_PAVING_INDEX: u16 = 1023;
 
 const SINGLE_HEX: [(i32, i32); 1] = [(0, 0)];
 
-/// Dictionary index → tile word.
+/// Resource dictionary index → tile word.
 fn encode_tile(index: u16, direction: u8, is_origin: bool) -> u16 {
     debug_assert!((1..=MAX_RESOURCE_INDEX).contains(&index));
     debug_assert!(direction < 6);
     (index & INDEX_MASK) | (u16::from(is_origin) << 10) | ((direction as u16) << DIRECTION_SHIFT)
+}
+
+/// Paving index → tile word.
+fn encode_paving(index: u16) -> u16 {
+    debug_assert!((1..=MAX_PAVING_INDEX).contains(&index));
+    PAVING_BIT | (index & INDEX_MASK)
 }
 
 fn tile_index(word: u16) -> u16 {
@@ -68,6 +101,16 @@ fn tile_direction(word: u16) -> u8 {
 
 fn tile_is_origin(word: u16) -> bool {
     word & ORIGIN_BIT != 0
+}
+
+fn tile_is_paving(word: u16) -> bool {
+    word & PAVING_BIT != 0
+}
+
+/// True when the tile carries resource or paving content (water alone is
+/// not content).
+fn tile_has_content(word: u16) -> bool {
+    word & CONTENT_MASK != 0
 }
 
 fn allowlist() -> &'static [i32] {
@@ -116,6 +159,8 @@ struct Node {
 /// Dictionary indices are assigned in first-sighting order, so they are
 /// stable per deploy but may differ across redeploys; [`Self::dict_version`]
 /// (FNV-1a over the id sequence) lets clients detect dictionary changes.
+/// Paving types live in a second namespace ([`Self::stamp_paving`]) with
+/// their own indices and the tile word's bit 14 set.
 #[derive(Debug)]
 pub struct ResourceTileMap {
     region: u16,
@@ -128,7 +173,14 @@ pub struct ResourceTileMap {
     /// `resource_desc.footprint` ([`Self::note_desc`]). Single hex when the
     /// desc row has not been seen (or has an empty footprint).
     footprints: HashMap<u16, Box<[(i32, i32)]>>,
+    /// Paving namespace: raw `paving_type_id` ↔ 10-bit paving index.
+    /// `paving_ids[0] == 0` sentinel; stamped words carry [`PAVING_BIT`].
+    /// Paved tiles are never entered into `by_entity` — the buffer is
+    /// written/cleared directly (a paved tile is a fixed single tile).
+    paving_ids: Vec<i32>,
+    paving_index_by_id: HashMap<i32, u16>,
     warned_overflow: bool,
+    warned_paving_overflow: bool,
 }
 
 impl ResourceTileMap {
@@ -140,7 +192,10 @@ impl ResourceTileMap {
             ids: vec![0],
             index_by_id: HashMap::new(),
             footprints: HashMap::new(),
+            paving_ids: vec![0],
+            paving_index_by_id: HashMap::new(),
             warned_overflow: false,
+            warned_paving_overflow: false,
         }
     }
 
@@ -191,6 +246,82 @@ impl ResourceTileMap {
         let index = (self.ids.len() - 1) as u16;
         self.index_by_id.insert(resource_id, index);
         Some(index)
+    }
+
+    fn intern_paving(&mut self, paving_type_id: i32) -> Option<u16> {
+        if let Some(&index) = self.paving_index_by_id.get(&paving_type_id) {
+            return Some(index);
+        }
+        if self.paving_ids.len() > MAX_PAVING_INDEX as usize {
+            if !self.warned_paving_overflow {
+                self.warned_paving_overflow = true;
+                tracing::warn!(
+                    target: "relay_cache::roads",
+                    cap = MAX_PAVING_INDEX,
+                    "paving dictionary overflow; further paving types are dropped"
+                );
+            }
+            return None;
+        }
+        self.paving_ids.push(paving_type_id);
+        let index = (self.paving_ids.len() - 1) as u16;
+        self.paving_index_by_id.insert(paving_type_id, index);
+        Some(index)
+    }
+
+    /// Stamp one paved tile (world coords). Paving fills only content-empty
+    /// tiles — where a resource stands, the resource keeps the tile
+    /// (verified rare: multi-hex formations over pavement). Single fixed
+    /// tile, no footprint, never entered into `by_entity`. The terrain
+    /// water bit is preserved.
+    pub fn stamp_paving(&mut self, x: i32, z: i32, paving_type_id: i32) {
+        let Some(index) = self.intern_paving(paving_type_id) else {
+            return;
+        };
+        if let Some(idx) = world_to_local(self.region, x, z).and_then(|(lx, lz)| overlay_index(lx, lz)) {
+            if !tile_has_content(self.tiles[idx]) {
+                self.tiles[idx] = encode_paving(index) | (self.tiles[idx] & WATER_BIT);
+            }
+        }
+    }
+
+    /// Clear a paved tile — only if it still holds exactly this paving
+    /// type's content (a resource that later overwrote it is never erased).
+    /// The terrain water bit is preserved.
+    pub fn clear_paving(&mut self, x: i32, z: i32, paving_type_id: i32) {
+        let Some(index) = self.paving_index_by_id.get(&paving_type_id).copied() else {
+            return;
+        };
+        if let Some(idx) = world_to_local(self.region, x, z).and_then(|(lx, lz)| overlay_index(lx, lz)) {
+            if self.tiles[idx] & CONTENT_MASK == encode_paving(index) {
+                self.tiles[idx] &= WATER_BIT;
+            }
+        }
+    }
+
+    /// Fill the water bit across the whole map from the terrain grid
+    /// (called once after the terrain seed flush, and again after rare live
+    /// terrain writes). A super-hex is water when its elevation is below its
+    /// water level; the flag applies to its 3×3 small tiles — terrain
+    /// resolution is the super-hex. Terrain never flips water↔land, so this
+    /// only ever sets the bit; content words already stamped are untouched
+    /// (OR semantics), and later writes preserve the bit.
+    pub fn fill_water_from_terrain(&mut self, terrain: &SuperHexTerrainGrid) {
+        for sz in 0..SUPER_SIDE {
+            for sx in 0..SUPER_SIDE {
+                let (elev, water) = unpack_terrain_water(terrain.get(sx, sz));
+                if elev >= water {
+                    continue; // land, or no water data (level = i16::MIN / 0)
+                }
+                for dz in 0..3 {
+                    for dx in 0..3 {
+                        if let Some(idx) = overlay_index(sx * 3 + dx, sz * 3 + dz) {
+                            self.tiles[idx] |= WATER_BIT;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Insert or update a resource entity. `loc` is the current overworld
@@ -263,12 +394,13 @@ impl ResourceTileMap {
         Some((self.ids[node.index as usize], node.loc))
     }
 
-    /// Decoded tile contents at region-local `(lx, lz)`; `None` when empty
-    /// or out of bounds.
+    /// Decoded tile contents at region-local `(lx, lz)`; `None` when empty,
+    /// out of bounds, or a paving tile (the roads resources endpoint is
+    /// resource-only; paving surfaces via the window + dictionary).
     pub fn resource_at_local(&self, lx: i32, lz: i32) -> Option<ResourceTile> {
         let idx = overlay_index(lx, lz)?;
         let word = self.tiles[idx];
-        if word == 0 {
+        if !tile_has_content(word) || tile_is_paving(word) {
             return None;
         }
         let resource_id = self.ids.get(tile_index(word) as usize).copied().unwrap_or(0);
@@ -280,6 +412,19 @@ impl ResourceTileMap {
             direction: tile_direction(word),
             is_origin: tile_is_origin(word),
         })
+    }
+
+    /// Raw paving type at region-local `(lx, lz)`, if the tile is paved.
+    pub fn paving_at_local(&self, lx: i32, lz: i32) -> Option<i32> {
+        let idx = overlay_index(lx, lz)?;
+        let word = self.tiles[idx];
+        if !tile_is_paving(word) {
+            return None;
+        }
+        self.paving_ids
+            .get(tile_index(word) as usize)
+            .copied()
+            .filter(|&id| id != 0)
     }
 
     /// `width`×`width` window of tile words (u16 LE, row-major) anchored at
@@ -316,12 +461,18 @@ impl ResourceTileMap {
         &self.ids
     }
 
-    /// FNV-1a over the dictionary id sequence in index order (sentinel
-    /// excluded). Stable until a new resource type is interned. Computed on
-    /// demand — at most 1023 ids, so it works off a shared read guard.
+    /// Paving namespace ids by index; `paving_ids[0] == 0` is the sentinel.
+    pub fn dict_paving_ids(&self) -> &[i32] {
+        &self.paving_ids
+    }
+
+    /// FNV-1a over the resource id sequence, then the paving id sequence
+    /// (sentinels excluded). Stable until a new type is interned in either
+    /// namespace. Computed on demand — at most ~2046 ids, so it works off a
+    /// shared read guard.
     pub fn dict_version(&self) -> u32 {
         let mut h = 0x811c_9dc5u32;
-        for id in &self.ids[1..] {
+        for id in self.ids.iter().chain(self.paving_ids.iter()).skip(1) {
             for b in id.to_le_bytes() {
                 h ^= u32::from(b);
                 h = h.wrapping_mul(0x0100_0193);
@@ -330,11 +481,13 @@ impl ResourceTileMap {
         h
     }
 
-    /// Stamp one footprint and return the tiles actually written (index +
-    /// word), for exact clearing later. Multi-hex shapes overwrite whatever
-    /// occupies their tiles; a single-hex newcomer onto an occupied tile is
-    /// skipped — the world does spawn forageables under multi-hex resources,
-    /// and the visible (bigger) occupant should keep the tile.
+    /// Stamp one footprint and return the content words actually written
+    /// (index + word, water bit excluded), for exact clearing later.
+    /// Multi-hex shapes overwrite whatever occupies their tiles; a
+    /// single-hex newcomer onto an occupied tile is skipped — the world does
+    /// spawn forageables under multi-hex resources, and the visible (bigger)
+    /// occupant should keep the tile. Water-only tiles count as empty, and
+    /// the terrain water bit rides along on every written word.
     fn stamp_footprint(&mut self, origin: (i32, i32), index: u16, direction: u8) -> Vec<(u32, u16)> {
         let offsets: &[(i32, i32)] = self.footprints.get(&index).map(|b| &b[..]).unwrap_or(&SINGLE_HEX);
         let multi = offsets.len() > 1;
@@ -344,22 +497,23 @@ impl ResourceTileMap {
             let Some(idx) = world_to_local(region, x, z).and_then(|(lx, lz)| overlay_index(lx, lz)) else {
                 continue;
             };
-            if !multi && self.tiles[idx] != 0 {
+            if !multi && tile_has_content(self.tiles[idx]) {
                 continue;
             }
             let word = encode_tile(index, direction, (x, z) == origin);
-            self.tiles[idx] = word;
+            self.tiles[idx] = word | (self.tiles[idx] & WATER_BIT);
             owned.push((idx as u32, word));
         }
         owned
     }
 
-    /// Zero exactly the tiles this entity wrote. A tile a later overlapping
-    /// resource re-stamped carries a different word and is left alone.
+    /// Zero exactly the content this entity wrote. A tile a later
+    /// overlapping resource re-stamped carries different content and is left
+    /// alone; the terrain water bit always survives.
     fn unstamp(&mut self, owned: &[(u32, u16)]) {
         for &(idx, word) in owned {
-            if self.tiles[idx as usize] == word {
-                self.tiles[idx as usize] = 0;
+            if self.tiles[idx as usize] & CONTENT_MASK == word {
+                self.tiles[idx as usize] &= WATER_BIT;
             }
         }
     }
@@ -565,5 +719,139 @@ mod tests {
         // Later arriving in-region location still lands.
         m.set_location(1, 12, 34);
         assert_eq!(tiles_at(&m, &[(12, 34)]).len(), 1);
+    }
+
+    const PAVING_TYPE_A: i32 = 1;
+    const PAVING_TYPE_B: i32 = 59838;
+
+    #[test]
+    fn paving_stamps_clears_and_interns_separately() {
+        let mut m = map();
+        m.stamp_paving(10, 20, PAVING_TYPE_A);
+        // Paving words are invisible to the resources endpoint…
+        assert!(m.resource_at_local(10, 20).is_none());
+        // …but present as bit-14 words, one index per paving type.
+        m.stamp_paving(12, 20, PAVING_TYPE_B);
+        assert_eq!(m.paving_at_local(10, 20), Some(PAVING_TYPE_A));
+        assert_eq!(m.paving_at_local(12, 20), Some(PAVING_TYPE_B));
+
+        // Dict version covers the paving namespace.
+        let v1 = m.dict_version();
+        m.stamp_paving(14, 20, 884); // new type interned
+        assert_ne!(m.dict_version(), v1);
+        assert_eq!(m.dict_paving_ids()[1], PAVING_TYPE_A);
+        assert_eq!(m.dict_paving_ids()[2], PAVING_TYPE_B);
+
+        // Clearing matches type exactly.
+        m.clear_paving(10, 20, PAVING_TYPE_B); // wrong type: no-op
+        assert_eq!(m.paving_at_local(10, 20), Some(PAVING_TYPE_A));
+        m.clear_paving(10, 20, PAVING_TYPE_A);
+        assert_eq!(m.paving_at_local(10, 20), None);
+        // Out-of-region clear/stamp are no-ops.
+        m.stamp_paving(-5, 0, PAVING_TYPE_A);
+        m.clear_paving(-5, 0, PAVING_TYPE_A);
+    }
+
+    #[test]
+    fn paving_yields_to_resources_and_never_erases_them() {
+        let mut m = map();
+        m.note_desc(BUTTON_MUSHROOMS, &[]);
+        m.note_desc(MUD_MOUND, &[(0, 0), (0, -1), (-1, 0)]);
+
+        // Resource first: paving does not clobber it…
+        m.upsert(1, BUTTON_MUSHROOMS, 0, Some((10, 20)));
+        m.stamp_paving(10, 20, PAVING_TYPE_A);
+        assert_eq!(m.resource_at_local(10, 20).unwrap().resource_id, BUTTON_MUSHROOMS);
+        assert_eq!(m.paving_at_local(10, 20), None);
+
+        // …and removing the paving leaves the resource untouched.
+        m.clear_paving(10, 20, PAVING_TYPE_A);
+        assert_eq!(m.resource_at_local(10, 20).unwrap().resource_id, BUTTON_MUSHROOMS);
+
+        // Paving first, multi-hex resource second: the resource overwrites,
+        // and paving removal does not punch a hole in the resource.
+        m.stamp_paving(30, 40, PAVING_TYPE_A);
+        m.upsert(2, MUD_MOUND, 0, Some((30, 40)));
+        assert_eq!(m.resource_at_local(30, 40).unwrap().resource_id, MUD_MOUND);
+        assert_eq!(m.paving_at_local(30, 40), None);
+        m.clear_paving(30, 40, PAVING_TYPE_A);
+        assert_eq!(m.resource_at_local(30, 40).unwrap().resource_id, MUD_MOUND);
+
+        // Multi-hex resource removed: its tiles zero (paving was consumed).
+        m.delete(2);
+        assert!(m.resource_at_local(30, 40).is_none());
+    }
+
+    const WATER_LEVEL: i16 = 10;
+
+    fn terrain_with_water(water_super_hexes: &[(i32, i32)]) -> SuperHexTerrainGrid {
+        let mut terrain = SuperHexTerrainGrid::new();
+        for &(sx, sz) in water_super_hexes {
+            terrain.set(sx, sz, crate::roads::grid::pack_terrain(0, 0, WATER_LEVEL, 1));
+        }
+        terrain
+    }
+
+    #[test]
+    fn water_fill_and_retention_across_writes() {
+        let mut m = map();
+        m.note_desc(BUTTON_MUSHROOMS, &[]);
+
+        // Super-hex (0,0) covers region-local tiles (0..3, 0..3): water.
+        // (10, 20) lives in super-hex (3, 6): land.
+        m.fill_water_from_terrain(&terrain_with_water(&[(0, 0)]));
+
+        // Water-only tile: no content, water bit set.
+        assert!(!tile_has_content(m.tiles[overlay_index(0, 0).unwrap()]));
+        assert_eq!(m.tiles[overlay_index(0, 0).unwrap()] & WATER_BIT, WATER_BIT);
+        assert!(m.resource_at_local(0, 0).is_none());
+        assert_eq!(m.paving_at_local(0, 0), None);
+
+        // Land tile untouched.
+        assert_eq!(m.tiles[overlay_index(10, 20).unwrap()], 0);
+
+        // Resource stamped onto a water tile keeps the water bit…
+        m.upsert(1, BUTTON_MUSHROOMS, 0, Some((1, 1)));
+        let word = m.tiles[overlay_index(1, 1).unwrap()];
+        assert_ne!(word & WATER_BIT, 0, "water bit rides on resource words");
+        assert_eq!(m.resource_at_local(1, 1).unwrap().resource_id, BUTTON_MUSHROOMS);
+
+        // …and survives the resource's removal.
+        m.delete(1);
+        assert!(m.resource_at_local(1, 1).is_none());
+        assert_ne!(m.tiles[overlay_index(1, 1).unwrap()] & WATER_BIT, 0);
+
+        // Paving on water: same retention, both ways.
+        m.stamp_paving(2, 2, PAVING_TYPE_A);
+        assert_ne!(m.tiles[overlay_index(2, 2).unwrap()] & WATER_BIT, 0);
+        m.clear_paving(2, 2, PAVING_TYPE_A);
+        assert_ne!(m.tiles[overlay_index(2, 2).unwrap()] & WATER_BIT, 0);
+        assert_eq!(m.paving_at_local(2, 2), None);
+
+        // A water-only tile counts as empty: paving can land on it.
+        m.stamp_paving(0, 0, PAVING_TYPE_A);
+        assert_eq!(m.paving_at_local(0, 0), Some(PAVING_TYPE_A));
+        m.clear_paving(0, 0, PAVING_TYPE_A);
+        assert_eq!(m.paving_at_local(0, 0), None);
+        assert_ne!(m.tiles[overlay_index(0, 0).unwrap()] & WATER_BIT, 0);
+    }
+
+    #[test]
+    fn land_tiles_stay_dry_and_missing_terrain_defaults_to_land() {
+        let mut m = map();
+        // No fill call: missing terrain defaults to ground (bit unset).
+        m.note_desc(BUTTON_MUSHROOMS, &[]);
+        m.upsert(1, BUTTON_MUSHROOMS, 0, Some((10, 20)));
+        assert_eq!(m.tiles[overlay_index(10, 20).unwrap()] & WATER_BIT, 0);
+
+        // A fill with no water super-hexes sets nothing.
+        m.fill_water_from_terrain(&terrain_with_water(&[]));
+        assert_eq!(m.tiles[overlay_index(10, 20).unwrap()] & WATER_BIT, 0);
+
+        // Water level below elevation (dry basin) is land.
+        let mut dry = SuperHexTerrainGrid::new();
+        dry.set(1, 1, crate::roads::grid::pack_terrain(50, 50, WATER_LEVEL, 1));
+        m.fill_water_from_terrain(&dry);
+        assert_eq!(m.tiles[overlay_index(3, 3).unwrap()] & WATER_BIT, 0);
     }
 }
