@@ -111,8 +111,8 @@ pub fn cli() -> clap::Command {
                 .long("public-mirror-v1")
                 .action(SetTrue)
                 .help(
-                    "Run as an in-memory public-mirror-v1 of a remote v1 BSATN database \
-                     (forces in-memory storage; rejects CallReducer)",
+                    "Run as an in-memory public-mirror of a remote database, ingesting over \
+                     WebSocket v2 (v2.bsatn.spacetimedb; forces in-memory storage; rejects CallReducer)",
                 ),
         )
         .arg(
