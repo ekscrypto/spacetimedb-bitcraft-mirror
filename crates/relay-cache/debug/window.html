@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Bit-Me resource window debug — odd-r hex grid</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #0d1117; color: #c9d1d9; font: 13px/1.5 -apple-system, BlinkMacSystemFont, sans-serif; }
+  header { padding: 10px 14px; border-bottom: 1px solid #30363d; display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
+  header h1 { font-size: 15px; margin: 0 8px 0 0; }
+  label { color: #8b949e; }
+  input, select { background: #161b22; color: #c9d1d9; border: 1px solid #30363d; border-radius: 4px; padding: 3px 6px; }
+  input[type=text] { width: 170px; }
+  #status { padding: 6px 14px; font-family: ui-monospace, monospace; white-space: pre-wrap; border-bottom: 1px solid #30363d; color: #8b949e; }
+  #status .err { color: #f85149; }
+  #status .ok { color: #3fb950; }
+  #scroller { overflow: auto; height: calc(100vh - 92px); }
+  canvas { display: block; image-rendering: auto; }
+  #tip { position: fixed; pointer-events: none; background: #161b22ee; border: 1px solid #30363d;
+         border-radius: 4px; padding: 6px 9px; font-family: ui-monospace, monospace; font-size: 12px;
+         display: none; z-index: 10; max-width: 340px; }
+  #legend { padding: 6px 14px; border-top: 1px solid #30363d; font-size: 12px; color: #8b949e; }
+</style>
+</head>
+<body>
+<header>
+  <h1>resource window debug</h1>
+  <label>relay <input type="text" id="base" value="http://127.0.0.1:8091"></label>
+  <label>player <input type="text" id="player" value="Maplesugar"></label>
+  <label>hex size <input type="range" id="zoom" min="3" max="16" step="0.5" value="6"> <span id="zoomval">6</span></label>
+  <label><input type="checkbox" id="labels" checked> coordinate labels</label>
+  <button id="refresh">refresh now</button>
+  <span id="countdown" style="color:#8b949e"></span>
+</header>
+<div id="status">starting…</div>
+<div id="scroller"><canvas id="cv"></canvas></div>
+<div id="legend">north is up · odd-r offset (odd world rows shifted right) · pointy-top hexes ·
+dot = origin tile of the instance · outline = connected tiles of one resource type ·
+hover a tile for details</div>
+<div id="tip"></div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const INDEX_MASK = 0x03FF, ORIGIN_BIT = 1 << 10, DIR_SHIFT = 11;
+const WIDTH = 400;
+
+let dict = null;            // { dict_version, byIndex: Map(index -> entry) }
+let window_ = null;         // parsed window snapshot
+let hoverTile = null;
+
+// --- parsing ---------------------------------------------------------------
+
+function parseWindow(buf) {
+  const b = new Uint8Array(buf);
+  if (b.length < 24) throw new Error(`window too small: ${b.length} bytes`);
+  const magic = String.fromCharCode(b[0], b[1], b[2], b[3]);
+  if (magic !== "BMR1") throw new Error(`bad magic ${magic}`);
+  const dv = new DataView(buf);
+  const words = new Array(WIDTH * WIDTH);
+  for (let i = 0; i < WIDTH * WIDTH; i++) {
+    const o = 24 + i * 2;
+    words[i] = b[o] | (b[o + 1] << 8);
+  }
+  return {
+    magic, version: dv.getUint16(4, true), width: dv.getUint16(6, true),
+    originX: dv.getInt32(8, true), originZ: dv.getInt32(12, true),
+    region: dv.getUint32(16, true), dictVersion: dv.getUint32(20, true),
+    words,
+  };
+}
+
+// --- odd-r pointy-top layout (north up) -------------------------------------
+
+let geom = null;
+function computeGeom() {
+  const s = parseFloat($("zoom").value);
+  const w = Math.sqrt(3) * s;
+  const width = Math.ceil(w * (WIDTH + 0.5) + s);
+  const height = Math.ceil(1.5 * s * (WIDTH - 1) + 2 * s);
+  geom = { s, w, width, height };
+  const cv = $("cv");
+  cv.width = width; cv.height = height;
+  cv.style.width = width + "px"; cv.style.height = height + "px";
+}
+
+// world row parity drives the odd-r shift, not the relative row
+const rowParity = r => (window_.originZ + r) & 1;
+function centerPx(c, r) {
+  const { s, w, height } = geom;
+  return [w * (c + 0.5 * rowParity(r)) + s, height - (1.5 * s * r + s)];
+}
+// 6 neighbor deltas in odd-r offset space, keyed by world-row parity
+function neighbors(c, r) {
+  const odd = rowParity(r);
+  return odd
+    ? [[c+1,r],[c+1,r-1],[c,r-1],[c-1,r],[c,r+1],[c+1,r+1]]
+    : [[c+1,r],[c,r-1],[c-1,r-1],[c-1,r],[c-1,r+1],[c,r+1]];
+}
+function cornerPx(cx, cy, deg) {
+  const a = deg * Math.PI / 180;
+  return [cx + geom.s * Math.cos(a), cy - geom.s * Math.sin(a)];
+}
+
+function hue(index) { return (index * 137.508) % 360; }
+
+// --- rendering ----------------------------------------------------------------
+
+function render() {
+  if (!window_) return;
+  computeGeom();
+  const cv = $("cv"), ctx = cv.getContext("2d");
+  const { s, w, width, height } = geom;
+  ctx.clearRect(0, 0, width, height);
+
+  const idxAt = (c, r) =>
+    (c < 0 || r < 0 || c >= WIDTH || r >= WIDTH) ? 0
+      : (window_.words[r * WIDTH + c] & INDEX_MASK);
+
+  // Ground layer: continuous light-blue water everywhere, with land hexes
+  // painted opaquely on top (stroked in the same color to seal the
+  // anti-aliased seams between neighboring hexes).
+  {
+    ctx.fillStyle = "#6ea8fe";
+    ctx.fillRect(0, 0, width, height);
+    const land = new Path2D();
+    for (let r = 0; r < WIDTH; r++) {
+      const parity = rowParity(r);
+      for (let c = 0; c < WIDTH; c++) {
+        if (window_.words[r * WIDTH + c] & (1 << 15)) continue; // water
+        const [cx, cy] = centerPx(c, r);
+        for (let k = 0; k < 6; k++) {
+          const [x1, y1] = cornerPx(cx, cy, 60 * k - 90);
+          const [x2, y2] = cornerPx(cx, cy, 60 * (k + 1) - 90);
+          if (k === 0) land.moveTo(x1, y1); else land.lineTo(x1, y1);
+          land.lineTo(x2, y2);
+        }
+      }
+    }
+    ctx.fillStyle = "#161b22";
+    ctx.strokeStyle = "#161b22";
+    ctx.lineWidth = 1;
+    ctx.fill(land);
+    ctx.stroke(land);
+  }
+
+  // filled hexes, batched per dictionary index
+  const byIndex = new Map();
+  for (let r = 0; r < WIDTH; r++) {
+    for (let c = 0; c < WIDTH; c++) {
+      const idx = idxAt(c, r);
+      if (!idx) continue;
+      if (!byIndex.has(idx)) byIndex.set(idx, new Path2D());
+      const p = byIndex.get(idx), [cx, cy] = centerPx(c, r);
+      for (let k = 0; k < 6; k++) {
+        const [x1, y1] = cornerPx(cx, cy, 60 * k - 90);
+        const [x2, y2] = cornerPx(cx, cy, 60 * (k + 1) - 90);
+        if (k === 0) p.moveTo(x1, y1); else p.lineTo(x1, y1);
+        p.lineTo(x2, y2);
+      }
+    }
+  }
+  for (const [idx, p] of byIndex) {
+    ctx.fillStyle = `hsl(${hue(idx)} 70% 55% / 0.75)`;
+    ctx.fill(p);
+  }
+
+  // instance outlines: boundary edges of connected same-index components
+  const seen = new Uint8Array(WIDTH * WIDTH);
+  const outline = new Path2D();
+  const origins = new Path2D();
+  for (let r0 = 0; r0 < WIDTH; r0++) {
+    for (let c0 = 0; c0 < WIDTH; c0++) {
+      const idx = idxAt(c0, r0);
+      if (!idx || seen[r0 * WIDTH + c0]) continue;
+      const stack = [[c0, r0]];
+      seen[r0 * WIDTH + c0] = 1;
+      while (stack.length) {
+        const [c, r] = stack.pop();
+        const [cx, cy] = centerPx(c, r);
+        const word = window_.words[r * WIDTH + c];
+        if (word & ORIGIN_BIT) {  // origin marker
+          const [ox, oy] = cornerPx(cx, cy, 90);
+          origins.moveTo(ox, oy);
+          origins.arc(cx, cy, Math.max(1.2, s * 0.22), 0, 2 * Math.PI);
+        }
+        // boundary edges: neighbor center angle θ → shared corners θ±30
+        for (const [nc, nr] of neighbors(c, r)) {
+          if (idxAt(nc, nr) === idx) {
+            if (!seen[nr * WIDTH + nc]) { seen[nr * WIDTH + nc] = 1; stack.push([nc, nr]); }
+            continue;
+          }
+          const [nx, ny] = centerPx(nc, nr);
+          const deg = Math.atan2(cy - ny, nx - cx) * 180 / Math.PI; // screen y flipped
+          const [ax, ay] = cornerPx(cx, cy, deg - 30);
+          const [bx, by] = cornerPx(cx, cy, deg + 30);
+          outline.moveTo(ax, ay);
+          outline.lineTo(bx, by);
+        }
+      }
+    }
+  }
+  ctx.strokeStyle = "#0d1117";
+  ctx.lineWidth = Math.max(1, s * 0.14);
+  ctx.stroke(outline);
+  ctx.fillStyle = "#ffffff";
+  ctx.fill(origins);
+
+  // coordinate labels every 20 tiles (world tiles)
+  if ($("labels").checked && s >= 5) {
+    ctx.fillStyle = "#8b949e";
+    ctx.font = `${Math.max(8, s * 1.6)}px ui-monospace, monospace`;
+    ctx.textAlign = "center";
+    for (let c = 0; c < WIDTH; c += 20) {
+      const [cx, cy] = centerPx(c, 0);
+      ctx.fillText(String(window_.originX + c), cx + (rowParity(0) ? w / 2 : 0), height - 2);
+    }
+    for (let r = 0; r < WIDTH; r += 20) {
+      const [cx, cy] = centerPx(0, r);
+      ctx.textAlign = "left";
+      ctx.fillText(String(window_.originZ + r), 1, cy + s * 0.4);
+    }
+  }
+
+  // player marker at the window anchor (relative 200,200)
+  {
+    const [cx, cy] = centerPx(200, 200);
+    ctx.strokeStyle = "#58a6ff"; ctx.lineWidth = Math.max(1.5, s * 0.2);
+    ctx.beginPath(); ctx.arc(cx, cy, Math.max(2.5, s * 0.5), 0, 2 * Math.PI); ctx.stroke();
+  }
+}
+
+// --- data plumbing --------------------------------------------------------------
+
+async function jget(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw Object.assign(new Error(`HTTP ${r.status} for ${url}`), { status: r.status, body: await r.text() });
+  return r.json();
+}
+
+let playerRows = [];
+
+async function refresh() {
+  const base = $("base").value.replace(/\/$/, "");
+  const name = $("player").value.trim();
+  const st = $("status");
+  try {
+    if (!playerRows.length) {
+      playerRows = await jget(`${base}/player?name=${encodeURIComponent(name)}`);
+      // signed-in players first: their live shard has fresher position rows
+      playerRows.sort((a, b) => (b.signed_in === true) - (a.signed_in === true));
+    }
+    if (!playerRows.length) throw new Error(`no player matching "${name}"`);
+
+    let ok = false, lastErr = null;
+    for (const row of playerRows) {
+      try {
+        const r = await fetch(`${base}/bitme/session/${row.entity_id}/resources`);
+        if (r.ok) {
+          window_ = parseWindow(await r.arrayBuffer());
+          if (!dict || dict.dict_version !== window_.dictVersion) {
+            dict = await jget(`${base}/bitme/region/${row.region}/resource-dictionary`);
+            // Resources and paving live in separate 10-bit index namespaces,
+            // discriminated by tile-word bit 14.
+            dict.byIndex = new Map(dict.entries.map(e => [e.paving === true ? `p${e.index}` : `r${e.index}`, e]));
+            if (dict.dict_version !== window_.dictVersion)
+              console.warn("dictionary version mismatch after refetch", dict.dict_version, window_.dictVersion);
+          }
+          render();
+          const occupied = window_.words.reduce((n, w) => n + (w & INDEX_MASK ? 1 : 0), 0);
+          let pos = "position unknown";
+          try {
+            const session = await jget(`${base}/bitme/session/${row.entity_id}`);
+            pos = `player ${session.username} tile (${session.position.tile_x}, ${session.position.tile_z})` +
+              ` dim ${session.position.dimension}${session.position.dimension === 1 ? "" : " (interior!)"}`;
+          } catch (_) { /* session snapshot is optional here */ }
+          st.innerHTML = `<span class="ok">ok</span> · ${pos} · entity ${row.entity_id} · region ${window_.region}` +
+            ` · window origin (${window_.originX}, ${window_.originZ}) → (${window_.originX + 399}, ${window_.originZ + 399})` +
+            ` · dict v${window_.dictVersion} (${dict.entries.length} types)` +
+            ` · occupied ${occupied}/160000 tiles` +
+            ` · fetched ${new Date().toLocaleTimeString()}`;
+          ok = true;
+          break;
+        }
+        lastErr = new Error(`${r.status} ${await r.text()}`);
+      } catch (e) { lastErr = e; }
+    }
+    if (!ok) throw lastErr;
+  } catch (e) {
+    st.innerHTML = `<span class="err">${new Date().toLocaleTimeString()} — ${e.message}` +
+      (e.body ? ` — ${e.body}` : "") + `</span>\nretrying in 10s`;
+  }
+}
+
+// --- hover tooltip -----------------------------------------------------------
+
+$("cv").addEventListener("mousemove", ev => {
+  if (!window_ || !geom) return;
+  const rect = $("cv").getBoundingClientRect();
+  const px = ev.clientX - rect.left, py = ev.clientY - rect.top;
+  const { s, w, height } = geom;
+  let best = null, bestD = Infinity;
+  const rGuess = Math.round((height - py - s) / (1.5 * s));
+  for (let r = rGuess - 1; r <= rGuess + 1; r++) {
+    if (r < 0 || r >= WIDTH) continue;
+    const cGuess = Math.round((px - s) / w - 0.5 * rowParity(r));
+    for (let c = cGuess - 1; c <= cGuess + 1; c++) {
+      if (c < 0 || c >= WIDTH) continue;
+      const [cx, cy] = centerPx(c, r);
+      const d = (cx - px) ** 2 + (cy - py) ** 2;
+      if (d < bestD) { bestD = d; best = [c, r, cx, cy]; }
+    }
+  }
+  const tip = $("tip");
+  if (!best || bestD > (2 * s) ** 2) { tip.style.display = "none"; return; }
+  const [c, r] = best;
+  const word = window_.words[r * WIDTH + c];
+  const isPaving = (word & (1 << 14)) !== 0;
+  const isWater = (word & (1 << 15)) !== 0;
+  const idx = word & 0x03FF;
+  const wx = window_.originX + c, wz = window_.originZ + r;
+  const entry = idx ? (dict && dict.byIndex.get(isPaving ? `p${idx}` : `r${idx}`)) : null;
+  tip.innerHTML = `tile (${wx}, ${wz}) <span style="color:#8b949e">rel ${c},${r}${isWater ? " · water" : ""}</span><br>` +
+    (idx
+      ? `<b style="color:hsl(${hue(idx)} 70% 65%)">${entry ? entry.name : "?"}</b><br>` +
+        (isPaving
+          ? `PAVING · paving_type_id ${entry ? entry.paving_type_id : "?"} · index ${idx}`
+          : `resource_id ${entry ? entry.resource_id : "?"} · index ${idx}<br>` +
+            `direction ${(word >> 11) & 7} · ${word & (1 << 10) ? "ORIGIN tile" : "footprint tile"}`) +
+        (entry && !isPaving ? `<br>harvestable: ${entry.harvestable} · max_health ${entry.max_health}` : "")
+      : (isWater ? "water" : "empty"));
+  tip.style.display = "block";
+  tip.style.left = (ev.clientX + 14) + "px";
+  tip.style.top = (ev.clientY + 14) + "px";
+});
+$("cv").addEventListener("mouseleave", () => $("tip").style.display = "none");
+
+// --- wiring -----------------------------------------------------------------
+
+$("refresh").addEventListener("click", () => { playerRows = []; refresh(); });
+$("player").addEventListener("change", () => { playerRows = []; refresh(); });
+$("base").addEventListener("change", () => { playerRows = []; dict = null; refresh(); });
+$("zoom").addEventListener("input", () => { $("zoomval").textContent = $("zoom").value; render(); });
+$("labels").addEventListener("change", render);
+
+let nextAt = Date.now();
+setInterval(() => {
+  $("countdown").textContent = `next refresh in ${Math.max(0, Math.ceil((nextAt - Date.now()) / 1000))}s`;
+}, 250);
+setInterval(() => { nextAt = Date.now() + 10000; refresh(); }, 10000);
+refresh().then(() => { nextAt = Date.now() + 10000; });
+</script>
+</body>
+</html>

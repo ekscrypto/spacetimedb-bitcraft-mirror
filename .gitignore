@@ -268,3 +268,6 @@ nul
 
 # Any local file
 *.local
+
+# relay-cache debug tooling (overriding the global debug/ ignore above)
+!crates/relay-cache/debug/
