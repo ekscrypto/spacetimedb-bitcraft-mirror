@@ -1,4 +1,11 @@
-//! v1.bsatn.spacetimedb WebSocket upstream client.
+//! v2.bsatn.spacetimedb WebSocket upstream client.
+//!
+//! BitCraft SpacetimeDB v2 upstreams no longer carry reducer context on the
+//! v1 protocol (v1 light frames only) and reject event-table subscriptions
+//! entirely on v1 ("Subscribing to event tables requires WebSocket v2"), so
+//! the mirror ingests over v2 and re-serves all client protocol versions
+//! downstream. v2 `TransactionUpdate`s have no reducer provenance; mirrored
+//! updates apply with `provenance: None`.
 //!
 //! # Session architecture
 //!
@@ -13,7 +20,7 @@
 //!
 //! Apply ordering is preserved: the queue is strictly FIFO — seeds and live
 //! updates apply in arrival order. On the initial cold start, wire seeds are
-//! queued as they arrive and the next table's `SubscribeMulti` is sent
+//! queued as they arrive and the next table's `Subscribe` is sent
 //! immediately; local apply catches up on the dedicated DB thread while
 //! upstream keeps sending. **Re-seeds are paced** (each table's seed applies
 //! locally before the next downloads) so a reconnecting region's decode and
@@ -42,11 +49,11 @@ use futures_util::{SinkExt, StreamExt};
 use http::header::{AUTHORIZATION, SEC_WEBSOCKET_PROTOCOL};
 use spacetimedb::util::thread_scheduling::deprioritize_mirror_background_thread;
 use spacetimedb_client_api_messages::websocket::common::{
-    QuerySetId, SERVER_MSG_COMPRESSION_TAG_BROTLI, SERVER_MSG_COMPRESSION_TAG_GZIP, SERVER_MSG_COMPRESSION_TAG_NONE,
+    QuerySetId, RowListLen, SERVER_MSG_COMPRESSION_TAG_BROTLI, SERVER_MSG_COMPRESSION_TAG_GZIP,
+    SERVER_MSG_COMPRESSION_TAG_NONE,
 };
-use spacetimedb_client_api_messages::websocket::v1::{
-    BsatnFormat, ClientMessage, CompressableQueryUpdate, DatabaseUpdate, OneOffQuery, QueryUpdate, ServerMessage,
-    SubscribeMulti, TransactionUpdate, TransactionUpdateLight, UpdateStatus,
+use spacetimedb_client_api_messages::websocket::v2::{
+    ClientMessage, OneOffQuery, QueryRows, ServerMessage, Subscribe, TableUpdateRows, TransactionUpdate,
 };
 use spacetimedb_lib::{bsatn, ConnectionId, Identity, ProductValue, Timestamp};
 use spacetimedb_sats::{ProductType, WithTypespace};
@@ -65,7 +72,7 @@ use crate::coordinator_client::CoordinatorPermit;
 use crate::observer::MirrorObserverRegistry;
 use crate::status::{ByteCounter, MirrorStatusHandle, SeedApplyProgress};
 
-const SUBPROTOCOL_V1: &str = "v1.bsatn.spacetimedb";
+const SUBPROTOCOL_V2: &str = spacetimedb_client_api_messages::websocket::v2::BIN_PROTOCOL;
 
 /// Client-initiated WS Ping interval. Matches relay-upstream / relay-cache wire:
 /// keep the write path polled so tungstenite auto-Pongs flush during multi-GiB
@@ -76,8 +83,8 @@ const CLIENT_PING_INTERVAL: Duration = Duration::from_secs(10);
 ///
 /// WS Ping/Pong only proves the TCP flow (or a proxy) is alive — not that the
 /// upstream *application* is still processing requests. Every
-/// [`PROBE_INTERVAL`] after live starts we send a v1 `OneOffQuery` ("SELECT 1");
-/// if no `OneOffQueryResponse` arrives within [`PROBE_TIMEOUT`], the session
+/// [`PROBE_INTERVAL`] after live starts we send a v2 `OneOffQuery` ("SELECT 1");
+/// if no `OneOffQueryResult` arrives within [`PROBE_TIMEOUT`], the session
 /// errors and reconnects. That catches the "up but silent" failure mode where
 /// connectivity stays `live` but transactions freeze.
 const PROBE_INTERVAL: Duration = Duration::from_secs(60);
@@ -88,7 +95,10 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 /// timeouts in the calibrated repro were false). Only a probe unanswered
 /// this long **with bytes flowing** is treated as a real failure.
 const PROBE_LATE_HARD_TIMEOUT: Duration = Duration::from_secs(150);
-const PROBE_MESSAGE_ID: &[u8] = b"PUBLIC_MIRROR_PROBE";
+/// Reserved `request_id` for the liveness probe. v2 `OneOffQueryResult`s are
+/// not correlated by id (any response proves the app is processing), but a
+/// dedicated id keeps the probe recognizable in wire logs.
+const PROBE_REQUEST_ID: u32 = u32::MAX;
 /// How often to poll an in-flight probe against [`PROBE_TIMEOUT`].
 const PROBE_DEADLINE_POLL: Duration = Duration::from_secs(5);
 
@@ -98,7 +108,7 @@ const PROBE_DEADLINE_POLL: Duration = Duration::from_secs(5);
 /// (30s) deadlines above have started to slip.
 const EVENT_LOOP_LAG_WARN: Duration = Duration::from_secs(5);
 
-/// Absolute per-table cap waiting for `SubscribeMultiApplied`. Safety net only:
+/// Absolute per-table cap waiting for `SubscribeApplied`. Safety net only:
 /// the *stall* timeout below is the operative one, so a slow-but-progressing
 /// multi-GiB seed is never killed while bytes are still arriving.
 const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
@@ -108,9 +118,9 @@ const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 /// however slowly — keeps the wait alive.
 const SUBSCRIBE_STALL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
-/// Wait for the post-connect `IdentityToken`. This wait holds a subscribe-gate
-/// slot, so it must not be generous: a dead server here would otherwise park
-/// the whole fleet.
+/// Wait for the post-connect `InitialConnection` identity message. This wait
+/// holds a subscribe-gate slot, so it must not be generous: a dead server here
+/// would otherwise park the whole fleet.
 const IDENTITY_TOKEN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Frames at/above this size are decompressed + BSATN-decoded on the blocking
@@ -161,7 +171,9 @@ impl Default for UpstreamConfig {
     }
 }
 
-/// Upstream reducer provenance from a committed v1 `TransactionUpdate`.
+/// Upstream reducer provenance (v1-era). v2 upstreams carry no reducer
+/// context, so v2-sourced updates always apply with `provenance: None`; the
+/// plumbing stays because downstream broadcasts still accept it.
 #[derive(Debug, Clone)]
 pub struct UpstreamProvenance {
     pub reducer_name: String,
@@ -194,7 +206,7 @@ pub struct UpstreamUpdate {
     /// `None` for subscribe-applied seed rows; `Some` for committed transaction updates.
     pub provenance: Option<UpstreamProvenance>,
     pub tables: Vec<UpstreamTableOps>,
-    /// `true` for a `SubscribeMultiApplied` snapshot: the local table is cleared
+    /// `true` for a `SubscribeApplied` snapshot: the local table is cleared
     /// before inserting so reconnect re-seeds converge instead of hitting unique
     /// constraint violations on rows left over from the previous session.
     pub is_seed: bool,
@@ -222,7 +234,7 @@ pub enum UpstreamError {
     UnknownTable(String),
     #[error("row type for table `{0}` is not a product")]
     NotProduct(String),
-    #[error("timed out waiting for SubscribeMultiApplied for `{0}` ({1:?} elapsed)")]
+    #[error("timed out waiting for SubscribeApplied for `{0}` ({1:?} elapsed)")]
     SubscribeTimeout(String, Duration),
     #[error("subscribe for `{0}` stalled: no socket bytes for {1:?}")]
     SubscribeStalled(String, Duration),
@@ -258,7 +270,7 @@ type ApplyFn = Arc<
 ///
 /// `subscribe_permit` is the subscribe-gate slot acquired by the caller before
 /// connecting. It is held through connect and every table's **wire** seed
-/// (SubscribeMultiApplied received and enqueued); released once all tables are
+/// (SubscribeApplied received and enqueued); released once all tables are
 /// subscribed on the wire so the next mirror can start downloading while this
 /// one drains its FIFO apply queue. Local seed applies continue on the dedicated
 /// DB thread after the gate is released.
@@ -422,7 +434,7 @@ where
 {
     ctx.await_identity_token().await?;
 
-    // Subscriptions are per WebSocket connection. Always SubscribeMulti every
+    // Subscriptions are per WebSocket connection. Always Subscribe every
     // table on a new socket. `completed_tables` is within-session seed-apply
     // bookkeeping only — the reconnect loop clears it and cold-resets local
     // state (kick clients + flush tables) before re-acquiring the subscribe gate.
@@ -479,7 +491,7 @@ where
     ctx.live_loop().await
 }
 
-/// Subscribe one table: send `SubscribeMulti`, await the wire seed snapshot,
+/// Subscribe one table: send `Subscribe`, await the wire seed snapshot,
 /// enqueue it for FIFO apply, and return — **without** waiting for local apply.
 ///
 /// The next table's subscribe is sent while prior seeds drain from the apply
@@ -489,9 +501,9 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let request_id = (idx as u32).saturating_add(1);
-    let query_id = request_id;
+    let query_set_id = request_id;
     let query = format!("SELECT * FROM {table}");
-    let frame = encode_subscribe_multi(request_id, query_id, &query)?;
+    let frame = encode_subscribe(request_id, query_set_id, &query)?;
     // Per-table progress is debug: a 274-table region logs this pair hundreds
     // of times per seed, and under the strict-serialized cold start that
     // volume is what floods slow-disk logging sinks (see
@@ -505,8 +517,8 @@ where
     ctx.status.set_subscribing_table(table.to_owned());
     ctx.sock.send(Message::Binary(frame.into())).await?;
 
-    let (mut tables_ops, n_rows, wire_bytes) = ctx.await_seed(query_id, table).await?;
-    log::debug!("public-mirror: SubscribeMultiApplied for {table} ({n_rows} seed rows, {wire_bytes} wire bytes)");
+    let (mut tables_ops, n_rows, wire_bytes) = ctx.await_seed(query_set_id, table).await?;
+    log::debug!("public-mirror: SubscribeApplied for {table} ({n_rows} seed rows, {wire_bytes} wire bytes)");
 
     // An empty seed must still clear the local table: after a reconnect the
     // previous session's rows may be stale (upstream table now empty).
@@ -820,14 +832,14 @@ where
     }
 
     /// Like [`Self::handle_frames_from`], but classifies with the awaited
-    /// `query_id` so the session's own wire seed is never swallowed as a
+    /// `query_set_id` so the session's own wire seed is never swallowed as a
     /// background message. Returns the awaited seed if found (remaining
     /// deferred frames are left for the caller to replay **after** the seed
     /// is enqueued), or `None` once every deferred frame is routed.
     async fn handle_frames_from_seed_wait(
         &mut self,
         first: Bytes,
-        query_id: u32,
+        query_set_id: u32,
     ) -> Result<Option<(Vec<UpstreamTableOps>, usize, usize)>, UpstreamError> {
         let mut current = Some(first);
         loop {
@@ -840,10 +852,10 @@ where
             };
             let decoded = if is_heavy_frame(&frame) {
                 let row_types = Arc::clone(&self.row_types);
-                self.run_blocking_decode(move || decode_seed_wait_frame(&frame, query_id, &row_types))
+                self.run_blocking_decode(move || decode_seed_wait_frame(&frame, query_set_id, &row_types))
                     .await?
             } else {
-                decode_seed_wait_frame(&frame, query_id, &self.row_types)?
+                decode_seed_wait_frame(&frame, query_set_id, &self.row_types)?
             };
             match decoded {
                 SeedWaitDecode::Seed {
@@ -852,7 +864,7 @@ where
                     wire_bytes,
                 } => return Ok(Some((tables_ops, n_rows, wire_bytes))),
                 SeedWaitDecode::WrongQueryId { got, want } => {
-                    log::warn!("public-mirror: unexpected SubscribeMultiApplied query_id={got} (want {want})");
+                    log::warn!("public-mirror: unexpected SubscribeApplied query_set_id={got} (want {want})");
                 }
                 SeedWaitDecode::Background(bg) => self.apply_decoded_background(bg)?,
             }
@@ -910,22 +922,22 @@ where
         }
     }
 
-    /// Wait for the post-connect `IdentityToken` (bounded by
-    /// [`IDENTITY_TOKEN_TIMEOUT`]).
+    /// Wait for the post-connect `InitialConnection` identity message
+    /// (bounded by [`IDENTITY_TOKEN_TIMEOUT`]).
     async fn await_identity_token(&mut self) -> Result<(), UpstreamError> {
         let deadline = tokio::time::Instant::now() + IDENTITY_TOKEN_TIMEOUT;
         loop {
             if tokio::time::Instant::now() >= deadline {
                 return Err(UpstreamError::Connect(format!(
-                    "timed out waiting for IdentityToken after {IDENTITY_TOKEN_TIMEOUT:?}"
+                    "timed out waiting for InitialConnection after {IDENTITY_TOKEN_TIMEOUT:?}"
                 )));
             }
             match self.next_event().await? {
                 Event::Frame(frame) => {
                     let server = decode_server_message(&frame)?;
                     match server {
-                        ServerMessage::IdentityToken(it) => {
-                            log::info!("public-mirror: identity token received (identity={})", it.identity);
+                        ServerMessage::InitialConnection(ic) => {
+                            log::info!("public-mirror: identity token received (identity={})", ic.identity);
                             return Ok(());
                         }
                         other => self.apply_decoded_background(classify_background(other, &self.row_types)?)?,
@@ -936,7 +948,7 @@ where
         }
     }
 
-    /// Wait for `SubscribeMultiApplied` for `query_id`.
+    /// Wait for `SubscribeApplied` for `query_set_id`.
     ///
     /// The timeout is **stall-based**: the wait only fails when the socket has
     /// been silent for [`SUBSCRIBE_STALL_TIMEOUT`] (or after the generous
@@ -944,7 +956,7 @@ where
     /// arriving — however slowly — is never killed mid-transfer.
     async fn await_seed(
         &mut self,
-        query_id: u32,
+        query_set_id: u32,
         table: &str,
     ) -> Result<(Vec<UpstreamTableOps>, usize, usize), UpstreamError> {
         let started = tokio::time::Instant::now();
@@ -959,7 +971,7 @@ where
             }
             match self.next_event().await? {
                 Event::Frame(frame) => {
-                    if let Some(seed) = self.handle_frames_from_seed_wait(frame, query_id).await? {
+                    if let Some(seed) = self.handle_frames_from_seed_wait(frame, query_set_id).await? {
                         // Deferred frames (if any) are replayed by the caller,
                         // *after* it enqueues this seed.
                         return Ok(seed);
@@ -1099,7 +1111,10 @@ impl Applier {
                 max: LIVE_QUEUE_BYTES_MAX,
             });
         }
-        let transactions = update.provenance.is_some() as u64;
+        // One wire TransactionUpdate == one committed upstream transaction.
+        // (v2 carries no reducer provenance, so this can no longer be derived
+        // from `provenance`.)
+        let transactions = 1u64;
         self.queue.push_back(PendingApply {
             update,
             kind: ApplyKind::Live { transactions },
@@ -1235,22 +1250,22 @@ async fn send_liveness_probe<S>(sock: &mut WebSocketStream<S>) -> Result<(), Ups
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let frame = encode_one_off_query(PROBE_MESSAGE_ID, "SELECT 1")?;
+    let frame = encode_one_off_query(PROBE_REQUEST_ID, "SELECT 1")?;
     log::debug!("public-mirror: sending liveness probe");
     sock.send(Message::Binary(frame.into()))
         .await
         .map_err(UpstreamError::from)
 }
 
-fn encode_one_off_query(message_id: &[u8], query: &str) -> Result<Vec<u8>, UpstreamError> {
-    let msg = ClientMessage::<Box<[u8]>>::OneOffQuery(OneOffQuery {
-        message_id: message_id.to_vec().into_boxed_slice(),
+fn encode_one_off_query(request_id: u32, query: &str) -> Result<Vec<u8>, UpstreamError> {
+    let msg = ClientMessage::OneOffQuery(OneOffQuery {
+        request_id,
         query_string: query.to_string().into_boxed_str(),
     });
     bsatn::to_vec(&msg).map_err(|e| UpstreamError::Encode(e.to_string()))
 }
 
-/// A background (non-seed-wait) message after decoding and TU/TUL
+/// A background (non-seed-wait) message after decoding and live-update
 /// conversion — the CPU-heavy part — ready to route.
 #[derive(Debug)]
 enum DecodedBackground {
@@ -1261,16 +1276,15 @@ enum DecodedBackground {
 }
 
 /// Classify a decoded server message for the background path, doing the
-/// expensive TU/TUL conversion (Brotli row lists, delete-row decode) eagerly
-/// so it can run on the blocking pool instead of a Tokio worker.
+/// expensive live-update conversion (Brotli row lists, delete-row decode)
+/// eagerly so it can run on the blocking pool instead of a Tokio worker.
 fn classify_background(
-    server: ServerMessage<BsatnFormat>,
+    server: ServerMessage,
     row_types: &HashMap<String, ProductType>,
 ) -> Result<DecodedBackground, UpstreamError> {
     Ok(match server {
-        ServerMessage::TransactionUpdate(tu) => DecodedBackground::Update(tu_to_update(tu, row_types)?),
-        ServerMessage::TransactionUpdateLight(tul) => DecodedBackground::Update(tul_to_update(tul, row_types)?),
-        ServerMessage::OneOffQueryResponse(_) => DecodedBackground::ProbeResponse,
+        ServerMessage::TransactionUpdate(tu) => DecodedBackground::Update(transaction_to_update(tu, row_types)?),
+        ServerMessage::OneOffQueryResult(_) => DecodedBackground::ProbeResponse,
         ServerMessage::SubscriptionError(err) => DecodedBackground::SubscriptionError(err.error.to_string()),
         other => DecodedBackground::Ignored(variant_name(&other)),
     })
@@ -1310,23 +1324,23 @@ enum SeedWaitDecode {
     Background(DecodedBackground),
 }
 
-/// Decode one binary frame received while awaiting `SubscribeMultiApplied`.
+/// Decode one binary frame received while awaiting `SubscribeApplied`.
 fn decode_seed_wait_frame(
     frame: &[u8],
-    query_id: u32,
+    query_set_id: u32,
     row_types: &HashMap<String, ProductType>,
 ) -> Result<SeedWaitDecode, UpstreamError> {
     let wire_bytes = frame.len();
     let server = decode_server_message(frame)?;
     match server {
-        ServerMessage::SubscribeMultiApplied(sma) => {
-            if sma.query_id.id != query_id {
+        ServerMessage::SubscribeApplied(sap) => {
+            if sap.query_set_id.id != query_set_id {
                 return Ok(SeedWaitDecode::WrongQueryId {
-                    got: sma.query_id.id,
-                    want: query_id,
+                    got: sap.query_set_id.id,
+                    want: query_set_id,
                 });
             }
-            let tables_ops = database_update_to_ops(&sma.update, row_types, /*seed*/ true)?;
+            let tables_ops = query_rows_to_ops(&sap.rows, row_types)?;
             let n_rows = tables_ops.iter().map(|t| t.inserts.len()).sum();
             Ok(SeedWaitDecode::Seed {
                 tables_ops,
@@ -1338,43 +1352,68 @@ fn decode_seed_wait_frame(
     }
 }
 
-fn tu_to_update(
-    tu: TransactionUpdate<BsatnFormat>,
+/// Convert a v2 `TransactionUpdate` into an [`UpstreamUpdate`].
+///
+/// One wire message == one upstream transaction. v2 carries no reducer
+/// provenance, so the update applies with `provenance: None`. Event-table
+/// rows are dropped: v2 servers do not persist them, so applying them would
+/// diverge local row counts from upstream and grow without bound.
+fn transaction_to_update(
+    tu: TransactionUpdate,
     row_types: &HashMap<String, ProductType>,
 ) -> Result<Option<UpstreamUpdate>, UpstreamError> {
-    let UpdateStatus::Committed(db) = tu.status else {
-        return Ok(None);
-    };
-    let tables = database_update_to_ops(&db, row_types, false)?;
-    if tables.is_empty() {
-        return Ok(None);
-    }
-    let provenance = UpstreamProvenance {
-        reducer_name: tu.reducer_call.reducer_name.to_string(),
-        caller_identity: tu.caller_identity,
-        caller_connection_id: tu.caller_connection_id,
-        timestamp: tu.timestamp,
-        request_id: tu.reducer_call.request_id,
-        args: Bytes::copy_from_slice(tu.reducer_call.args.as_ref()),
-    };
-    Ok(Some(UpstreamUpdate {
-        provenance: Some(provenance),
-        tables,
-        is_seed: false,
-    }))
-}
+    let mut out = Vec::with_capacity(tu.query_sets.len());
+    for query_set in &tu.query_sets {
+        for table in &query_set.tables {
+            let table_name = table.table_name.to_string();
+            let row_ty = row_types
+                .get(&table_name)
+                .ok_or_else(|| UpstreamError::UnknownTable(table_name.clone()))?;
 
-fn tul_to_update(
-    tul: TransactionUpdateLight<BsatnFormat>,
-    row_types: &HashMap<String, ProductType>,
-) -> Result<Option<UpstreamUpdate>, UpstreamError> {
-    let tables = database_update_to_ops(&tul.update, row_types, false)?;
-    if tables.is_empty() {
+            let mut inserts = Vec::new();
+            let mut deletes = Vec::new();
+            let mut delete_bytes = Vec::new();
+            let mut event_rows = 0usize;
+            for rows in &table.rows {
+                match rows {
+                    TableUpdateRows::PersistentTable(p) => {
+                        // `BsatnRowList` iteration yields zero-copy `Bytes`
+                        // slices into the shared row blob — one allocation per
+                        // table, not one per row.
+                        inserts.extend(&p.inserts);
+                        delete_bytes.extend(&p.deletes);
+                        for row in &p.deletes {
+                            let mut bytes: &[u8] = row.as_ref();
+                            let pv = ProductValue::decode(row_ty, &mut bytes)
+                                .map_err(|e| UpstreamError::Decode(format!("delete row for {table_name}: {e}")))?;
+                            deletes.push(pv);
+                        }
+                    }
+                    TableUpdateRows::EventTable(e) => {
+                        event_rows += e.events.len();
+                    }
+                }
+            }
+            if event_rows > 0 {
+                log::debug!("public-mirror: dropping {event_rows} transient event row(s) for {table_name}");
+            }
+            if inserts.is_empty() && deletes.is_empty() {
+                continue;
+            }
+            out.push(UpstreamTableOps {
+                table_name,
+                deletes,
+                delete_bytes,
+                inserts,
+            });
+        }
+    }
+    if out.is_empty() {
         return Ok(None);
     }
     Ok(Some(UpstreamUpdate {
         provenance: None,
-        tables,
+        tables: out,
         is_seed: false,
     }))
 }
@@ -1402,65 +1441,38 @@ fn build_row_types(module_def: &ModuleDef) -> Result<HashMap<String, ProductType
     Ok(map)
 }
 
-fn database_update_to_ops(
-    db: &DatabaseUpdate<BsatnFormat>,
+/// Convert a v2 seed (`SubscribeApplied.rows`) into per-table insert ops.
+///
+/// Seed snapshots are inserts-only in v2 (a `QueryRows`, not an insert/delete
+/// delta). Tables with zero matching rows are omitted, matching the v1 path;
+/// `subscribe_table` handles the fully-empty snapshot by enqueueing a
+/// truncate-only op.
+fn query_rows_to_ops(
+    rows: &QueryRows,
     row_types: &HashMap<String, ProductType>,
-    seed: bool,
 ) -> Result<Vec<UpstreamTableOps>, UpstreamError> {
-    let mut out = Vec::with_capacity(db.tables.len());
-    for table in &db.tables {
-        let table_name = table.table_name.to_string();
+    let mut out = Vec::with_capacity(rows.tables.len());
+    for table in &rows.tables {
+        let table_name = table.table.to_string();
         let row_ty = row_types
             .get(&table_name)
             .ok_or_else(|| UpstreamError::UnknownTable(table_name.clone()))?;
+        let _ = row_ty;
 
-        let mut inserts = Vec::new();
-        let mut deletes = Vec::new();
-        let mut delete_bytes = Vec::new();
-        for update in &table.updates {
-            let qu = query_update_owned(update)?;
-            // `BsatnRowList` iteration yields zero-copy `Bytes` slices into the
-            // shared row blob — one allocation per table, not one per row.
-            inserts.extend(&qu.inserts);
-            delete_bytes.extend(&qu.deletes);
-            if !seed {
-                for row in &qu.deletes {
-                    let mut bytes: &[u8] = row.as_ref();
-                    let pv = ProductValue::decode(row_ty, &mut bytes)
-                        .map_err(|e| UpstreamError::Decode(format!("delete row for {table_name}: {e}")))?;
-                    deletes.push(pv);
-                }
-            }
-        }
-        if inserts.is_empty() && deletes.is_empty() {
+        // `BsatnRowList` iteration yields zero-copy `Bytes` slices into the
+        // shared row blob — one allocation per table, not one per row.
+        let inserts: Vec<Bytes> = (&table.rows).into_iter().collect();
+        if inserts.is_empty() {
             continue;
         }
         out.push(UpstreamTableOps {
             table_name,
-            deletes,
-            delete_bytes,
+            deletes: Vec::new(),
+            delete_bytes: Vec::new(),
             inserts,
         });
     }
     Ok(out)
-}
-
-/// Materialize a possibly-compressed query update. The uncompressed arm is a
-/// cheap clone (`Bytes` refcount bumps); compressed arms decompress + decode.
-fn query_update_owned(u: &CompressableQueryUpdate<BsatnFormat>) -> Result<QueryUpdate<BsatnFormat>, UpstreamError> {
-    match u {
-        CompressableQueryUpdate::Uncompressed(qu) => Ok(qu.clone()),
-        CompressableQueryUpdate::Brotli(bytes) => {
-            let raw = brotli_decompress(bytes)?;
-            bsatn::from_slice::<QueryUpdate<BsatnFormat>>(&raw)
-                .map_err(|e| UpstreamError::Decode(format!("brotli query update: {e}")))
-        }
-        CompressableQueryUpdate::Gzip(bytes) => {
-            let raw = gzip_decompress(bytes)?;
-            bsatn::from_slice::<QueryUpdate<BsatnFormat>>(&raw)
-                .map_err(|e| UpstreamError::Decode(format!("gzip query update: {e}")))
-        }
-    }
 }
 
 fn brotli_decompress(data: &[u8]) -> Result<Vec<u8>, UpstreamError> {
@@ -1479,18 +1491,18 @@ fn gzip_decompress(data: &[u8]) -> Result<Vec<u8>, UpstreamError> {
     Ok(out)
 }
 
-fn encode_subscribe_multi(request_id: u32, query_id: u32, query: &str) -> Result<Vec<u8>, UpstreamError> {
-    let msg = ClientMessage::<Box<[u8]>>::SubscribeMulti(SubscribeMulti {
+fn encode_subscribe(request_id: u32, query_set_id: u32, query: &str) -> Result<Vec<u8>, UpstreamError> {
+    let msg = ClientMessage::Subscribe(Subscribe {
         query_strings: vec![query.to_string().into_boxed_str()].into_boxed_slice(),
         request_id,
-        query_id: QuerySetId::new(query_id),
+        query_set_id: QuerySetId::new(query_set_id),
     });
     bsatn::to_vec(&msg).map_err(|e| UpstreamError::Encode(e.to_string()))
 }
 
 /// Decode a server frame, transparently handling whole-message brotli/gzip
 /// compression (leading tag byte).
-fn decode_server_message(data: &[u8]) -> Result<ServerMessage<BsatnFormat>, UpstreamError> {
+fn decode_server_message(data: &[u8]) -> Result<ServerMessage, UpstreamError> {
     let Some((&tag, payload)) = data.split_first() else {
         return Err(UpstreamError::FrameTooShort(0));
     };
@@ -1510,7 +1522,7 @@ fn decode_server_message(data: &[u8]) -> Result<ServerMessage<BsatnFormat>, Upst
     if payload.is_empty() {
         return Err(UpstreamError::FrameTooShort(data.len()));
     }
-    bsatn::from_slice::<ServerMessage<BsatnFormat>>(payload).map_err(|e| UpstreamError::Decode(e.to_string()))
+    bsatn::from_slice::<ServerMessage>(payload).map_err(|e| UpstreamError::Decode(e.to_string()))
 }
 
 async fn next_binary<S>(sock: &mut WebSocketStream<S>) -> Result<Bytes, UpstreamError>
@@ -1570,7 +1582,7 @@ fn build_connect_request(
         .map_err(|e| UpstreamError::Url(e.to_string()))?;
     request.headers_mut().insert(
         SEC_WEBSOCKET_PROTOCOL,
-        SUBPROTOCOL_V1
+        SUBPROTOCOL_V2
             .parse()
             .map_err(|_| UpstreamError::Url("invalid subprotocol header".into()))?,
     );
@@ -1586,18 +1598,15 @@ fn build_connect_request(
     Ok(request)
 }
 
-fn variant_name(msg: &ServerMessage<BsatnFormat>) -> &'static str {
+fn variant_name(msg: &ServerMessage) -> &'static str {
     match msg {
-        ServerMessage::InitialSubscription(_) => "InitialSubscription",
-        ServerMessage::TransactionUpdate(_) => "TransactionUpdate",
-        ServerMessage::TransactionUpdateLight(_) => "TransactionUpdateLight",
-        ServerMessage::IdentityToken(_) => "IdentityToken",
-        ServerMessage::OneOffQueryResponse(_) => "OneOffQueryResponse",
+        ServerMessage::InitialConnection(_) => "InitialConnection",
         ServerMessage::SubscribeApplied(_) => "SubscribeApplied",
         ServerMessage::UnsubscribeApplied(_) => "UnsubscribeApplied",
         ServerMessage::SubscriptionError(_) => "SubscriptionError",
-        ServerMessage::SubscribeMultiApplied(_) => "SubscribeMultiApplied",
-        ServerMessage::UnsubscribeMultiApplied(_) => "UnsubscribeMultiApplied",
+        ServerMessage::TransactionUpdate(_) => "TransactionUpdate",
+        ServerMessage::OneOffQueryResult(_) => "OneOffQueryResult",
+        ServerMessage::ReducerResult(_) => "ReducerResult",
         ServerMessage::ProcedureResult(_) => "ProcedureResult",
     }
 }
@@ -1774,8 +1783,8 @@ mod tests {
 
     #[test]
     fn decode_server_message_brotli_and_gzip_roundtrip() {
-        use spacetimedb_client_api_messages::websocket::v1::IdentityToken;
-        let msg = ServerMessage::<BsatnFormat>::IdentityToken(IdentityToken {
+        use spacetimedb_client_api_messages::websocket::v2::InitialConnection;
+        let msg = ServerMessage::InitialConnection(InitialConnection {
             identity: Identity::ZERO,
             token: "tok".into(),
             connection_id: ConnectionId::ZERO,
@@ -1787,7 +1796,7 @@ mod tests {
         frame.extend_from_slice(&raw);
         assert!(matches!(
             decode_server_message(&frame).unwrap(),
-            ServerMessage::IdentityToken(_)
+            ServerMessage::InitialConnection(_)
         ));
 
         // Brotli (tag 1).
@@ -1801,7 +1810,7 @@ mod tests {
         frame.extend_from_slice(&compressed);
         assert!(matches!(
             decode_server_message(&frame).unwrap(),
-            ServerMessage::IdentityToken(_)
+            ServerMessage::InitialConnection(_)
         ));
 
         // Gzip (tag 2).
@@ -1816,7 +1825,7 @@ mod tests {
         frame.extend_from_slice(&compressed);
         assert!(matches!(
             decode_server_message(&frame).unwrap(),
-            ServerMessage::IdentityToken(_)
+            ServerMessage::InitialConnection(_)
         ));
     }
 

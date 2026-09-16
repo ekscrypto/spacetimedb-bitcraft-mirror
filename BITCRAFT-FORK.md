@@ -60,6 +60,31 @@ Everything from [`FORK.md`](FORK.md) applies unchanged (per-database client
 gating, subscribe gate, idempotent seeds, `/v1/mirrors` sidecar, coordinator
 socket). `--bitcraft-cache` adds:
 
+## Upstream protocol: WebSocket v2
+
+The mirror ingests over **`v2.bsatn.spacetimedb`** (`crates/public-mirror/src/upstream.rs`).
+The BitCraft game servers are upgrading to SpacetimeDB v2, which changes the
+upstream contract in ways v1 cannot express:
+
+- **Event tables require WebSocket v2.** v2+ servers reject v1 subscriptions
+  to `_event` tables ("Subscribing to event tables requires WebSocket v2");
+  every region DB has 43 of them, so a v1 upstream client cannot seed regions
+  at all. v2 subscribes to all public tables.
+- **No reducer context on v1** — v1 clients only get light frames. v2
+  `TransactionUpdate`s carry row deltas only (no reducer provenance), so
+  mirrored updates apply with `provenance: None` and downstream v2/v3 clients
+  receive frames byte-compatible with upstream (row ordering aside).
+- **Event rows are dropped at ingest.** v2 servers do not persist event-table
+  rows, so the mirror discards `TableUpdateRows::EventTable` deltas to keep
+  local row counts identical to upstream (and avoid unbounded growth).
+
+Downstream (client-facing) side is unchanged: the fork's client API negotiates
+v3/v2/v1 BSATN + JSON per client, so existing explorer/tooling clients keep
+working. Verified against the game team's staging environment 2026-09-16:
+global + regions 3/7 live with all tables; per-table row counts match staging
+exactly on all 318 region tables and 282 global tables; seed frames
+byte-identical except row ordering; live updates flow.
+
 - an embedded `relay-cache` fed in-process per mirrored `bitcraft-live-N`
   (schema taken from the same raw schema JSON the mirror fetched — no extra
   HTTP, no drift),
