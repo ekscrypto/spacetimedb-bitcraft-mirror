@@ -18,15 +18,15 @@ use axum::routing::get;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::roads::coords::{region_origin, world_to_local};
+use crate::roads::coords::{region_origin, world_to_local, world_to_region};
 use crate::roads::grid::get_claim_index;
 use crate::roads::resource_map::is_harvestable_resource_id;
 use crate::roads::RoadsFleet;
 use crate::serve::{format_rfc3339_millis, no_store_json, no_store_octets, no_store_status, Fleet};
 use crate::store::RegionStore;
 
-/// Window side in tiles for `GET /bitme/session/:id/resources` (the player
-/// anchors at the center, `(width/2, width/2)`).
+/// Window side in tiles for the resource-window endpoints (the anchor tile
+/// sits at the center, `(width/2, width/2)`).
 const RESOURCE_WINDOW_WIDTH: usize = 400;
 
 pub fn bitme_routes() -> axum::Router<Fleet> {
@@ -34,6 +34,7 @@ pub fn bitme_routes() -> axum::Router<Fleet> {
         .route("/bitme/resolve", get(bitme_resolve))
         .route("/bitme/session/:entity_id", get(bitme_session))
         .route("/bitme/session/:entity_id/resources", get(bitme_session_resources))
+        .route("/bitme/world/:x/:z/resources", get(bitme_world_resources))
         .route(
             "/bitme/region/:region/resource-dictionary",
             get(bitme_region_resource_dictionary),
@@ -242,6 +243,44 @@ async fn bitme_session_resources(State(fleet): State<Fleet>, Path(entity_id): Pa
         .into_response();
     };
 
+    resource_window_response(&fleet, region, (px, pz))
+}
+
+/// `GET /bitme/world/:x/:z/resources` — the same packed 400×400 resource
+/// window as `/bitme/session/:id/resources`, but anchored at explicit world
+/// tile coordinates instead of a player. The region is derived from the
+/// coordinates; window cells that fall outside it are zero (no cross-region
+/// stitching). Nothing is player-scoped, so no session side effects.
+async fn bitme_world_resources(State(fleet): State<Fleet>, Path((x, z)): Path<(String, String)>) -> Response {
+    let (Ok(x), Ok(z)) = (x.parse::<i32>(), z.parse::<i32>()) else {
+        return no_store_status(
+            StatusCode::BAD_REQUEST,
+            json!({"error": "x and z must be i32 world tile coordinates"}),
+        )
+        .into_response();
+    };
+    let Some(region) = world_to_region(x, z) else {
+        return no_store_status(
+            StatusCode::NOT_FOUND,
+            json!({
+                "found": false,
+                "x": x,
+                "z": z,
+                "error": "coordinates outside the known world grid",
+            }),
+        )
+        .into_response();
+    };
+    resource_window_response(&fleet, region as u32, (x, z))
+}
+
+/// Shared tail of the resource-window endpoints: resolve the roads region,
+/// slice the 400×400 window centered on `center` from the dense tile map,
+/// and pack it behind the `BMR1` header (24-byte LE header, then `width²`
+/// u16 LE tile words — see `roads/resource_map.rs` for the bit layout).
+/// 503 without the roads cache, 404 for a region with no map, empty 202
+/// while the grid is still seeding.
+fn resource_window_response(fleet: &Fleet, region: u32, center: (i32, i32)) -> Response {
     let Some(roads) = fleet.roads.as_ref() else {
         return no_store_status(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -258,7 +297,7 @@ async fn bitme_session_resources(State(fleet): State<Fleet>, Path(entity_id): Pa
     };
 
     let half = (RESOURCE_WINDOW_WIDTH / 2) as i32;
-    let origin_world = (px - half, pz - half);
+    let origin_world = (center.0 - half, center.1 - half);
 
     let body = {
         let grid = handle.grid.read();
@@ -276,7 +315,7 @@ async fn bitme_session_resources(State(fleet): State<Fleet>, Path(entity_id): Pa
         body.extend_from_slice(&(RESOURCE_WINDOW_WIDTH as u16).to_le_bytes());
         body.extend_from_slice(&origin_world.0.to_le_bytes());
         body.extend_from_slice(&origin_world.1.to_le_bytes());
-        body.extend_from_slice(&region.to_le_bytes());
+        body.extend_from_slice(&handle.region.to_le_bytes());
         body.extend_from_slice(&dict_version.to_le_bytes());
         body.extend_from_slice(&payload);
         body
@@ -875,6 +914,139 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn world_resource_window_matches_player_window() {
+        let fleet = fleet_with_player(1, true);
+        let app = bitme_routes().with_state(fleet);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/bitme/world/7690/7700/resources")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["content-type"], "application/octet-stream");
+        let world = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+
+        // (7690, 7700) is player 42's tile → byte-identical to the session
+        // window anchored on the player.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/bitme/session/42/resources")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let session = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(world, session);
+
+        // Header sanity: window origin is center − 200, region derived as 7.
+        assert_eq!(world.len(), 24 + 400 * 400 * 2);
+        assert_eq!(&world[0..4], b"BMR1");
+        assert_eq!(i32::from_le_bytes(world[8..12].try_into().unwrap()), 7490);
+        assert_eq!(i32::from_le_bytes(world[12..16].try_into().unwrap()), 7500);
+        assert_eq!(u32::from_le_bytes(world[16..20].try_into().unwrap()), 7);
+    }
+
+    #[tokio::test]
+    async fn world_resource_window_404_outside_grid() {
+        let fleet = fleet_with_player(1, true);
+        let app = bitme_routes().with_state(fleet);
+        for uri in [
+            "/bitme/world/-1/0/resources",
+            "/bitme/world/0/-1/resources",
+            "/bitme/world/38400/0/resources",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn world_resource_window_404_for_unmirrored_region() {
+        // (100, 100) is inside the world grid (region 1), but the fixture
+        // only mirrors region 7.
+        let fleet = fleet_with_player(1, true);
+        let app = bitme_routes().with_state(fleet);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/bitme/world/100/100/resources")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn world_resource_window_400_bad_coords() {
+        let fleet = fleet_with_player(1, true);
+        let app = bitme_routes().with_state(fleet);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/bitme/world/abc/0/resources")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn world_resource_window_503_without_roads() {
+        let fleet = fleet_with_player(1, false);
+        let app = bitme_routes().with_state(fleet);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/bitme/world/7690/7700/resources")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn world_resource_window_202_while_grid_loading() {
+        let fleet = fleet_with_player(1, true);
+        fleet
+            .roads
+            .as_ref()
+            .unwrap()
+            .region_handle(7)
+            .unwrap()
+            .grid
+            .write()
+            .ready = false;
+        let app = bitme_routes().with_state(fleet);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/bitme/world/7690/7700/resources")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
     }
 
     #[tokio::test]

@@ -99,6 +99,17 @@ pub fn terrain_index(super_x: i32, super_z: i32) -> Option<usize> {
     Some((super_z as usize) * (SUPER_SIDE as usize) + (super_x as usize))
 }
 
+/// World small-hex coords → 1-based region id; None outside the 5×5 grid.
+/// Inverse of [`region_rx_rz`].
+pub fn world_to_region(x: i32, z: i32) -> Option<u16> {
+    let rx = x.div_euclid(REGION_SIDE);
+    let rz = z.div_euclid(REGION_SIDE);
+    if !(0..REGION_COUNT_SQRT).contains(&rx) || !(0..REGION_COUNT_SQRT).contains(&rz) {
+        return None;
+    }
+    Some((rz * REGION_COUNT_SQRT + rx + 1) as u16)
+}
+
 /// World small-hex coords → region-local `(lx, lz)`.
 pub fn world_to_local(region: u16, x: i32, z: i32) -> Option<(i32, i32)> {
     let origin = region_origin(region);
@@ -124,6 +135,32 @@ mod tests {
         assert_eq!(region_rx_rz(14), (3, 2));
         assert_eq!(region_origin(14), Hex::new(23040, 15360));
         assert_eq!(region_origin(1), Hex::new(0, 0));
+    }
+
+    #[test]
+    fn world_to_region_roundtrips_every_region() {
+        for id in 1..=(REGION_COUNT_SQRT * REGION_COUNT_SQRT) {
+            let origin = region_origin(id as u16);
+            // First and last tile of the region both resolve to it.
+            assert_eq!(world_to_region(origin.x, origin.z), Some(id as u16));
+            assert_eq!(
+                world_to_region(origin.x + REGION_SIDE - 1, origin.z + REGION_SIDE - 1),
+                Some(id as u16)
+            );
+            // The resolved region agrees with world_to_local on containment.
+            assert!(world_to_local(id as u16, origin.x, origin.z).is_some());
+        }
+    }
+
+    #[test]
+    fn world_to_region_rejects_outside_grid() {
+        assert_eq!(world_to_region(-1, 0), None);
+        assert_eq!(world_to_region(0, -1), None);
+        assert_eq!(world_to_region(REGION_SIDE * REGION_COUNT_SQRT, 0), None);
+        assert_eq!(world_to_region(0, REGION_SIDE * REGION_COUNT_SQRT), None);
+        assert_eq!(world_to_region(i32::MIN, i32::MAX), None);
+        // Boundary inside the grid stays valid.
+        assert_eq!(world_to_region(REGION_SIDE - 1, REGION_SIDE - 1), Some(1));
     }
 
     #[test]
