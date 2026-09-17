@@ -18,9 +18,10 @@ use axum::routing::get;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::roads::coords::{region_origin, world_to_local, world_to_region};
+use crate::roads::coords::{region_origin, world_to_local, world_to_region, SMALL_PER_SUPER};
 use crate::roads::grid::get_claim_index;
 use crate::roads::resource_map::is_harvestable_resource_id;
+use crate::roads::store::RoadsRegionHandle;
 use crate::roads::RoadsFleet;
 use crate::serve::{format_rfc3339_millis, no_store_json, no_store_octets, no_store_status, Fleet};
 use crate::store::RegionStore;
@@ -29,12 +30,18 @@ use crate::store::RegionStore;
 /// sits at the center, `(width/2, width/2)`).
 const RESOURCE_WINDOW_WIDTH: usize = 400;
 
+/// Super-hexes per side covering a [`RESOURCE_WINDOW_WIDTH`] elevation
+/// window. Any 400-tile span covers exactly ceil(400/3) super columns —
+/// 400 ≡ 1 (mod 3), so every start offset yields the same count.
+const ELEVATION_WINDOW_SUPER_SIDE: usize = RESOURCE_WINDOW_WIDTH.div_ceil(SMALL_PER_SUPER as usize);
+
 pub fn bitme_routes() -> axum::Router<Fleet> {
     axum::Router::new()
         .route("/bitme/resolve", get(bitme_resolve))
         .route("/bitme/session/:entity_id", get(bitme_session))
         .route("/bitme/session/:entity_id/resources", get(bitme_session_resources))
         .route("/bitme/world/:x/:z/resources", get(bitme_world_resources))
+        .route("/bitme/world/:x/:z/elevation", get(bitme_world_elevation))
         .route(
             "/bitme/region/:region/resource-dictionary",
             get(bitme_region_resource_dictionary),
@@ -252,15 +259,50 @@ async fn bitme_session_resources(State(fleet): State<Fleet>, Path(entity_id): Pa
 /// coordinates; window cells that fall outside it are zero (no cross-region
 /// stitching). Nothing is player-scoped, so no session side effects.
 async fn bitme_world_resources(State(fleet): State<Fleet>, Path((x, z)): Path<(String, String)>) -> Response {
+    match resolve_world_anchor(&x, &z) {
+        Ok((x, z, region)) => resource_window_response(&fleet, region, (x, z)),
+        Err(resp) => resp,
+    }
+}
+
+/// `GET /bitme/world/:x/:z/elevation` — the super-hex terrain plane covering
+/// the same 400×400 small-tile window as `/bitme/world/:x/:z/resources`: one
+/// packed u64 per super-hex (`pack_terrain`: elev | original<<16 |
+/// water_level<<32 | water_body_type<<48). Any 400-tile span covers exactly
+/// 134 super-hexes per side, so the payload is always 134×134 cells (~140
+/// KiB) sliced straight from the resident terrain grid.
+///
+/// Response body: 24-byte LE header mirroring `BMR1`, then the cells u64 LE
+/// row-major. Cell `(r, c)` covers world small tiles `x ∈ [origin_x + 3c,
+/// origin_x + 3c + 2]`, `z ∈ [origin_z + 3r, origin_z + 3r + 2]`, where
+/// `(origin_x, origin_z)` is the header's super origin (world coord of the
+/// first cell's (0,0) tile). The covering supers are a superset of the
+/// resource window — partial supers at the edges extend past it. Cells
+/// outside the region are zero; `generation` mirrors the grid's update
+/// counter (terraform bumps it), so clients can refetch on change.
+async fn bitme_world_elevation(State(fleet): State<Fleet>, Path((x, z)): Path<(String, String)>) -> Response {
+    match resolve_world_anchor(&x, &z) {
+        Ok((x, z, region)) => elevation_window_response(&fleet, region, (x, z)),
+        Err(resp) => resp,
+    }
+}
+
+/// Shared `:x`/`:z` resolution for the `/bitme/world/…` endpoints: parse as
+/// i32 world tile coordinates and pick the owning region. Err carries the
+/// response to return (400 bad integers, 404 outside the world grid).
+// The Err is a fully-built HTTP response by design, not a value type.
+#[allow(clippy::result_large_err)]
+fn resolve_world_anchor(x: &str, z: &str) -> Result<(i32, i32, u32), Response> {
     let (Ok(x), Ok(z)) = (x.parse::<i32>(), z.parse::<i32>()) else {
-        return no_store_status(
+        return Err(no_store_status(
             StatusCode::BAD_REQUEST,
             json!({"error": "x and z must be i32 world tile coordinates"}),
         )
-        .into_response();
+        .into_response());
     };
-    let Some(region) = world_to_region(x, z) else {
-        return no_store_status(
+    match world_to_region(x, z) {
+        Some(region) => Ok((x, z, u32::from(region))),
+        None => Err(no_store_status(
             StatusCode::NOT_FOUND,
             json!({
                 "found": false,
@@ -269,9 +311,29 @@ async fn bitme_world_resources(State(fleet): State<Fleet>, Path((x, z)): Path<(S
                 "error": "coordinates outside the known world grid",
             }),
         )
-        .into_response();
+        .into_response()),
+    }
+}
+
+/// Shared prologue of the window endpoints: 503 without the roads cache,
+/// 404 for a region with no roads grid.
+// The Err is a fully-built HTTP response by design, not a value type.
+#[allow(clippy::result_large_err)]
+fn roads_region(fleet: &Fleet, region: u32) -> Result<Arc<RoadsRegionHandle>, Response> {
+    let Some(roads) = fleet.roads.as_ref() else {
+        return Err(no_store_status(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error": "roads cache not enabled"}),
+        )
+        .into_response());
     };
-    resource_window_response(&fleet, region as u32, (x, z))
+    roads.region_handle(region).ok_or_else(|| {
+        no_store_status(
+            StatusCode::NOT_FOUND,
+            json!({"found": false, "error": format!("region {region} has no resource map")}),
+        )
+        .into_response()
+    })
 }
 
 /// Shared tail of the resource-window endpoints: resolve the roads region,
@@ -281,19 +343,9 @@ async fn bitme_world_resources(State(fleet): State<Fleet>, Path((x, z)): Path<(S
 /// 503 without the roads cache, 404 for a region with no map, empty 202
 /// while the grid is still seeding.
 fn resource_window_response(fleet: &Fleet, region: u32, center: (i32, i32)) -> Response {
-    let Some(roads) = fleet.roads.as_ref() else {
-        return no_store_status(
-            StatusCode::SERVICE_UNAVAILABLE,
-            json!({"error": "roads cache not enabled"}),
-        )
-        .into_response();
-    };
-    let Some(handle) = roads.region_handle(region) else {
-        return no_store_status(
-            StatusCode::NOT_FOUND,
-            json!({"found": false, "error": format!("region {region} has no resource map")}),
-        )
-        .into_response();
+    let handle = match roads_region(fleet, region) {
+        Ok(handle) => handle,
+        Err(resp) => return resp,
     };
 
     let half = (RESOURCE_WINDOW_WIDTH / 2) as i32;
@@ -317,6 +369,49 @@ fn resource_window_response(fleet: &Fleet, region: u32, center: (i32, i32)) -> R
         body.extend_from_slice(&origin_world.1.to_le_bytes());
         body.extend_from_slice(&handle.region.to_le_bytes());
         body.extend_from_slice(&dict_version.to_le_bytes());
+        body.extend_from_slice(&payload);
+        body
+    };
+    no_store_octets(body)
+}
+
+/// Elevation counterpart of [`resource_window_response`]: slice the
+/// `ELEVATION_WINDOW_SUPER_SIDE`² super-hex terrain cells covering the
+/// 400×400 window centered on `center` and pack them behind the `BME1`
+/// header (24-byte LE: magic, version, super side, super origin world x/z,
+/// region, generation). Same 503/404/202 semantics.
+fn elevation_window_response(fleet: &Fleet, region: u32, center: (i32, i32)) -> Response {
+    let handle = match roads_region(fleet, region) {
+        Ok(handle) => handle,
+        Err(resp) => return resp,
+    };
+
+    let half = (RESOURCE_WINDOW_WIDTH / 2) as i32;
+    let origin_world = (center.0 - half, center.1 - half);
+
+    let body = {
+        let grid = handle.grid.read();
+        if !grid.ready {
+            return (StatusCode::ACCEPTED, Vec::<u8>::new()).into_response();
+        }
+        let origin = region_origin(handle.region as u16);
+        // Region-local super coords of the first covering cell; flooring
+        // (div_euclid) keeps partially-covered supers at negative origins.
+        let origin_super = (
+            (origin_world.0 - origin.x).div_euclid(SMALL_PER_SUPER),
+            (origin_world.1 - origin.z).div_euclid(SMALL_PER_SUPER),
+        );
+        let payload = grid.terrain.window(origin_super, ELEVATION_WINDOW_SUPER_SIDE);
+
+        let mut body = Vec::with_capacity(24 + payload.len());
+        body.extend_from_slice(b"BME1");
+        body.extend_from_slice(&1u16.to_le_bytes()); // format version
+        body.extend_from_slice(&(ELEVATION_WINDOW_SUPER_SIDE as u16).to_le_bytes());
+        body.extend_from_slice(&(origin.x + origin_super.0 * SMALL_PER_SUPER).to_le_bytes());
+        body.extend_from_slice(&(origin.z + origin_super.1 * SMALL_PER_SUPER).to_le_bytes());
+        body.extend_from_slice(&handle.region.to_le_bytes());
+        // u32 keeps the header at 24 bytes; generation is a small counter.
+        body.extend_from_slice(&(grid.generation as u32).to_le_bytes());
         body.extend_from_slice(&payload);
         body
     };
@@ -736,6 +831,7 @@ mod tests {
     use crate::decode::{ExtractionRecipeRow, MobileEntityRow, ResourceDescRow};
     use crate::interest::InterestHub;
     use crate::roads::catalog::{GlobalRoadsCatalog, RoadsFleet};
+    use crate::roads::grid::{pack_terrain, unpack_terrain_water};
     use crate::roads::store::{RoadsRegionGrid, RoadsRegionHandle};
     use crate::shard::ShardHandle;
     use axum::body::Body;
@@ -774,6 +870,8 @@ mod tests {
                 grid.resource_map.note_desc(74, &[]);
                 grid.resource_map.upsert(100, 74, 2, Some((7690, 7700)));
                 grid.resource_map.stamp_paving(7691, 7700, 59838);
+                // Terrain under the player: local small (10, 20) → super (3, 6).
+                grid.terrain.set(3, 6, pack_terrain(120, 100, 50, 2));
                 grid.mark_ready();
             }
             roads.catalog.write().paving.push(crate::roads::decode::PavingDescRow {
@@ -1041,6 +1139,155 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/bitme/world/7690/7700/resources")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn world_elevation_window_serves_packed_terrain() {
+        let fleet = fleet_with_player(1, true);
+        let expected_generation = fleet
+            .roads
+            .as_ref()
+            .unwrap()
+            .region_handle(7)
+            .unwrap()
+            .grid
+            .read()
+            .generation;
+        let app = bitme_routes().with_state(fleet);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/bitme/world/7690/7700/elevation")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["content-type"], "application/octet-stream");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let side = ELEVATION_WINDOW_SUPER_SIDE;
+        assert_eq!(body.len(), 24 + side * side * 8);
+        assert_eq!(&body[0..4], b"BME1");
+        assert_eq!(u16::from_le_bytes(body[4..6].try_into().unwrap()), 1); // version
+        assert_eq!(u16::from_le_bytes(body[6..8].try_into().unwrap()), 134); // super side
+                                                                             // Super origin: window origin (7490, 7500) floors to region-local
+                                                                             // super (−64, −60) → world (7680 − 192, 7680 − 180).
+        assert_eq!(i32::from_le_bytes(body[8..12].try_into().unwrap()), 7488);
+        assert_eq!(i32::from_le_bytes(body[12..16].try_into().unwrap()), 7500);
+        assert_eq!(u32::from_le_bytes(body[16..20].try_into().unwrap()), 7);
+        assert_eq!(
+            u32::from_le_bytes(body[20..24].try_into().unwrap()),
+            expected_generation as u32
+        );
+
+        let cell = |r: usize, c: usize| {
+            u64::from_le_bytes(
+                body[24 + (r * side + c) * 8..24 + (r * side + c) * 8 + 8]
+                    .try_into()
+                    .unwrap(),
+            )
+        };
+        // Seeded super (3, 6) → row 6 − (−60) = 66, col 3 − (−64) = 67; all
+        // four packed fields survive the roundtrip.
+        let word = cell(66, 67);
+        assert_eq!(word, pack_terrain(120, 100, 50, 2));
+        assert_eq!(unpack_terrain_water(word), (120, 50));
+        assert_eq!(((word >> 16) & 0xFFFF) as u16 as i16, 100); // original
+        assert_eq!((word >> 48) as u8, 2); // water_body_type
+                                           // Out-of-region corner supers are zero (window origin is negative).
+        assert_eq!(cell(0, 0), 0);
+    }
+
+    #[tokio::test]
+    async fn world_elevation_window_404_outside_grid() {
+        let fleet = fleet_with_player(1, true);
+        let app = bitme_routes().with_state(fleet);
+        for uri in [
+            "/bitme/world/-1/0/elevation",
+            "/bitme/world/0/-1/elevation",
+            "/bitme/world/38400/0/elevation",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn world_elevation_window_404_for_unmirrored_region() {
+        let fleet = fleet_with_player(1, true);
+        let app = bitme_routes().with_state(fleet);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/bitme/world/100/100/elevation")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn world_elevation_window_400_bad_coords() {
+        let fleet = fleet_with_player(1, true);
+        let app = bitme_routes().with_state(fleet);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/bitme/world/abc/0/elevation")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn world_elevation_window_503_without_roads() {
+        let fleet = fleet_with_player(1, false);
+        let app = bitme_routes().with_state(fleet);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/bitme/world/7690/7700/elevation")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn world_elevation_window_202_while_grid_loading() {
+        let fleet = fleet_with_player(1, true);
+        fleet
+            .roads
+            .as_ref()
+            .unwrap()
+            .region_handle(7)
+            .unwrap()
+            .grid
+            .write()
+            .ready = false;
+        let app = bitme_routes().with_state(fleet);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/bitme/world/7690/7700/elevation")
                     .body(Body::empty())
                     .unwrap(),
             )

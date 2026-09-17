@@ -64,6 +64,36 @@ impl SuperHexTerrainGrid {
     pub fn get(&self, super_x: i32, super_z: i32) -> u64 {
         terrain_index(super_x, super_z).map(|idx| self.cells[idx]).unwrap_or(0)
     }
+
+    /// `side`×`side` window of packed terrain cells (u64 LE, row-major)
+    /// anchored at region-local super coords `origin` (which may be negative
+    /// or overhang the region edge — out-of-region cells are zero). Same
+    /// row-slice technique as `ResourceTileMap::window`.
+    pub fn window(&self, origin: (i32, i32), side: usize) -> Vec<u8> {
+        let mut out = vec![0u64; side * side];
+        let grid = SUPER_SIDE;
+        let w = side as i32;
+        for r in 0..side {
+            let sz = origin.1 + r as i32;
+            if !(0..grid).contains(&sz) {
+                continue;
+            }
+            let start = origin.0.max(0);
+            let end = (origin.0 + w).min(grid);
+            if start >= end {
+                continue;
+            }
+            let row_base = (sz as usize) * (SUPER_SIDE as usize);
+            let dst = r * side + (start - origin.0) as usize;
+            let count = (end - start) as usize;
+            out[dst..dst + count].copy_from_slice(&self.cells[row_base + start as usize..row_base + end as usize]);
+        }
+        let mut bytes = Vec::with_capacity(out.len() * 8);
+        for cell in out {
+            bytes.extend_from_slice(&cell.to_le_bytes());
+        }
+        bytes
+    }
 }
 
 impl std::fmt::Debug for SuperHexTerrainGrid {
@@ -145,5 +175,25 @@ mod tests {
         assert_eq!(cell, 0x0007_0063);
         set_claim_index(&mut cell, 0);
         assert_eq!(cell, 0x0000_0063);
+    }
+
+    #[test]
+    fn terrain_window_clamps_negative_origin_and_region_edge() {
+        let mut grid = SuperHexTerrainGrid::new();
+        grid.set(0, 0, pack_terrain(10, 8, 2, 1));
+        grid.set(2, 1, pack_terrain(30, 20, 5, 3));
+
+        // origin (−1, −1): cell (r, c) holds super (c−1, r−1).
+        let bytes = grid.window((-1, -1), 4);
+        assert_eq!(bytes.len(), 4 * 4 * 8);
+        let cell =
+            |r: usize, c: usize| u64::from_le_bytes(bytes[(r * 4 + c) * 8..(r * 4 + c) * 8 + 8].try_into().unwrap());
+        assert_eq!(cell(0, 0), 0, "super (−1, −1) is outside");
+        assert_eq!(cell(1, 1), pack_terrain(10, 8, 2, 1));
+        assert_eq!(cell(2, 3), pack_terrain(30, 20, 5, 3));
+        assert_eq!(cell(0, 3), 0);
+
+        // A window fully past the region edge is all zeros.
+        assert!(grid.window((SUPER_SIDE, SUPER_SIDE), 4).iter().all(|b| *b == 0));
     }
 }
