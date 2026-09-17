@@ -3,8 +3,8 @@
 The HTTP endpoints the Bit-Me mobile app consumes, served by the
 embedded relay-cache on **`https://relay.bitcraftsync.app`**. Plain JSON
 over HTTPS, no authentication, no WebSocket, no SpacetimeDB protocol —
-the phone only polls. (One exception: the resource-map window in §4 is a
-packed binary payload.)
+the phone only polls. (Exceptions: the resource/elevation windows of
+§4–§6 are packed binary payloads.)
 
 Source of truth: `src/bitme_serve.rs` (handlers) and `src/bitme.rs`
 (tracker). Operator-facing inventory: `USED-TABLES.md`. Design notes:
@@ -372,7 +372,82 @@ HTTP 503  {"error": "roads cache not enabled"}
 
 ---
 
-## 5. `GET /bitme/region/:region/resource-dictionary`
+## 5. `GET /bitme/world/:x/:z/resources`
+
+The same 400×400 BMR1 window as §4, anchored at explicit world tile
+coordinates instead of a player. The region is derived from the
+coordinates (5×5 grid of 7680×7680-tile regions, id 1 at `(0, 0)`); the
+payload format is byte-identical, with the anchor tile at relative
+`(200, 200)`. Window cells that fall outside the picked region are zero
+(no cross-region stitching).
+
+Nothing is player-scoped — no session registration, no TTL refresh.
+
+### Errors
+
+```json
+HTTP 400  {"error": "x and z must be i32 world tile coordinates"}
+HTTP 404  {"found": false, "x": 7690, "z": -1,
+           "error": "coordinates outside the known world grid"}
+HTTP 404  {"found": false, "error": "region 4 has no resource map"}
+HTTP 202  (empty body — region grid still seeding; retry with backoff)
+HTTP 503  {"error": "roads cache not enabled"}
+```
+
+---
+
+## 6. `GET /bitme/world/:x/:z/elevation`
+
+The super-hex terrain plane covering the same 400×400 window as §5: one
+packed `u64` per super-hex (3×3 small tiles each — the same grid as
+in-game N/E), 134×134 cells, sliced from the resident terrain grid.
+
+- **Response:** `application/octet-stream`, `Cache-Control: no-store`,
+  143,672 bytes = 24-byte header + 17,956 little-endian u64 cells
+  (row-major). A 400-tile span always covers exactly 134 super columns,
+  so the size never varies.
+- **Coverage:** cell `(r, c)` covers world tiles
+  `x ∈ [origin_super_x + 3c … +2]`, `z ∈ [origin_super_z + 3r … +2]` — a
+  superset of the resource window (partial super-hexes at the edges stick
+  out by up to 2 tiles). Cells outside the region are `0`.
+- **Generation:** the header carries the grid's update counter and
+  terraform bumps it; elevation is the only field that changes after
+  seed. Refetch when it moves.
+
+### Header (all fields little-endian)
+
+| Offset | Type | Meaning |
+|---|---|---|
+| 0–3 | `[u8; 4]` | Magic `BME1` |
+| 4–5 | `u16` | Format version (`1`) |
+| 6–7 | `u16` | Super-hexes per side (`134`) |
+| 8–11 | `i32` | `origin_super_world_x` — world tile of cell (0, 0)'s (0, 0) tile |
+| 12–15 | `i32` | `origin_super_world_z` |
+| 16–19 | `u32` | Region id |
+| 20–23 | `u32` | `generation` — grid update counter (low 32 bits) |
+
+### Terrain cell (u64 LE) — the roads region-map cell unchanged
+
+| Bits | Field |
+|---|---|
+| 0–15 | `elevation` (`i16` stored as u16) |
+| 16–31 | `original_elevation` (`i16`) — pre-terraform |
+| 32–47 | `water_level` (`i16`) |
+| 48–55 | `water_body_type` (`u8`) |
+| 56–63 | unused (zero) |
+
+A cell is underwater when `elevation < water_level`; missing water data
+arrives as `i16::MIN`, which never classifies as water (this is the
+source of the BMR1 water bit, at full resolution here). The full terrain
+layer is documented with the roads region map.
+
+### Errors
+
+Same family as §5, including the 202/503 semantics.
+
+---
+
+## 7. `GET /bitme/region/:region/resource-dictionary`
 
 The `resource_id ↔ 10-bit tile index` map for expanding window payloads,
 plus gamedata. Fetch once per region and refetch when a window header's
@@ -425,7 +500,7 @@ HTTP 503  {"error": "roads cache not enabled"}
 
 ---
 
-## 6. Readiness, deploys, and failure modes
+## 8. Readiness, deploys, and failure modes
 
 - **Readiness probe:** `GET /cache-health` → `{"ready": true, …}`. If
   `ready` is `false`, treat all relay data as stale.
@@ -440,14 +515,16 @@ HTTP 503  {"error": "roads cache not enabled"}
 - Region coverage can change; read the region list from
   `GET /roads/regions` rather than hardcoding, if it matters.
 
-## 7. Recommended client flow
+## 9. Recommended client flow
 
 1. Onboarding: `resolve` the player name → store `entity_id`,
    `region_id`, `module`.
 2. Activity screens: poll `session/:entity_id` at ~1 Hz while open.
 3. Resource map: fetch `region/:region_id/resource-dictionary`, then poll
    `session/:entity_id/resources` alongside the snapshot; refetch the
-   dictionary when a window header's `dict_version` changes.
+   dictionary when a window header's `dict_version` changes. Pan freely
+   with `world/:x/:z/resources`; pair it with
+   `world/:x/:z/elevation` for terrain (refetch on `generation` change).
 4. Render countdowns client-side from the snapshot + bundled gamedata
    (action progress from `ends_at_ms`; buff expiry from
    `start_timestamp + duration`; stamina regen projected from
@@ -457,11 +534,12 @@ HTTP 503  {"error": "roads cache not enabled"}
 6. Never hold state across deploys — on `404`/`ready=false`, back off and
    re-resolve.
 
-## 8. Rate/abuse posture
+## 10. Rate/abuse posture
 
 Anonymous, no API keys, no rate limits today (same posture as
 `/claim`/`/player`; nginx caps request bodies and timeouts). Keep polling
 at ~1 Hz per active screen; do not fan out resolve calls per keystroke —
-debounce name lookups. The resource window is ~320 KB per poll (before
-HTTP compression); poll it only while the map screen is open, and prefer
-letting transport-level gzip handle it.
+debounce name lookups. The resource window is ~320 KB and the elevation
+plane ~140 KB per poll (before HTTP compression); poll them only while
+the map screen is open, and prefer letting transport-level gzip handle
+it.

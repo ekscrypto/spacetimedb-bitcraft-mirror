@@ -196,10 +196,19 @@ curl -s 'http://127.0.0.1:8089/bitme/session/1297036692699948124'
 # BITME-API.md §4.
 # curl -s http://127.0.0.1:8089/bitme/session/<player_entity_id>/resources -o window.bin
 
+# Same BMR1 window anchored at explicit world tiles (region derived from
+# the coordinates; no player, no session side effects). BITME-API.md §5.
+# curl -s http://127.0.0.1:8089/bitme/world/<x>/<z>/resources -o window.bin
+
+# Super-hex terrain plane covering the same window: 134x134 packed u64
+# cells (elev | original<<16 | water_level<<32 | water_body_type<<48),
+# refetch when the header generation moves. BITME-API.md §6.
+# curl -s http://127.0.0.1:8089/bitme/world/<x>/<z>/elevation -o terrain.bin
+
 # Resource dictionary for expanding window tiles: index -> resource_id +
 # name / gamedata / harvestable flag, plus paving entries (paving: true,
 # paving_type_id). Indices are per-deploy; refetch when a window header's
-# dict_version changes. BITME-API.md §5.
+# dict_version changes. BITME-API.md §7.
 # curl -s http://127.0.0.1:8089/bitme/region/7/resource-dictionary
 
 # Resources on a hex list — served from the dense per-region resource tile
