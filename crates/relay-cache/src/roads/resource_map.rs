@@ -21,9 +21,10 @@
 //!               empty tiles.
 //!   bit  15   : water flag — the tile's terrain elevation is below its
 //!               water level. Filled once from the terrain seed
-//!               ([`Self::fill_water_from_terrain`], one bit per 3×3-tile
-//!               super-hex) and preserved by every later write; terrain
-//!               never flips water↔land.
+//!               ([`Self::fill_water_from_terrain`]; terrain resolution is
+//!               the super-hex — 7-tile flower per super, corner tiles wet
+//!               when any of their three supers is) and preserved by every
+//!               later write; terrain never flips water↔land.
 //!
 //! Footprints come from `resource_desc.footprint` (axial offsets, rotated by
 //! direction via [`footprint_world_hexes`]) and are stamped server-side onto
@@ -48,7 +49,10 @@ use std::sync::OnceLock;
 
 use hashbrown::HashMap;
 
-use super::coords::{footprint_world_hexes, overlay_index, world_to_local, REGION_SIDE, SUPER_SIDE};
+use super::coords::{
+    axial_to_offset, footprint_world_hexes, offset_to_axial, overlay_index, world_to_local,
+    REGION_SIDE, SUPER_SIDE,
+};
 use super::grid::{unpack_terrain_water, SuperHexTerrainGrid};
 
 pub const RESOURCE_MAP_BYTES: usize = (REGION_SIDE as usize) * (REGION_SIDE as usize) * 2;
@@ -59,6 +63,35 @@ pub const MAX_RESOURCE_QUERY_TILES: usize = 16384;
 const INDEX_MASK: u16 = 0x03FF;
 const ORIGIN_BIT: u16 = 1 << 10;
 const DIRECTION_SHIFT: u16 = 11;
+
+/// Small tiles wet by one water super-hex at super odd-r offset `(sx, sz)`:
+/// axial deltas (from the super's center tile at axial `3·(q, r)`) of the 7
+/// exclusively-owned flower tiles plus the 6 shared corner tiles — the
+/// official `parent_large_tile` / `get_terrain_coordinates` tessellation.
+fn wet_super_hex_tiles(sx: i32, sz: i32, mut visit: impl FnMut(i32, i32)) {
+    const FLOWER_AND_CORNERS: [(i32, i32); 13] = [
+        // Flower: the center tile and its 6 axial neighbours.
+        (0, 0),
+        (1, 0),
+        (-1, 0),
+        (0, 1),
+        (0, -1),
+        (1, -1),
+        (-1, 1),
+        // Corners: each shared with the two adjoining supers.
+        (-1, -1),
+        (1, 1),
+        (-2, 1),
+        (1, -2),
+        (2, -1),
+        (-1, 2),
+    ];
+    let (q, r) = offset_to_axial(sx, sz);
+    for (dq, dr) in FLOWER_AND_CORNERS {
+        let h = axial_to_offset(3 * q + dq, 3 * r + dr);
+        visit(h.x, h.z);
+    }
+}
 /// Paving namespace flag: when set, bits 0-9 hold a paving index (separate
 /// [`ResourceTileMap::intern_paving`] namespace), not a resource index.
 pub const PAVING_BIT: u16 = 1 << 14;
@@ -302,8 +335,12 @@ impl ResourceTileMap {
     /// Fill the water bit across the whole map from the terrain grid
     /// (called once after the terrain seed flush, and again after rare live
     /// terrain writes). A super-hex is water when its elevation is below its
-    /// water level; the flag applies to its 3×3 small tiles — terrain
-    /// resolution is the super-hex. Terrain never flips water↔land, so this
+    /// water level. Per the game's terrain tessellation, a water super-hex
+    /// wets the 7 tiles of its flower (its center tile plus the 6 axial
+    /// neighbours) and the 6 corner tiles where it meets two other
+    /// supers — a corner is water when *any* of its three supers is, so
+    /// stamping from every water super reproduces the official
+    /// `is_submerged` exactly. Terrain never flips water↔land, so this
     /// only ever sets the bit; content words already stamped are untouched
     /// (OR semantics), and later writes preserve the bit.
     pub fn fill_water_from_terrain(&mut self, terrain: &SuperHexTerrainGrid) {
@@ -313,13 +350,11 @@ impl ResourceTileMap {
                 if elev >= water {
                     continue; // land, or no water data (level = i16::MIN / 0)
                 }
-                for dz in 0..3 {
-                    for dx in 0..3 {
-                        if let Some(idx) = overlay_index(sx * 3 + dx, sz * 3 + dz) {
-                            self.tiles[idx] |= WATER_BIT;
-                        }
+                wet_super_hex_tiles(sx, sz, |lx, lz| {
+                    if let Some(idx) = overlay_index(lx, lz) {
+                        self.tiles[idx] |= WATER_BIT;
                     }
-                }
+                });
             }
         }
     }
@@ -797,8 +832,9 @@ mod tests {
         let mut m = map();
         m.note_desc(BUTTON_MUSHROOMS, &[]);
 
-        // Super-hex (0,0) covers region-local tiles (0..3, 0..3): water.
-        // (10, 20) lives in super-hex (3, 6): land.
+        // Water super-hex (0,0) wets its flower — tiles (0,0), (1,0), (0,1)
+        // — and its corners (1,1), (0,2). (10, 20) lives in super-hex
+        // (3, 7): land.
         m.fill_water_from_terrain(&terrain_with_water(&[(0, 0)]));
 
         // Water-only tile: no content, water bit set.
@@ -810,7 +846,8 @@ mod tests {
         // Land tile untouched.
         assert_eq!(m.tiles[overlay_index(10, 20).unwrap()], 0);
 
-        // Resource stamped onto a water tile keeps the water bit…
+        // Resource stamped onto a corner tile of the water super keeps the
+        // water bit…
         m.upsert(1, BUTTON_MUSHROOMS, 0, Some((1, 1)));
         let word = m.tiles[overlay_index(1, 1).unwrap()];
         assert_ne!(word & WATER_BIT, 0, "water bit rides on resource words");
@@ -821,12 +858,12 @@ mod tests {
         assert!(m.resource_at_local(1, 1).is_none());
         assert_ne!(m.tiles[overlay_index(1, 1).unwrap()] & WATER_BIT, 0);
 
-        // Paving on water: same retention, both ways.
-        m.stamp_paving(2, 2, PAVING_TYPE_A);
-        assert_ne!(m.tiles[overlay_index(2, 2).unwrap()] & WATER_BIT, 0);
-        m.clear_paving(2, 2, PAVING_TYPE_A);
-        assert_ne!(m.tiles[overlay_index(2, 2).unwrap()] & WATER_BIT, 0);
-        assert_eq!(m.paving_at_local(2, 2), None);
+        // Paving on water: same retention, both ways (corner tile (0,2)).
+        m.stamp_paving(0, 2, PAVING_TYPE_A);
+        assert_ne!(m.tiles[overlay_index(0, 2).unwrap()] & WATER_BIT, 0);
+        m.clear_paving(0, 2, PAVING_TYPE_A);
+        assert_ne!(m.tiles[overlay_index(0, 2).unwrap()] & WATER_BIT, 0);
+        assert_eq!(m.paving_at_local(0, 2), None);
 
         // A water-only tile counts as empty: paving can land on it.
         m.stamp_paving(0, 0, PAVING_TYPE_A);
@@ -834,6 +871,48 @@ mod tests {
         m.clear_paving(0, 0, PAVING_TYPE_A);
         assert_eq!(m.paving_at_local(0, 0), None);
         assert_ne!(m.tiles[overlay_index(0, 0).unwrap()] & WATER_BIT, 0);
+    }
+
+    #[test]
+    fn water_fill_partitions_tiles_between_supers() {
+        use crate::roads::coords::{small_corner_supers, small_is_corner, small_to_super};
+
+        // A checkerboard of water supers: every tile's water bit must equal
+        // "any of its supers is water", computed independently from the
+        // official per-tile mapping (primary + corner triple).
+        let water_supers: Vec<(i32, i32)> = (0..12)
+            .flat_map(|sz| (0..12).filter(move |sx| (sx + sz) % 2 == 0).map(move |sx| (sx, sz)))
+            .collect();
+        let mut m = map();
+        m.fill_water_from_terrain(&terrain_with_water(&water_supers));
+
+        for lz in 0..36 {
+            for lx in 0..36 {
+                let expected = if small_is_corner(lx, lz) {
+                    small_corner_supers(lx, lz).iter().any(|s| water_supers.contains(s))
+                } else {
+                    water_supers.contains(&small_to_super(lx, lz))
+                };
+                let got = m.tiles[overlay_index(lx, lz).unwrap()] & WATER_BIT != 0;
+                assert_eq!(got, expected, "tile ({lx},{lz})");
+            }
+        }
+
+        // Corner any-of-3: tile (1,1) blends supers (0,0), (1,0), (0,1);
+        // wetting only (1,0) still wets it, and drying (1,0) with (0,0)
+        // dry leaves it land.
+        let mut m = map();
+        m.fill_water_from_terrain(&terrain_with_water(&[(1, 0)]));
+        assert_ne!(m.tiles[overlay_index(1, 1).unwrap()] & WATER_BIT, 0);
+        let mut m = map();
+        m.fill_water_from_terrain(&terrain_with_water(&[(0, 1)]));
+        assert_ne!(m.tiles[overlay_index(1, 1).unwrap()] & WATER_BIT, 0);
+        let mut m = map();
+        m.fill_water_from_terrain(&terrain_with_water(&[(1, 1)]));
+        // (1,1) is a corner of supers (0,0), (1,0), (0,1) — not of (1,1).
+        assert_eq!(m.tiles[overlay_index(1, 1).unwrap()] & WATER_BIT, 0);
+        // …but the flower of (1,1) is wet, e.g. its center tile (4,3).
+        assert_ne!(m.tiles[overlay_index(4, 3).unwrap()] & WATER_BIT, 0);
     }
 
     #[test]

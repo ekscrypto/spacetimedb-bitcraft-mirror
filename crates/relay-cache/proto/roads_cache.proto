@@ -138,8 +138,11 @@ message MapTile {
   uint64 claim_entity_id = 4; // 0 = unclaimed
 }
 
-// Super hex = 3x3 block of small hexes; x/z is the world coord of the
-// block's (0,0) tile, so the block covers x..x+2, z..z+2.
+// Super hex = the game's terrain cell: a true hex at 3x the tile scale in
+// odd-r offset coordinates. x/z is the world coord of its CENTER tile
+// (3X + (Z&1), 3Z) — odd super rows sit one tile right. The super
+// exclusively owns the 7-tile flower around that center; corner tiles
+// where three supers meet blend all three.
 message MapSuperHex {
   int32 x = 1;
   int32 z = 2;

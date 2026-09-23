@@ -65,15 +65,15 @@ impl SuperHexTerrainGrid {
         terrain_index(super_x, super_z).map(|idx| self.cells[idx]).unwrap_or(0)
     }
 
-    /// `side`×`side` window of packed terrain cells (u64 LE, row-major)
+    /// `width`×`height` window of packed terrain cells (u64 LE, row-major)
     /// anchored at region-local super coords `origin` (which may be negative
     /// or overhang the region edge — out-of-region cells are zero). Same
     /// row-slice technique as `ResourceTileMap::window`.
-    pub fn window(&self, origin: (i32, i32), side: usize) -> Vec<u8> {
-        let mut out = vec![0u64; side * side];
+    pub fn window(&self, origin: (i32, i32), width: usize, height: usize) -> Vec<u8> {
+        let mut out = vec![0u64; width * height];
         let grid = SUPER_SIDE;
-        let w = side as i32;
-        for r in 0..side {
+        let w = width as i32;
+        for r in 0..height {
             let sz = origin.1 + r as i32;
             if !(0..grid).contains(&sz) {
                 continue;
@@ -84,7 +84,7 @@ impl SuperHexTerrainGrid {
                 continue;
             }
             let row_base = (sz as usize) * (SUPER_SIDE as usize);
-            let dst = r * side + (start - origin.0) as usize;
+            let dst = r * width + (start - origin.0) as usize;
             let count = (end - start) as usize;
             out[dst..dst + count].copy_from_slice(&self.cells[row_base + start as usize..row_base + end as usize]);
         }
@@ -184,7 +184,7 @@ mod tests {
         grid.set(2, 1, pack_terrain(30, 20, 5, 3));
 
         // origin (−1, −1): cell (r, c) holds super (c−1, r−1).
-        let bytes = grid.window((-1, -1), 4);
+        let bytes = grid.window((-1, -1), 4, 4);
         assert_eq!(bytes.len(), 4 * 4 * 8);
         let cell =
             |r: usize, c: usize| u64::from_le_bytes(bytes[(r * 4 + c) * 8..(r * 4 + c) * 8 + 8].try_into().unwrap());
@@ -194,6 +194,6 @@ mod tests {
         assert_eq!(cell(0, 3), 0);
 
         // A window fully past the region edge is all zeros.
-        assert!(grid.window((SUPER_SIDE, SUPER_SIDE), 4).iter().all(|b| *b == 0));
+        assert!(grid.window((SUPER_SIDE, SUPER_SIDE), 4, 4).iter().all(|b| *b == 0));
     }
 }

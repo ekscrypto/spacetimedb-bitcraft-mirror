@@ -389,7 +389,7 @@ mod tests {
 
         // Region 9 origin is (23040, 7680): world (23050, 7700) is local
         // (10, 20) and world (23051, 7700) is local (11, 20) — both inside
-        // super hex (3, 6). World (5, 5) belongs to region 1 and must be
+        // super hex (3, 7). World (5, 5) belongs to region 1 and must be
         // skipped.
         let query = super::roads_pb::MapQuery {
             tiles: vec![
@@ -419,7 +419,7 @@ mod tests {
                 set_paving(cell, 5);
                 set_claim_index(cell, 1);
             }
-            grid.terrain.set(3, 6, pack_terrain(10, -5, 20, 2));
+            grid.terrain.set(3, 7, pack_terrain(10, -5, 20, 2));
             grid.mark_ready();
         }
 
@@ -447,10 +447,10 @@ mod tests {
         assert_eq!((decoded.tiles[1].x, decoded.tiles[1].z), (23051, 7700));
         assert_eq!(decoded.tiles[1].paving_type_id, 0);
         assert_eq!(decoded.tiles[1].claim_entity_id, 0);
-        // Both tiles share super hex (3, 6); its world base tile is
-        // (23049, 7698).
+        // Both tiles share super hex (3, 7); its world center tile is
+        // (3·3 + 1, 3·7) local → (23050, 7701).
         assert_eq!(decoded.terrain.len(), 1);
-        assert_eq!((decoded.terrain[0].x, decoded.terrain[0].z), (23049, 7698));
+        assert_eq!((decoded.terrain[0].x, decoded.terrain[0].z), (23050, 7701));
         assert_eq!(decoded.terrain[0].terrain, pack_terrain(10, -5, 20, 2));
     }
 

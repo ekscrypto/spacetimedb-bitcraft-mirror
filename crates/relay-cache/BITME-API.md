@@ -345,7 +345,7 @@ not just the old roads harvestable list. Poll counts as session activity
 | 10 | **Origin flag** — this tile is the resource's anchor tile |
 | 11–13 | `direction_index` (0–5), repeated on every tile of the footprint |
 | 14 | **Paving flag** — the tile is player-paved; bits 0–9 then hold a **paving index** (the dictionary lists these as entries with `"paving": true` and a `paving_type_id`) |
-| 15 | **Water flag** — the tile's terrain sits below its water level. Terrain never flips water↔land, so this is filled once from the terrain seed and rides along on every word — including otherwise-empty tiles (`0x8000` alone = water, nothing on it). Resolution is the 3×3-tile terrain super-hex. |
+| 15 | **Water flag** — the tile's terrain sits below its water level. Terrain never flips water↔land, so this is filled once from the terrain seed and rides along on every word — including otherwise-empty tiles (`0x8000` alone = water, nothing on it). Resolution is the terrain super-hex: a water super wets its 7-tile flower, and corner tiles (where three supers meet) are water when *any* of the three is. |
 
 The server stamps every occupied tile of a multi-hex resource
 (`resource_desc.footprint` × `direction`), so per-tile rendering needs no
@@ -399,17 +399,29 @@ HTTP 503  {"error": "roads cache not enabled"}
 ## 6. `GET /bitme/world/:x/:z/elevation`
 
 The super-hex terrain plane covering the same 400×400 window as §5: one
-packed `u64` per super-hex (3×3 small tiles each — the same grid as
-in-game N/E), 134×134 cells, sliced from the resident terrain grid.
+packed `u64` per super-hex, sliced from the resident terrain grid.
 
+- **Grid semantics (v2):** super-hexes are the game's terrain lattice — a
+  true hex grid at 3× the tile scale, addressed in odd-r offset coordinates
+  the same way small tiles are. This is *not* a rectangular 3×3 blocking of
+  tile indices: a super at offset `(X, Z)` has its **center tile** at
+  `(3X + (Z&1), 3Z)` (odd super rows sit one tile right — the odd-r shear
+  at 3× scale), exclusively owns the **7-tile flower** around that center
+  (the center plus its 6 odd-r neighbours), and shares the **corner
+  tiles** where three supers meet. Mapping a tile to its super:
+  `q = x − ⌊z/2⌋; r = z` (odd-r → axial), round each component to the
+  nearest third, convert back to odd-r at the super scale. Corner tiles
+  (axial `x ≡ z ≡ ±1 mod 3`) blend **three** supers — water at a corner
+  is any-of-the-three, matching the game's `is_submerged`.
 - **Response:** `application/octet-stream`, `Cache-Control: no-store`,
-  143,672 bytes = 24-byte header + 17,956 little-endian u64 cells
-  (row-major). A 400-tile span always covers exactly 134 super columns,
-  so the size never varies.
-- **Coverage:** cell `(r, c)` covers world tiles
-  `x ∈ [origin_super_x + 3c … +2]`, `z ∈ [origin_super_z + 3r … +2]` — a
-  superset of the resource window (partial super-hexes at the edges stick
-  out by up to 2 tiles). Cells outside the region are `0`.
+  `26 + width·height·8` bytes (width 134–137 × height 136 for a 400-tile
+  window; the shear makes the column count depend on the window's row
+  alignment). Cells are u64 LE, row-major in super offset space.
+- **Coverage:** the window covers every super owning or blended by a tile
+  of the resource window, padded one super on each side. Cells outside
+  the region are `0`. Cell `(r, c)` is the super at offset
+  `(origin_super + (c, r))`; `origin_super` is recoverable from the header
+  center tile via `X = (x − (Z&1))/3, Z = z/3` (floored division).
 - **Generation:** the header carries the grid's update counter and
   terraform bumps it; elevation is the only field that changes after
   seed. Refetch when it moves.
@@ -419,12 +431,13 @@ in-game N/E), 134×134 cells, sliced from the resident terrain grid.
 | Offset | Type | Meaning |
 |---|---|---|
 | 0–3 | `[u8; 4]` | Magic `BME1` |
-| 4–5 | `u16` | Format version (`1`) |
-| 6–7 | `u16` | Super-hexes per side (`134`) |
-| 8–11 | `i32` | `origin_super_world_x` — world tile of cell (0, 0)'s (0, 0) tile |
-| 12–15 | `i32` | `origin_super_world_z` |
-| 16–19 | `u32` | Region id |
-| 20–23 | `u32` | `generation` — grid update counter (low 32 bits) |
+| 4–5 | `u16` | Format version (`2`) |
+| 6–7 | `u16` | `width` — super-hex columns |
+| 8–9 | `u16` | `height` — super-hex rows |
+| 10–13 | `i32` | `origin_center_world_x` — world tile of cell (0, 0)'s center tile |
+| 14–17 | `i32` | `origin_center_world_z` |
+| 18–21 | `u32` | Region id |
+| 22–25 | `u32` | `generation` — grid update counter (low 32 bits) |
 
 ### Terrain cell (u64 LE) — the roads region-map cell unchanged
 

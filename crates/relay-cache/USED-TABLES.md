@@ -140,7 +140,8 @@ Endpoints with **no** synchronized tables: `/cache-health`, `/proto`,
   `resource_desc.footprint`, plus paved tiles from `paved_tile_state`
   ⋈ location (stamped only into empty tiles — resources win the rare
   collision) and the water flag from `terrain_chunk_state`
-  (elevation < water level per 3×3 super-hex; static, filled at seed).
+  (elevation < water level per terrain super-hex — 7-tile flower with
+  any-of-three corner blending; static, filled at seed).
   One resource per tile: multi-hex shapes overwrite their
   tiles; a single-hex newcomer onto an occupied tile (the world does spawn
   forageables under multi-hex resources) is not stamped; clears only zero

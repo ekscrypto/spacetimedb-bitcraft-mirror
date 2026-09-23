@@ -9,7 +9,10 @@ use hashbrown::{HashMap, HashSet};
 use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
 
-use super::coords::{region_origin, small_to_super, world_to_local, SMALL_PER_SUPER};
+use super::coords::{
+    region_origin, small_corner_supers, small_is_corner, small_to_super, super_center_tile,
+    world_to_local,
+};
 use super::decode::TerrainChunkRow;
 use super::grid::{get_claim_index, get_paving, OVERLAY_BYTES, TERRAIN_BYTES};
 use super::index::ClaimIndexTable;
@@ -154,16 +157,25 @@ impl RoadsRegionGrid {
                 claim_entity_id,
             });
             supers.insert(small_to_super(lx, lz));
+            // Corner tiles blend three supers — include them all.
+            if small_is_corner(lx, lz) {
+                for s in small_corner_supers(lx, lz) {
+                    supers.insert(s);
+                }
+            }
         }
 
         let mut super_list: Vec<(i32, i32)> = supers.into_iter().collect();
         super_list.sort_unstable();
         window.terrain = super_list
             .into_iter()
-            .map(|(sx, sz)| MapSuperHexData {
-                x: origin.x + sx * SMALL_PER_SUPER,
-                z: origin.z + sz * SMALL_PER_SUPER,
-                terrain: self.terrain.get(sx, sz),
+            .map(|(sx, sz)| {
+                let center = super_center_tile(sx, sz);
+                MapSuperHexData {
+                    x: origin.x + center.0,
+                    z: origin.z + center.1,
+                    terrain: self.terrain.get(sx, sz),
+                }
             })
             .collect();
         window
@@ -212,7 +224,9 @@ pub struct MapTileData {
 
 #[derive(Debug)]
 pub struct MapSuperHexData {
-    /// World coord of the super-hex block's `(0, 0)` small tile.
+    /// World coord of the super-hex's center small tile: `(3x + (z&1), 3z)`
+    /// — the official terrain lattice, where odd super rows sit one tile
+    /// right (the odd-r shear at 3× scale).
     pub x: i32,
     pub z: i32,
     pub terrain: u64,
@@ -302,7 +316,7 @@ mod tests {
             set_paving(cell, 7);
             set_claim_index(cell, 2);
         }
-        grid.terrain.set(3, 6, pack_terrain(10, -5, 20, 2));
+        grid.terrain.set(3, 7, pack_terrain(10, -5, 20, 2));
         grid.terrain.set(4, 7, pack_terrain(-3, 1, -2, 9));
 
         // Duplicates, unsorted input, and an out-of-region tile are folded
@@ -320,15 +334,20 @@ mod tests {
         assert_eq!(window.tiles[1].paving_type_id, 7);
         assert_eq!(window.tiles[1].claim_entity_id, snap.claim_table[2]);
 
-        // One super hex per distinct 3x3 block, matching the dense snapshot
-        // bytes at the covering terrain index.
+        // One super per owning cell under the official lattice — tile
+        // (10,20) → super (3,7), tile (12,21) → super (4,7) — anchored at
+        // their center tiles (3X + (Z&1), 3Z) and matching the dense
+        // snapshot bytes at the covering terrain index.
         assert_eq!(window.terrain.len(), 2);
-        assert_eq!((window.terrain[0].x, window.terrain[0].z), (9, 18));
+        assert_eq!((window.terrain[0].x, window.terrain[0].z), (10, 21));
         assert_eq!(window.terrain[0].terrain, pack_terrain(10, -5, 20, 2));
-        assert_eq!((window.terrain[1].x, window.terrain[1].z), (12, 21));
+        assert_eq!((window.terrain[1].x, window.terrain[1].z), (13, 21));
         assert_eq!(window.terrain[1].terrain, pack_terrain(-3, 1, -2, 9));
         for super_hex in &window.terrain {
-            let idx = terrain_index(super_hex.x / 3, super_hex.z / 3).unwrap();
+            // The center tile maps back to its super under the official
+            // lattice (roundtrip guaranteed by small_to_super).
+            let (sx, sz) = small_to_super(super_hex.x, super_hex.z);
+            let idx = terrain_index(sx, sz).unwrap();
             let bytes = &snap.terrain[idx * 8..idx * 8 + 8];
             assert_eq!(super_hex.terrain, u64::from_le_bytes(bytes.try_into().unwrap()));
         }

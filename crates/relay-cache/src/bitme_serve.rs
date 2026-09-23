@@ -18,7 +18,9 @@ use axum::routing::get;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::roads::coords::{region_origin, world_to_local, world_to_region, SMALL_PER_SUPER};
+use crate::roads::coords::{
+    region_origin, small_to_super, super_center_tile, world_to_local, world_to_region,
+};
 use crate::roads::grid::get_claim_index;
 use crate::roads::resource_map::is_harvestable_resource_id;
 use crate::roads::store::RoadsRegionHandle;
@@ -29,11 +31,6 @@ use crate::store::RegionStore;
 /// Window side in tiles for the resource-window endpoints (the anchor tile
 /// sits at the center, `(width/2, width/2)`).
 const RESOURCE_WINDOW_WIDTH: usize = 400;
-
-/// Super-hexes per side covering a [`RESOURCE_WINDOW_WIDTH`] elevation
-/// window. Any 400-tile span covers exactly ceil(400/3) super columns —
-/// 400 ≡ 1 (mod 3), so every start offset yields the same count.
-const ELEVATION_WINDOW_SUPER_SIDE: usize = RESOURCE_WINDOW_WIDTH.div_ceil(SMALL_PER_SUPER as usize);
 
 pub fn bitme_routes() -> axum::Router<Fleet> {
     axum::Router::new()
@@ -268,18 +265,22 @@ async fn bitme_world_resources(State(fleet): State<Fleet>, Path((x, z)): Path<(S
 /// `GET /bitme/world/:x/:z/elevation` — the super-hex terrain plane covering
 /// the same 400×400 small-tile window as `/bitme/world/:x/:z/resources`: one
 /// packed u64 per super-hex (`pack_terrain`: elev | original<<16 |
-/// water_level<<32 | water_body_type<<48). Any 400-tile span covers exactly
-/// 134 super-hexes per side, so the payload is always 134×134 cells (~140
-/// KiB) sliced straight from the resident terrain grid.
+/// water_level<<32 | water_body_type<<48), sliced straight from the resident
+/// terrain grid.
 ///
-/// Response body: 24-byte LE header mirroring `BMR1`, then the cells u64 LE
-/// row-major. Cell `(r, c)` covers world small tiles `x ∈ [origin_x + 3c,
-/// origin_x + 3c + 2]`, `z ∈ [origin_z + 3r, origin_z + 3r + 2]`, where
-/// `(origin_x, origin_z)` is the header's super origin (world coord of the
-/// first cell's (0,0) tile). The covering supers are a superset of the
-/// resource window — partial supers at the edges extend past it. Cells
-/// outside the region are zero; `generation` mirrors the grid's update
-/// counter (terraform bumps it), so clients can refetch on change.
+/// The super grid is the game's terrain lattice — a true hex grid at 3× the
+/// tile scale in odd-r offset coordinates (`small_to_super`), *not*
+/// rectangular 3×3 blocks of tile indices. Cell `(r, c)` is the super at
+/// offset `(origin + (c, r))`; its center tile is `(3X + (Z&1), 3Z)` (the
+/// header origin names cell (0,0)'s center tile), it exclusively owns the
+/// 7-tile flower around that center, and the corner tiles where three
+/// supers meet blend all three (see BITME-API.md §6). The covering window is
+/// padded one super on every side so edge corner tiles can still blend.
+/// Because the odd-r shear makes the cover's width vary with the window's
+/// row alignment (134–137 columns × 136 rows), the header carries explicit
+/// width/height. Cells outside the region are zero; `generation` mirrors
+/// the grid's update counter (terraform bumps it), so clients can refetch
+/// on change.
 async fn bitme_world_elevation(State(fleet): State<Fleet>, Path((x, z)): Path<(String, String)>) -> Response {
     match resolve_world_anchor(&x, &z) {
         Ok((x, z, region)) => elevation_window_response(&fleet, region, (x, z)),
@@ -375,11 +376,45 @@ fn resource_window_response(fleet: &Fleet, region: u32, center: (i32, i32)) -> R
     no_store_octets(body)
 }
 
+/// Region-local super window covering the tile window
+/// `x ∈ [lx0, lx0+width)`, `z ∈ [lz0, lz0+height)`: `(origin, width, height)`
+/// in super odd-r offset coords, padded one super on every side so corner
+/// tiles at the window edges can still blend all three of their supers.
+///
+/// A tile's super *column*, `small_to_super(x, z).0`, is periodic in `z`
+/// with period 6 (the odd-r shear and the ÷3 rounding realign every 6
+/// rows), and monotone in `x` — so sampling 6 rows at both `x` extremes
+/// bounds the covering columns exactly. Super rows are simply
+/// `round(z/3)`, monotone in `z`.
+fn covering_super_window(lx0: i32, lz0: i32, width: i32, height: i32) -> ((i32, i32), usize, usize) {
+    let mut x_min = i32::MAX;
+    let mut x_max = i32::MIN;
+    for dz in 0..height.min(6) {
+        let z = lz0 + dz;
+        for x in [lx0, lx0 + width - 1] {
+            let (sx, _) = small_to_super(x, z);
+            x_min = x_min.min(sx);
+            x_max = x_max.max(sx);
+        }
+    }
+    // Corner tiles blend supers up to one offset column/row outside the
+    // owning cover on either side.
+    x_min -= 1;
+    x_max += 1;
+    let z_min = small_to_super(lx0, lz0).1 - 1;
+    let z_max = small_to_super(lx0, lz0 + height - 1).1 + 1;
+    (
+        (x_min, z_min),
+        (x_max - x_min + 1) as usize,
+        (z_max - z_min + 1) as usize,
+    )
+}
+
 /// Elevation counterpart of [`resource_window_response`]: slice the
-/// `ELEVATION_WINDOW_SUPER_SIDE`² super-hex terrain cells covering the
-/// 400×400 window centered on `center` and pack them behind the `BME1`
-/// header (24-byte LE: magic, version, super side, super origin world x/z,
-/// region, generation). Same 503/404/202 semantics.
+/// super-hex terrain cells covering the 400×400 window centered on
+/// `center` ([`covering_super_window`]) and pack them behind the `BME1`
+/// header (26-byte LE: magic, version 2, width, height, center-tile world
+/// x/z, region, generation). Same 503/404/202 semantics.
 fn elevation_window_response(fleet: &Fleet, region: u32, center: (i32, i32)) -> Response {
     let handle = match roads_region(fleet, region) {
         Ok(handle) => handle,
@@ -395,22 +430,26 @@ fn elevation_window_response(fleet: &Fleet, region: u32, center: (i32, i32)) -> 
             return (StatusCode::ACCEPTED, Vec::<u8>::new()).into_response();
         }
         let origin = region_origin(handle.region as u16);
-        // Region-local super coords of the first covering cell; flooring
-        // (div_euclid) keeps partially-covered supers at negative origins.
-        let origin_super = (
-            (origin_world.0 - origin.x).div_euclid(SMALL_PER_SUPER),
-            (origin_world.1 - origin.z).div_euclid(SMALL_PER_SUPER),
+        let (super_origin, width, height) = covering_super_window(
+            origin_world.0 - origin.x,
+            origin_world.1 - origin.z,
+            RESOURCE_WINDOW_WIDTH as i32,
+            RESOURCE_WINDOW_WIDTH as i32,
         );
-        let payload = grid.terrain.window(origin_super, ELEVATION_WINDOW_SUPER_SIDE);
+        let payload = grid.terrain.window(super_origin, width, height);
 
-        let mut body = Vec::with_capacity(24 + payload.len());
+        let mut body = Vec::with_capacity(26 + payload.len());
         body.extend_from_slice(b"BME1");
-        body.extend_from_slice(&1u16.to_le_bytes()); // format version
-        body.extend_from_slice(&(ELEVATION_WINDOW_SUPER_SIDE as u16).to_le_bytes());
-        body.extend_from_slice(&(origin.x + origin_super.0 * SMALL_PER_SUPER).to_le_bytes());
-        body.extend_from_slice(&(origin.z + origin_super.1 * SMALL_PER_SUPER).to_le_bytes());
+        body.extend_from_slice(&2u16.to_le_bytes()); // format version
+        body.extend_from_slice(&(width as u16).to_le_bytes());
+        body.extend_from_slice(&(height as u16).to_le_bytes());
+        // Header origin: world coord of cell (0,0)'s center tile — the super
+        // grid's odd-r shear means that is (3X + (Z&1), 3Z), not (3X, 3Z).
+        let center0 = super_center_tile(super_origin.0, super_origin.1);
+        body.extend_from_slice(&(origin.x + center0.0).to_le_bytes());
+        body.extend_from_slice(&(origin.z + center0.1).to_le_bytes());
         body.extend_from_slice(&handle.region.to_le_bytes());
-        // u32 keeps the header at 24 bytes; generation is a small counter.
+        // u32 keeps the field compact; generation is a small counter.
         body.extend_from_slice(&(grid.generation as u32).to_le_bytes());
         body.extend_from_slice(&payload);
         body
@@ -830,6 +869,7 @@ mod tests {
     use crate::bitme::BitmeHub;
     use crate::decode::{ExtractionRecipeRow, MobileEntityRow, ResourceDescRow};
     use crate::interest::InterestHub;
+    use crate::roads::coords::{small_corner_supers, small_is_corner};
     use crate::roads::catalog::{GlobalRoadsCatalog, RoadsFleet};
     use crate::roads::grid::{pack_terrain, unpack_terrain_water};
     use crate::roads::store::{RoadsRegionGrid, RoadsRegionHandle};
@@ -870,8 +910,9 @@ mod tests {
                 grid.resource_map.note_desc(74, &[]);
                 grid.resource_map.upsert(100, 74, 2, Some((7690, 7700)));
                 grid.resource_map.stamp_paving(7691, 7700, 59838);
-                // Terrain under the player: local small (10, 20) → super (3, 6).
-                grid.terrain.set(3, 6, pack_terrain(120, 100, 50, 2));
+                // Terrain under the player: local small (10, 20) → super
+                // (3, 7) under the official axial-rounding lattice.
+                grid.terrain.set(3, 7, pack_terrain(120, 100, 50, 2));
                 grid.mark_ready();
             }
             roads.catalog.write().paving.push(crate::roads::decode::PavingDescRow {
@@ -1172,37 +1213,65 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers()["content-type"], "application/octet-stream");
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let side = ELEVATION_WINDOW_SUPER_SIDE;
-        assert_eq!(body.len(), 24 + side * side * 8);
+
+        // Covering supers for local tile window [−190, 210) × [−180, 220):
+        // origin (−65, −61), 137 columns × 136 rows. The odd-r shear makes
+        // the column count vary with the window's row alignment (134–137).
+        let (origin, width, height) = covering_super_window(-190, -180, 400, 400);
+        assert_eq!((origin, width, height), ((-65, -61), 137, 136));
+
+        assert_eq!(body.len(), 26 + width * height * 8);
         assert_eq!(&body[0..4], b"BME1");
-        assert_eq!(u16::from_le_bytes(body[4..6].try_into().unwrap()), 1); // version
-        assert_eq!(u16::from_le_bytes(body[6..8].try_into().unwrap()), 134); // super side
-                                                                             // Super origin: window origin (7490, 7500) floors to region-local
-                                                                             // super (−64, −60) → world (7680 − 192, 7680 − 180).
-        assert_eq!(i32::from_le_bytes(body[8..12].try_into().unwrap()), 7488);
-        assert_eq!(i32::from_le_bytes(body[12..16].try_into().unwrap()), 7500);
-        assert_eq!(u32::from_le_bytes(body[16..20].try_into().unwrap()), 7);
+        assert_eq!(u16::from_le_bytes(body[4..6].try_into().unwrap()), 2); // version
+        assert_eq!(u16::from_le_bytes(body[6..8].try_into().unwrap()), 137); // width
+        assert_eq!(u16::from_le_bytes(body[8..10].try_into().unwrap()), 136); // height
+                                                                           // Cell (0,0) = super (−65, −61); its center tile is (3·(−65)+1,
+                                                                           // 3·(−61)) local → world (7680 − 194, 7680 − 183) — odd super rows
+                                                                           // sit one tile right.
+        assert_eq!(i32::from_le_bytes(body[10..14].try_into().unwrap()), 7486);
+        assert_eq!(i32::from_le_bytes(body[14..18].try_into().unwrap()), 7497);
+        assert_eq!(u32::from_le_bytes(body[18..22].try_into().unwrap()), 7);
         assert_eq!(
-            u32::from_le_bytes(body[20..24].try_into().unwrap()),
+            u32::from_le_bytes(body[22..26].try_into().unwrap()),
             expected_generation as u32
         );
 
         let cell = |r: usize, c: usize| {
             u64::from_le_bytes(
-                body[24 + (r * side + c) * 8..24 + (r * side + c) * 8 + 8]
+                body[26 + (r * width + c) * 8..26 + (r * width + c) * 8 + 8]
                     .try_into()
                     .unwrap(),
             )
         };
-        // Seeded super (3, 6) → row 6 − (−60) = 66, col 3 − (−64) = 67; all
+        // Seeded super (3, 7) → row 7 − (−61) = 68, col 3 − (−65) = 68; all
         // four packed fields survive the roundtrip.
-        let word = cell(66, 67);
+        let word = cell(68, 68);
         assert_eq!(word, pack_terrain(120, 100, 50, 2));
         assert_eq!(unpack_terrain_water(word), (120, 50));
         assert_eq!(((word >> 16) & 0xFFFF) as u16 as i16, 100); // original
         assert_eq!((word >> 48) as u8, 2); // water_body_type
                                            // Out-of-region corner supers are zero (window origin is negative).
         assert_eq!(cell(0, 0), 0);
+
+        // Covering guarantee: every tile of the 400×400 window finds all of
+        // its supers — the primary, plus the corner triple where three
+        // supers meet — inside the served window.
+        for lz in -180..220 {
+            for lx in -190..210 {
+                let supers = if small_is_corner(lx, lz) {
+                    small_corner_supers(lx, lz).to_vec()
+                } else {
+                    vec![small_to_super(lx, lz)]
+                };
+                for (sx, sz) in supers {
+                    let (dr, dc) = (sz - origin.1, sx - origin.0);
+                    assert!(
+                        dr >= 0 && (dr as usize) < height && dc >= 0 && (dc as usize) < width,
+                        "tile ({lx},{lz}) super ({sx},{sz}) outside window {origin:?} {width}×{height}"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]

@@ -121,9 +121,66 @@ pub fn world_to_local(region: u16, x: i32, z: i32) -> Option<(i32, i32)> {
     Some((lx, lz))
 }
 
-/// Region-local small-hex coords → super-hex coords covering the tile.
+/// `round(v / 3)` — the game's per-component `HexCoordinates::scale(1/3)`
+/// (f32 `.round()`, half away from zero). No `.5` ties exist because the
+/// residue is never ±½·3, so this integer form matches exactly.
+fn round_div3(v: i32) -> i32 {
+    (v + 1).div_euclid(3)
+}
+
+/// Region-local small-hex coords → the super-hex that owns the tile, in
+/// super odd-r offset coords (region-local).
+///
+/// Matches the game server's `SmallHexTile::parent_large_tile`: convert to
+/// axial, round each component to nearest thirds, convert back to odd-r at
+/// the super scale. The supers are a true hex lattice at 3× the tile scale,
+/// *not* rectangular 3×3 blocks of tile indices — odd super rows sit one
+/// tile further right ([`super_center_tile`]).
+///
+/// Corner tiles — axial `x ≡ z ≡ ±1 (mod 3)`, see [`small_is_corner`] — sit
+/// where three supers meet and blend all of them
+/// ([`small_corner_supers`]); this returns the round-to-nearest one.
 pub fn small_to_super(lx: i32, lz: i32) -> (i32, i32) {
-    (lx.div_euclid(SMALL_PER_SUPER), lz.div_euclid(SMALL_PER_SUPER))
+    let (q, r) = offset_to_axial(lx, lz);
+    let h = axial_to_offset(round_div3(q), round_div3(r));
+    (h.x, h.z)
+}
+
+/// Is this small tile a terrain corner — the tiles where three super-hexes
+/// meet (axial `x ≡ z ≡ ±1 (mod 3)`; game `SmallHexTile::is_corner`)?
+pub fn small_is_corner(lx: i32, lz: i32) -> bool {
+    let (q, r) = offset_to_axial(lx, lz);
+    let rq = q.rem_euclid(3);
+    rq != 0 && rq == r.rem_euclid(3)
+}
+
+/// The three super-hexes a corner tile blends (game
+/// `SmallHexTile::get_terrain_coordinates`), in super odd-r offset coords.
+/// Only defined for corner tiles — [`small_is_corner`] decides.
+pub fn small_corner_supers(lx: i32, lz: i32) -> [(i32, i32); 3] {
+    let (q, r) = offset_to_axial(lx, lz);
+    let q0 = round_div3(q);
+    let r0 = round_div3(r);
+    // Down-corner (axial 3q+1, 3r+1) adds (q+1, r) and (q, r+1);
+    // up-corner (axial 3q−1, 3r−1) adds (q−1, r) and (q, r−1).
+    let [a, b, c] = if q.rem_euclid(3) == 1 {
+        [(q0, r0), (q0 + 1, r0), (q0, r0 + 1)]
+    } else {
+        [(q0, r0), (q0 - 1, r0), (q0, r0 - 1)]
+    };
+    [axial_super(a), axial_super(b), axial_super(c)]
+}
+
+fn axial_super((q, r): (i32, i32)) -> (i32, i32) {
+    let h = axial_to_offset(q, r);
+    (h.x, h.z)
+}
+
+/// Super odd-r offset coords → the world/region-local small tile at the
+/// super's center (game `LargeHexTile::center_small_tile`): `(3x + (z&1), 3z)`
+/// — odd super rows are shifted one tile right, the odd-r shear at scale 3.
+pub fn super_center_tile(sx: i32, sz: i32) -> (i32, i32) {
+    (sx * SMALL_PER_SUPER + (sz & 1), sz * SMALL_PER_SUPER)
 }
 
 #[cfg(test)]
@@ -190,5 +247,108 @@ mod tests {
         // is odd-r (11,2), not naive (10,2).
         let tiles: Vec<_> = footprint_world_hexes(10, 1, 0, &[(0, 0), (0, 1)]).collect();
         assert_eq!(tiles, vec![(10, 1), (11, 2)]);
+    }
+
+    #[test]
+    fn super_center_tile_roundtrips_through_small_to_super() {
+        for sz in -40..40 {
+            for sx in -40..40 {
+                let (cx, cz) = super_center_tile(sx, sz);
+                assert_eq!(small_to_super(cx, cz), (sx, sz), "super ({sx},{sz})");
+            }
+        }
+    }
+
+    #[test]
+    fn small_to_super_matches_official_axial_rounding() {
+        // Hand-derived from the game's parent_large_tile (axial round(÷3)):
+        // rows of 400 consecutive tiles each map to 134 consecutive supers,
+        // and odd super rows start one tile further right.
+        for lz in 0..12 {
+            let mut cols: Vec<i32> = (0..400).map(|lx| small_to_super(lx, lz).0).collect();
+            cols.dedup();
+            // Consecutive columns, no gaps or repeats in the run.
+            for w in cols.windows(2) {
+                assert_eq!(w[1] - w[0], 1, "row {lz}");
+            }
+            assert_eq!(cols.len(), 134, "row {lz}");
+            // Super z is round(z/3), independent of x.
+            assert_eq!(small_to_super(0, lz).1, round_div3_pub(lz));
+        }
+        // Block semantics would give (0,0) for tile (2,0); the official
+        // lattice assigns it to the next super over.
+        assert_eq!(small_to_super(0, 0), (0, 0));
+        assert_eq!(small_to_super(1, 0), (0, 0));
+        assert_eq!(small_to_super(2, 0), (1, 0));
+        assert_eq!(small_to_super(0, 1), (0, 0));
+        assert_eq!(small_to_super(0, 2), (0, 1));
+        assert_eq!(small_to_super(0, 3), (0, 1));
+        assert_eq!(small_to_super(0, 5), (0, 2));
+    }
+
+    #[test]
+    fn super_x_is_periodic_in_tile_z_with_period_6() {
+        // The covering-window math relies on X(x, z+6) == X(x, z).
+        for lz in -20..20 {
+            for lx in [-7, 0, 5, 123] {
+                assert_eq!(
+                    small_to_super(lx, lz + 6).0,
+                    small_to_super(lx, lz).0,
+                    "tile ({lx},{lz})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn corner_tiles_know_their_three_supers() {
+        // Tile (1,1) is the down-corner of super axial (0,0) → offset (0,0);
+        // official get_terrain_coordinates returns (0,0), (1,0), (0,1).
+        assert!(small_is_corner(1, 1));
+        assert_eq!(small_corner_supers(1, 1), [(0, 0), (1, 0), (0, 1)]);
+        // Tile (6,4): axial (4,4) → down-corner of super axial (1,1) whose
+        // offset is (1,1); extra supers axial (2,1)→(2,1) and (1,2)→(2,2).
+        assert!(small_is_corner(6, 4));
+        assert_eq!(small_corner_supers(6, 4), [(1, 1), (2, 1), (2, 2)]);
+        // Up-corner: tile axial (−1,−1) is offset (−2,−1) — supers
+        // axial (0,0),(−1,0),(0,−1) → offsets (0,0),(−1,0),(−1,−1).
+        assert!(small_is_corner(-2, -1));
+        assert_eq!(small_corner_supers(-2, -1), [(0, 0), (-1, 0), (-1, -1)]);
+        // Up-corner at positive coords: tile (0,2) is axial (−1,2), the
+        // up-corner of super (0,1) → supers (0,1), (−1,1), (0,0).
+        assert!(small_is_corner(0, 2));
+        assert_eq!(small_corner_supers(0, 2), [(0, 1), (-1, 1), (0, 0)]);
+        // Regular tiles are not corners.
+        assert!(!small_is_corner(0, 0));
+        assert!(!small_is_corner(2, 0));
+        assert!(!small_is_corner(0, 1));
+        assert!(!small_is_corner(2, 1));
+    }
+
+    #[test]
+    fn corner_supers_include_the_primary_and_are_distinct() {
+        for lz in -15..15 {
+            for lx in -15..15 {
+                if !small_is_corner(lx, lz) {
+                    continue;
+                }
+                let primary = small_to_super(lx, lz);
+                let triple = small_corner_supers(lx, lz);
+                // The round-to-nearest super is always one of the three the
+                // game blends.
+                assert!(
+                    triple.contains(&primary),
+                    "tile ({lx},{lz}) primary {primary:?} not in {triple:?}"
+                );
+                let [a, b, c] = triple;
+                assert_ne!(a, b);
+                assert_ne!(b, c);
+                assert_ne!(a, c);
+            }
+        }
+    }
+
+    fn round_div3_pub(v: i32) -> i32 {
+        (v + 1).div_euclid(3)
     }
 }
