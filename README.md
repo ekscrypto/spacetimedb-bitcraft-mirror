@@ -110,6 +110,7 @@ HTTP (protobuf-encoded bodies; the `.proto` sources self-describe the API):
 | `/storage-logs` | storage chest access logs |
 | `/proto` · `/proto/:name` | protobuf schema sources |
 | `/internal/dim-buildings/ws` | WebSocket push: housing-interior building entity IDs per (region, dimension) — see [`crates/relay-cache/DIM-BUILDINGS-WS.md`](crates/relay-cache/DIM-BUILDINGS-WS.md) |
+| `/bitme/session/:id/resources/ws` | WebSocket push: resource-tile changes inside the player's 400×400 compacted-map window (BMD1 deltas; client refetches the BMR1 window on reconnect/resync) — see [`crates/relay-cache/BITME-API.md`](crates/relay-cache/BITME-API.md) §8 |
 | `/internal/stats` | loopback-only diagnostics (memory, row counts) — deliberately not proxied publicly |
 
 Full endpoint documentation: [`crates/relay-cache/README.md`](crates/relay-cache/README.md).

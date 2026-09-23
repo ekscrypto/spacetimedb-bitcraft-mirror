@@ -45,13 +45,13 @@
 //! **all** `resource_state` rows (every resource type, including forageables
 //! and event resources); consumers filter via the dictionary.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 use hashbrown::HashMap;
 
 use super::coords::{
-    axial_to_offset, footprint_world_hexes, offset_to_axial, overlay_index, world_to_local,
-    REGION_SIDE, SUPER_SIDE,
+    axial_to_offset, footprint_world_hexes, offset_to_axial, overlay_index, world_to_local, REGION_SIDE, SUPER_SIDE,
 };
 use super::grid::{unpack_terrain_water, SuperHexTerrainGrid};
 
@@ -214,6 +214,14 @@ pub struct ResourceTileMap {
     paving_index_by_id: HashMap<i32, u16>,
     warned_overflow: bool,
     warned_paving_overflow: bool,
+    /// Live watch recording gate ([`Self::set_watch`]). Off during seeds —
+    /// the seed path applies to a staging grid whose flag is never set —
+    /// so the pending buffer only grows on the live grid while at least
+    /// one resource-stream listener exists.
+    watch: AtomicBool,
+    /// Tile changes (local tile index, final word incl. the water bit)
+    /// recorded since the last [`Self::take_pending`], in write order.
+    pending: Vec<(u32, u16)>,
 }
 
 impl ResourceTileMap {
@@ -229,6 +237,8 @@ impl ResourceTileMap {
             paving_index_by_id: HashMap::new(),
             warned_overflow: false,
             warned_paving_overflow: false,
+            watch: AtomicBool::new(false),
+            pending: Vec::new(),
         }
     }
 
@@ -243,6 +253,34 @@ impl ResourceTileMap {
     /// Located entity count (for diagnostics parity with the old index).
     pub fn located_len(&self) -> usize {
         self.by_entity.values().filter(|n| n.loc.is_some()).count()
+    }
+
+    /// Enable/disable tile-change recording for the live watch stream
+    /// ([`crate::roads::watch`]). The watch hub flips this on the live grid
+    /// when the first listener registers for the region, and off when the
+    /// last leaves or the grid is swapped; a stale-true flag costs nothing
+    /// beyond one drained-empty buffer per batch.
+    pub fn set_watch(&self, on: bool) {
+        self.watch.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether change recording is on (diagnostics / tests).
+    pub fn watch_enabled(&self) -> bool {
+        self.watch.load(Ordering::Relaxed)
+    }
+
+    /// Drain recorded tile changes — `(local tile index, final word)` pairs,
+    /// final word including the terrain water bit — since the last call.
+    /// Consumed by the live feed's resource-watch fan-out.
+    pub fn take_pending(&mut self) -> Vec<(u32, u16)> {
+        std::mem::take(&mut self.pending)
+    }
+
+    /// Record one tile write for the watch stream (no-op when disabled).
+    fn note(&mut self, idx: u32, word: u16) {
+        if self.watch.load(Ordering::Relaxed) {
+            self.pending.push((idx, word));
+        }
     }
 
     /// Feed a `resource_desc` row: intern the id and remember its footprint.
@@ -313,7 +351,9 @@ impl ResourceTileMap {
         };
         if let Some(idx) = world_to_local(self.region, x, z).and_then(|(lx, lz)| overlay_index(lx, lz)) {
             if !tile_has_content(self.tiles[idx]) {
-                self.tiles[idx] = encode_paving(index) | (self.tiles[idx] & WATER_BIT);
+                let word = encode_paving(index) | (self.tiles[idx] & WATER_BIT);
+                self.tiles[idx] = word;
+                self.note(idx as u32, word);
             }
         }
     }
@@ -327,7 +367,9 @@ impl ResourceTileMap {
         };
         if let Some(idx) = world_to_local(self.region, x, z).and_then(|(lx, lz)| overlay_index(lx, lz)) {
             if self.tiles[idx] & CONTENT_MASK == encode_paving(index) {
-                self.tiles[idx] &= WATER_BIT;
+                let word = self.tiles[idx] & WATER_BIT;
+                self.tiles[idx] = word;
+                self.note(idx as u32, word);
             }
         }
     }
@@ -352,7 +394,12 @@ impl ResourceTileMap {
                 }
                 wet_super_hex_tiles(sx, sz, |lx, lz| {
                     if let Some(idx) = overlay_index(lx, lz) {
-                        self.tiles[idx] |= WATER_BIT;
+                        let dry = self.tiles[idx];
+                        if dry & WATER_BIT == 0 {
+                            let word = dry | WATER_BIT;
+                            self.tiles[idx] = word;
+                            self.note(idx as u32, word);
+                        }
                     }
                 });
             }
@@ -524,11 +571,16 @@ impl ResourceTileMap {
     /// occupant should keep the tile. Water-only tiles count as empty, and
     /// the terrain water bit rides along on every written word.
     fn stamp_footprint(&mut self, origin: (i32, i32), index: u16, direction: u8) -> Vec<(u32, u16)> {
-        let offsets: &[(i32, i32)] = self.footprints.get(&index).map(|b| &b[..]).unwrap_or(&SINGLE_HEX);
+        // Cloned so the pending-recording writes below can borrow `self`
+        // mutably while iterating (footprints are ≤ ~7 offsets).
+        let offsets: Vec<(i32, i32)> = match self.footprints.get(&index) {
+            Some(b) => b.to_vec(),
+            None => SINGLE_HEX.to_vec(),
+        };
         let multi = offsets.len() > 1;
         let region = self.region;
         let mut owned = Vec::with_capacity(offsets.len());
-        for (x, z) in footprint_world_hexes(origin.0, origin.1, direction as i32, offsets) {
+        for (x, z) in footprint_world_hexes(origin.0, origin.1, direction as i32, &offsets) {
             let Some(idx) = world_to_local(region, x, z).and_then(|(lx, lz)| overlay_index(lx, lz)) else {
                 continue;
             };
@@ -536,7 +588,9 @@ impl ResourceTileMap {
                 continue;
             }
             let word = encode_tile(index, direction, (x, z) == origin);
-            self.tiles[idx] = word | (self.tiles[idx] & WATER_BIT);
+            let final_word = word | (self.tiles[idx] & WATER_BIT);
+            self.tiles[idx] = final_word;
+            self.note(idx as u32, final_word);
             owned.push((idx as u32, word));
         }
         owned
@@ -548,7 +602,9 @@ impl ResourceTileMap {
     fn unstamp(&mut self, owned: &[(u32, u16)]) {
         for &(idx, word) in owned {
             if self.tiles[idx as usize] & CONTENT_MASK == word {
-                self.tiles[idx as usize] &= WATER_BIT;
+                let final_word = self.tiles[idx as usize] & WATER_BIT;
+                self.tiles[idx as usize] = final_word;
+                self.note(idx, final_word);
             }
         }
     }
@@ -932,5 +988,96 @@ mod tests {
         dry.set(1, 1, crate::roads::grid::pack_terrain(50, 50, WATER_LEVEL, 1));
         m.fill_water_from_terrain(&dry);
         assert_eq!(m.tiles[overlay_index(3, 3).unwrap()] & WATER_BIT, 0);
+    }
+
+    fn idx_of(x: i32, z: i32) -> u32 {
+        overlay_index(x, z).unwrap() as u32
+    }
+
+    #[test]
+    fn watch_records_pending_only_when_enabled_and_drains() {
+        let mut m = map();
+        m.note_desc(MUD_MOUND, &[(0, 0), (0, -1), (-1, 0)]);
+        // Watch off: mutations record nothing.
+        m.upsert(1, MUD_MOUND, 0, Some((10, 20)));
+        assert!(m.take_pending().is_empty());
+
+        m.set_watch(true);
+        m.upsert(2, MUD_MOUND, 0, Some((30, 40)));
+        let mut pending = m.take_pending();
+        pending.sort_unstable();
+        let mut expected = vec![
+            (idx_of(30, 40), encode_tile(1, 0, true)),
+            (idx_of(29, 39), encode_tile(1, 0, false)),
+            (idx_of(29, 40), encode_tile(1, 0, false)),
+        ];
+        expected.sort_unstable();
+        assert_eq!(pending, expected);
+        // Drained: a second take returns nothing until a new write.
+        assert!(m.take_pending().is_empty());
+
+        // Deletion zeroes exactly its own tiles (final word 0 on dry land).
+        m.delete(2);
+        let mut pending = m.take_pending();
+        pending.sort_unstable();
+        let mut expected: Vec<(u32, u16)> = [(30, 40), (29, 39), (29, 40)]
+            .iter()
+            .map(|&(x, z)| (idx_of(x, z), 0))
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(pending, expected);
+
+        // A move records both the vacated (zeroed) and re-stamped tiles.
+        m.upsert(3, MUD_MOUND, 0, Some((50, 60)));
+        assert!(!m.take_pending().is_empty());
+        m.set_location(3, 52, 62);
+        let pending = m.take_pending();
+        for &(idx, word) in &pending {
+            let lx = (idx % (super::REGION_SIDE as u32)) as i32;
+            let lz = (idx / (super::REGION_SIDE as u32)) as i32;
+            let vacated = [(50, 60), (49, 59), (49, 60)];
+            let stamped = [(52, 62), (51, 61), (51, 62)];
+            if vacated.contains(&(lx, lz)) {
+                assert_eq!(word, 0, "vacated tile ({lx},{lz}) must zero");
+            } else {
+                assert!(stamped.contains(&(lx, lz)), "unexpected tile ({lx},{lz})");
+                assert_ne!(word, 0);
+            }
+        }
+        assert_eq!(pending.len(), 6);
+
+        m.set_watch(false);
+        m.upsert(4, MUD_MOUND, 0, Some((70, 80)));
+        assert!(m.take_pending().is_empty());
+    }
+
+    #[test]
+    fn watch_records_paving_and_water_flips() {
+        let mut m = map();
+        m.set_watch(true);
+
+        m.stamp_paving(10, 20, PAVING_TYPE_A);
+        assert_eq!(m.take_pending(), vec![(idx_of(10, 20), PAVING_BIT | 1)]);
+        m.clear_paving(10, 20, PAVING_TYPE_A);
+        assert_eq!(m.take_pending(), vec![(idx_of(10, 20), 0)]);
+
+        // Water fill records flips once; a second fill records nothing.
+        m.fill_water_from_terrain(&terrain_with_water(&[(0, 0)]));
+        let flips = m.take_pending();
+        assert!(!flips.is_empty());
+        assert!(flips.iter().all(|&(_, w)| w == WATER_BIT));
+        m.fill_water_from_terrain(&terrain_with_water(&[(0, 0)]));
+        assert!(m.take_pending().is_empty());
+
+        // A resource stamped onto a wet tile carries the water bit in its
+        // recorded word; its removal records the bare water bit.
+        m.note_desc(BUTTON_MUSHROOMS, &[]);
+        m.upsert(1, BUTTON_MUSHROOMS, 0, Some((1, 1)));
+        assert_eq!(
+            m.take_pending(),
+            vec![(idx_of(1, 1), encode_tile(1, 0, true) | WATER_BIT)]
+        );
+        m.delete(1);
+        assert_eq!(m.take_pending(), vec![(idx_of(1, 1), WATER_BIT)]);
     }
 }

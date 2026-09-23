@@ -200,6 +200,18 @@ curl -s 'http://127.0.0.1:8089/bitme/session/1297036692699948124'
 # the coordinates; no player, no session side effects). BITME-API.md §5.
 # curl -s http://127.0.0.1:8089/bitme/world/<x>/<z>/resources -o window.bin
 
+# Live push of resource changes inside the player's window: BMD1 binary
+# delta frames (world tile + final u16 word) plus resync/moved/gone JSON
+# control frames and 5s heartbeats. Server keeps only the window anchor
+# per listener; the client refetches the BMR1 window on close/resync.
+#   ws://127.0.0.1:8089/bitme/session/<player_entity_id>/resources/ws
+#   wss://relay.bitcraftsync.app/bitme/session/<player_entity_id>/resources/ws
+# Full client contract: BITME-API.md §8. NOTE: the public path needs the
+# nginx /bitme/ location upgraded for WebSocket (Upgrade/Connection
+# headers + proxy_read_timeout 3600s, like /internal/dim-buildings/ws) —
+# the relay host's live conf and the bitcraft-relay repo's snippet both
+# still carry the poll-only "no WebSocket" variant.
+
 # Super-hex terrain plane covering the same window: 134x134 packed u64
 # cells (elev | original<<16 | water_level<<32 | water_body_type<<48),
 # refetch when the header generation moves. BITME-API.md §6.

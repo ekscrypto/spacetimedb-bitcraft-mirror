@@ -13,6 +13,7 @@ use super::decode::{
 };
 use super::meta::RoadsTableMeta;
 use super::store::{RegionRoadStatus, RoadsRegionHandle};
+use super::watch::ResourceWatchHub;
 
 #[derive(Debug)]
 pub struct GlobalRoadsCatalog {
@@ -61,6 +62,9 @@ impl Default for GlobalRoadsCatalog {
 pub struct RoadsFleet {
     pub regions: Mutex<Vec<Arc<RoadsRegionHandle>>>,
     pub catalog: Arc<RwLock<GlobalRoadsCatalog>>,
+    /// Player-keyed resource change stream (`/bitme/session/:id/resources/ws`)
+    /// — shared by the HTTP handlers and the ingest feed's fan-out.
+    pub watch: Arc<ResourceWatchHub>,
 }
 
 impl RoadsFleet {
@@ -68,6 +72,7 @@ impl RoadsFleet {
         Self {
             regions: Mutex::new(Vec::new()),
             catalog,
+            watch: Arc::new(ResourceWatchHub::new()),
         }
     }
 

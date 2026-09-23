@@ -69,6 +69,10 @@ struct RegionFeed {
     bitme: Arc<BitmeHub>,
     handle: Arc<ShardHandle>,
     roads: Option<Arc<RoadsRegionHandle>>,
+    /// The owning roads fleet — reached from the live/reset paths to fan
+    /// resource-tile changes out to `/bitme/session/:id/resources/ws`
+    /// listeners.
+    roads_fleet: Option<Arc<RoadsFleet>>,
 }
 
 struct GlobalFeed {
@@ -161,14 +165,13 @@ impl FeedManager {
             }
         };
 
-        let roads_handle = if self.roads_enabled() {
+        let roads_fleet = self.roads_fleet.lock().clone();
+        let roads_handle = if let Some(fleet) = &roads_fleet {
             let rh = Arc::new(RoadsRegionHandle {
                 region,
                 grid: Arc::new(RwLock::new(RoadsRegionGrid::new(region as u16))),
             });
-            if let Some(fleet) = self.roads_fleet.lock().as_ref() {
-                fleet.push_region(rh.clone());
-            }
+            fleet.push_region(rh.clone());
             Some(rh)
         } else {
             None
@@ -189,6 +192,7 @@ impl FeedManager {
             bitme: self.bitme.clone(),
             handle: handle.clone(),
             roads: roads_handle,
+            roads_fleet,
         });
         let bitme_enabled = feed.bitme_meta.is_some();
         tokio::spawn(run_worker(feed, rx));
@@ -356,6 +360,12 @@ async fn run_worker(feed: Arc<RegionFeed>, mut rx: mpsc::Receiver<FeedMsg>) {
                 if let Some(rh) = &feed.roads {
                     roads_phase = Some(RoadsPhase::Seeding(Box::new(RoadsRegionGrid::new(region as u16))));
                     *rh.grid.write() = RoadsRegionGrid::new(region as u16);
+                    // The grid was wholesale-replaced: tell resource-stream
+                    // listeners to refetch their BMR1 window and re-arm
+                    // change recording on the fresh grid.
+                    if let Some(fleet) = &feed.roads_fleet {
+                        fleet.watch.on_grid_replaced(rh, "reseed");
+                    }
                 }
                 tracing::info!(
                     target: "relay_cache::feed",
@@ -411,7 +421,7 @@ async fn run_worker(feed: Arc<RegionFeed>, mut rx: mpsc::Receiver<FeedMsg>) {
                         if let (Some(rh), Some(meta), Some(RoadsPhase::Live)) =
                             (&feed.roads, &feed.roads_meta, roads_phase.as_ref())
                         {
-                            apply_roads_live(rh, &feed.schema, meta, &update);
+                            apply_roads_live(rh, feed.roads_fleet.as_ref(), &feed.schema, meta, &update);
                         }
                     }
                 }
@@ -520,6 +530,12 @@ fn finalize_roads(feed: &RegionFeed, handle: &RoadsRegionHandle, staging: Box<Ro
     finalize_terrain_seed(&mut staging);
     staging.mark_ready();
     *handle.grid.write() = staging;
+    // Fresh content end-to-end: any listener's BMR1 window is stale, and
+    // the swapped-in grid needs change recording re-armed if listeners
+    // survived the seed.
+    if let Some(fleet) = &feed.roads_fleet {
+        fleet.watch.on_grid_replaced(handle, "live");
+    }
     tracing::info!(
         target: "relay_cache::feed",
         region = feed.region,
@@ -592,18 +608,34 @@ fn apply_live_update(feed: &RegionFeed, update: &UpstreamUpdate) {
 
 fn apply_roads_live(
     handle: &RoadsRegionHandle,
+    fleet: Option<&Arc<RoadsFleet>>,
     schema: &MirroredSchema,
     meta: &RoadsTableMeta,
     update: &UpstreamUpdate,
 ) {
-    let mut guard = handle.grid.write();
-    if let Err(e) = apply_roads_update(&mut guard, schema, meta, update) {
-        tracing::error!(
-            target: "relay_cache::feed",
-            region = handle.region,
-            error = %e,
-            "roads live batch apply failed"
-        );
+    let collecting = fleet.is_some_and(|f| f.watch.has_listeners(handle.region));
+    // Drain the recorded tile changes and the dictionary version under the
+    // write guard, then fan out after releasing it — the hub must never be
+    // entered with a grid guard held (lock order: hub → grid).
+    let (changes, dict_version) = {
+        let mut guard = handle.grid.write();
+        if let Err(e) = apply_roads_update(&mut guard, schema, meta, update) {
+            tracing::error!(
+                target: "relay_cache::feed",
+                region = handle.region,
+                error = %e,
+                "roads live batch apply failed"
+            );
+            return;
+        }
+        if collecting {
+            (guard.resource_map.take_pending(), guard.resource_map.dict_version())
+        } else {
+            (Vec::new(), 0)
+        }
+    };
+    if let (Some(fleet), false) = (fleet, changes.is_empty()) {
+        fleet.watch.fanout(handle.region, &changes, dict_version);
     }
 }
 

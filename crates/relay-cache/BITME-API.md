@@ -2,9 +2,10 @@
 
 The HTTP endpoints the Bit-Me mobile app consumes, served by the
 embedded relay-cache on **`https://relay.bitcraftsync.app`**. Plain JSON
-over HTTPS, no authentication, no WebSocket, no SpacetimeDB protocol —
-the phone only polls. (Exceptions: the resource/elevation windows of
-§4–§6 are packed binary payloads.)
+over HTTPS, no authentication, no SpacetimeDB protocol — the phone only
+polls. (Exceptions: the resource/elevation windows of §4–§6 are packed
+binary payloads, and §8 adds one optional WebSocket, the resource change
+stream, for live map updates.)
 
 Source of truth: `src/bitme_serve.rs` (handlers) and `src/bitme.rs`
 (tracker). Operator-facing inventory: `USED-TABLES.md`. Design notes:
@@ -513,14 +514,105 @@ HTTP 503  {"error": "roads cache not enabled"}
 
 ---
 
-## 8. Readiness, deploys, and failure modes
+## 8. `GET /bitme/session/:entity_id/resources/ws` — resource change stream
+
+WebSocket push of compacted-map changes: every resource/paving tile the
+relay stamps or clears whose world tile falls inside the player's 400×400
+window (§4 geometry, anchor followed server-side from the player's live
+position) arrives as a small binary delta frame. The server keeps **only
+the window coordinates per listener** — no window copy, no diffing — and
+the **client owns convergence**: initial state, reconnect recovery, and
+resync recovery are all "re-fetch the BMR1 window" (§4 or §5). Frames are
+never silently dropped to a live socket; backpressure closes the
+connection instead, so the delivered stream is totally ordered.
+
+Pre-upgrade errors are byte-identical to §4's (400/404/404/503 JSON, plus
+503 when the fleet-wide WS connection cap — 2048, shared with the
+dim-buildings stream — is reached).
+
+### Server → client frames
+
+1. **Ack** (text, first frame after the upgrade):
+
+   ```json
+   {"type":"subscribed","player_entity_id":"…","region":14,
+    "anchor":{"x":7690,"z":7700},"width":400,"dict_version":123456789}
+   ```
+
+2. **Delta** (binary, `BMD1`) — one per applied upstream batch, containing
+   only in-window changed tiles:
+
+   | Offset | Type | Meaning |
+   |---|---|---|
+   | 0–3 | `[u8; 4]` | Magic `BMD1` |
+   | 4–5 | `u16` | Format version (`1`) |
+   | 6–9 | `u32` | Region id |
+   | 10–13 | `u32` | `dict_version` — pair with `/resource-dictionary` |
+   | 14–15 | `u16` | Entry count `n` (batches larger than 65535 tiles split into consecutive frames) |
+   | 16+ | `n ×` 10 bytes | `i32 world_x`, `i32 world_z`, `u16 tile word` (§4 bit layout, water bit included) |
+
+   Tiles are **world** odd-r coordinates, not window-relative: map them
+   through the client's current window origin (or apply any that fall in
+   whatever window the client is holding — the words are absolute).
+   Duplicate tiles within a frame never occur; writes within one batch
+   collapse to the final word.
+
+3. **Control** (text):
+
+   - `{"type":"resync","reason":"reseed"|"live"}` — the region grid was
+     replaced (upstream disconnect) or finished re-seeding. **Refetch the
+     BMR1 window**; if the next frame's `dict_version` differs from the
+     snapshot header's, refetch the dictionary too.
+   - `{"type":"moved","region":7,"anchor":{…}}` — the player crossed into
+     another region; the stream re-anchored there. Refetch the BMR1
+     window (it is a different area of the world).
+   - `{"type":"gone","player_entity_id":"…"}` — the player has had no
+     live position in any mirrored region for ~60 s (logged out, or a
+     deploy/reseed outlasting the window). The server closes right after.
+   - `{"ts":1753296000123}` — heartbeat every 5 s; also refreshes the
+     session TTL exactly like the HTTP polls.
+
+The socket also answers WS pings with pongs. Client → server text/binary
+frames are ignored; the stream is read-only.
+
+### Client recipe
+
+1. Fetch the BMR1 window (§4 or §5) — connect order is safe either way:
+   replaying an already-applied tile word is idempotent, and frames that
+   race the fetch carry the same final word.
+2. Open the WS; on `subscribed`, note `region`/`anchor`.
+3. Apply each `BMD1` entry onto the window: `word → tile at (x, z)` when
+   in bounds. A `0` word (or water-bit-only word) means the tile emptied.
+4. On close (any reason), `resync`, `moved`, or a `dict_version` change →
+   refetch the BMR1 window (+ dictionary on version change) and reconnect
+   with the usual backoff. Treat ~15 s without a frame as dead.
+5. While walking, keep the movement-triggered BMR1 refetch — the server
+   follows the anchor at ~1 s granularity, so trailing-edge events for a
+   few tiles around a fast-moving player are intentionally trimmed until
+   the next full fetch.
+
+### Intensity profile
+
+Idle (no listeners): a single relaxed atomic load per tile write. Live:
+`changed tiles × listeners` integer bounds checks per upstream batch on
+the region worker, and ~16 + 10·n byte frames. No 320 KB re-scans. This
+is the same safety quadrant as the dim-buildings WS (tiny payloads,
+bounded fan-out, hard caps) — see
+[`DIM-BUILDINGS-WS.md`](DIM-BUILDINGS-WS.md) for the contrast with the
+retired `/inventory/ws`.
+
+---
+
+## 9. Readiness, deploys, and failure modes
 
 - **Readiness probe:** `GET /cache-health` → `{"ready": true, …}`. If
   `ready` is `false`, treat all relay data as stale.
 - **Deploys restart the mirror** (~15–20 min reseed). During that window
   the JSON endpoints return `404 {"found": false, …}`, the resource window
   returns `202` then `404`, and `/cache-health` flips to `ready: false`.
-  Retry with backoff (≥ 30 s); Bit-Me only needs
+  The §8 change stream emits `resync` (`reseed`, then `live` at seed
+  completion) and may close (`gone`) if the outage outlasts its ~60 s
+  no-position window. Retry with backoff (≥ 30 s); Bit-Me only needs
   to show a reconnecting state — countdowns already on screen can keep
   running from the last snapshot.
 - Upstream game-server resets can also momentarily empty stores; the same
@@ -528,15 +620,17 @@ HTTP 503  {"error": "roads cache not enabled"}
 - Region coverage can change; read the region list from
   `GET /roads/regions` rather than hardcoding, if it matters.
 
-## 9. Recommended client flow
+## 10. Recommended client flow
 
 1. Onboarding: `resolve` the player name → store `entity_id`,
    `region_id`, `module`.
 2. Activity screens: poll `session/:entity_id` at ~1 Hz while open.
-3. Resource map: fetch `region/:region_id/resource-dictionary`, then poll
-   `session/:entity_id/resources` alongside the snapshot; refetch the
-   dictionary when a window header's `dict_version` changes. Pan freely
-   with `world/:x/:z/resources`; pair it with
+3. Resource map: fetch `region/:region_id/resource-dictionary`, then
+   fetch `session/:entity_id/resources` once per window placement and
+   keep it live with the §8 change stream (`resources/ws`) — apply BMD1
+   deltas, refetch the full window on close/resync/moved or when
+   `dict_version` changes, and refetch the dictionary then too. Pan
+   freely with `world/:x/:z/resources`; pair it with
    `world/:x/:z/elevation` for terrain (refetch on `generation` change).
 4. Render countdowns client-side from the snapshot + bundled gamedata
    (action progress from `ends_at_ms`; buff expiry from
@@ -547,12 +641,13 @@ HTTP 503  {"error": "roads cache not enabled"}
 6. Never hold state across deploys — on `404`/`ready=false`, back off and
    re-resolve.
 
-## 10. Rate/abuse posture
+## 11. Rate/abuse posture
 
 Anonymous, no API keys, no rate limits today (same posture as
 `/claim`/`/player`; nginx caps request bodies and timeouts). Keep polling
 at ~1 Hz per active screen; do not fan out resolve calls per keystroke —
 debounce name lookups. The resource window is ~320 KB and the elevation
-plane ~140 KB per poll (before HTTP compression); poll them only while
-the map screen is open, and prefer letting transport-level gzip handle
-it.
+plane ~140 KB per poll (before HTTP compression); fetch them only when
+the window moves or a §8 recovery event asks for it, and prefer letting
+transport-level gzip handle it. One change-stream socket per player; the
+fleet-wide WS cap is 2048 connections (shared with dim-buildings).

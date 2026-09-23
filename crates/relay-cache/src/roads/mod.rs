@@ -12,6 +12,7 @@ pub mod join;
 pub mod meta;
 pub mod resource_map;
 pub mod store;
+pub mod watch;
 
 pub use catalog::{GlobalRoadsCatalog, RoadsFleet};
 pub use grid::{get_claim_index, set_claim_index, set_paving};

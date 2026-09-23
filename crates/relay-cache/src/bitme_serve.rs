@@ -10,20 +10,23 @@
 //! with integer odd-r tiles alongside.
 
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use futures_util::stream::SplitSink;
+use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::roads::coords::{
-    region_origin, small_to_super, super_center_tile, world_to_local, world_to_region,
-};
+use crate::roads::coords::{region_origin, small_to_super, super_center_tile, world_to_local, world_to_region};
 use crate::roads::grid::get_claim_index;
 use crate::roads::resource_map::is_harvestable_resource_id;
 use crate::roads::store::RoadsRegionHandle;
+use crate::roads::watch::WatchFrame;
 use crate::roads::RoadsFleet;
 use crate::serve::{format_rfc3339_millis, no_store_json, no_store_octets, no_store_status, Fleet};
 use crate::store::RegionStore;
@@ -37,6 +40,10 @@ pub fn bitme_routes() -> axum::Router<Fleet> {
         .route("/bitme/resolve", get(bitme_resolve))
         .route("/bitme/session/:entity_id", get(bitme_session))
         .route("/bitme/session/:entity_id/resources", get(bitme_session_resources))
+        .route(
+            "/bitme/session/:entity_id/resources/ws",
+            get(bitme_session_resources_ws),
+        )
         .route("/bitme/world/:x/:z/resources", get(bitme_world_resources))
         .route("/bitme/world/:x/:z/elevation", get(bitme_world_elevation))
         .route(
@@ -863,14 +870,301 @@ fn format_rfc3339_secs(secs: i64) -> String {
     format_rfc3339_millis(secs.saturating_mul(1_000_000))
 }
 
+// ---------------------------------------------------------------------------
+// Resource change stream — `/bitme/session/:entity_id/resources/ws`
+//
+// Push channel for the compacted map: every live resource-tile change whose
+// world tile falls within the player's 400×400 window is streamed as a BMD1
+// binary frame. Server-side per-listener state is just the window anchor
+// (`roads/watch.rs`); the client owns convergence — initial state, reconnect
+// recovery, and resync recovery are all "re-fetch the BMR1 window" (§4/§5 of
+// BITME-API.md). See §8 of that document for the full client contract.
+// ---------------------------------------------------------------------------
+
+/// Fleet-wide concurrent resource-stream sockets, shared with the
+/// dim-buildings WS budget (both are cheap push channels).
+const RESOURCE_WS_MAX_CONNECTIONS: u64 = 2048;
+/// Application-level heartbeat (client treats ~15 s of silence as dead).
+const RESOURCE_WS_HEARTBEAT: Duration = Duration::from_secs(5);
+/// How often the server re-reads the player's tile to follow movement.
+/// Events carry absolute world tiles, so a stale anchor only trims edge
+/// events until the client's movement-triggered BMR1 refetch.
+const RESOURCE_WS_ANCHOR_TICK: Duration = Duration::from_secs(1);
+/// Consecutive anchor ticks with the player gone from every ready shard
+/// before the stream gives up and closes (outlives upstream batch gaps;
+/// a full region re-seed outlasts it and the client simply reconnects).
+const RESOURCE_WS_GONE_AFTER: u32 = 60;
+/// Max tile entries per BMD1 frame (u16 count field); larger fan-outs are
+/// chunked into consecutive frames.
+const BMD1_MAX_TILES: usize = u16::MAX as usize;
+
+/// `GET /bitme/session/:entity_id/resources/ws` — WebSocket push of
+/// resource tile changes within the player's window. Pre-upgrade errors
+/// mirror `GET /bitme/session/:id/resources` exactly (400/404/503 JSON);
+/// after the upgrade the server sends a `subscribed` ack, then binary
+/// BMD1 delta frames, JSON control frames, and `{"ts":…}` heartbeats.
+async fn bitme_session_resources_ws(
+    ws: WebSocketUpgrade,
+    State(fleet): State<Fleet>,
+    Path(entity_id): Path<String>,
+) -> Response {
+    let Ok(pk) = entity_id.parse::<u64>() else {
+        return no_store_status(StatusCode::BAD_REQUEST, json!({"error": "entity_id must be a u64"})).into_response();
+    };
+    // Connecting counts as session activity, same as the HTTP polls.
+    fleet.bitme.touch_session(pk);
+    let Some(conn) = fleet.interest.try_acquire_connection(RESOURCE_WS_MAX_CONNECTIONS) else {
+        return no_store_status(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error": "too many resource-change streams"}),
+        )
+        .into_response();
+    };
+    let Some(region) = locate_player_region(&fleet, pk) else {
+        return no_store_status(
+            StatusCode::NOT_FOUND,
+            json!({
+                "found": false,
+                "player_entity_id": pk.to_string(),
+                "error": "player not present in any mirrored region",
+            }),
+        )
+        .into_response();
+    };
+    let Some(shard) = fleet.shards.iter().find(|s| s.region == region) else {
+        return no_store_status(
+            StatusCode::NOT_FOUND,
+            json!({"found": false, "error": "region shard missing"}),
+        )
+        .into_response();
+    };
+    let player_tile = {
+        let s = shard.store.read();
+        s.mobile_entity.overworld_tile(pk)
+    };
+    let Some((px, pz)) = player_tile else {
+        return no_store_status(
+            StatusCode::NOT_FOUND,
+            json!({
+                "found": false,
+                "player_entity_id": pk.to_string(),
+                "error": "player not on the overworld",
+            }),
+        )
+        .into_response();
+    };
+    let handle = match roads_region(&fleet, region) {
+        Ok(handle) => handle,
+        Err(resp) => return resp,
+    };
+    ws.on_upgrade(move |socket| async move {
+        run_resource_stream(socket, fleet, conn, pk, region, (px, pz), handle).await;
+    })
+    .into_response()
+}
+
+/// Live player position across all ready shards (mobile_entity rows only —
+/// home-region username rows are not a position; during an own-region
+/// re-seed this misses, and the stream keeps its last anchor).
+fn find_player_tile(fleet: &Fleet, pk: u64) -> Option<(u32, (i32, i32))> {
+    for shard in &fleet.shards {
+        let s = shard.store.read();
+        if !s.ready {
+            continue;
+        }
+        if let Some(tile) = s.mobile_entity.overworld_tile(pk) {
+            return Some((s.region, tile));
+        }
+    }
+    None
+}
+
+async fn run_resource_stream(
+    socket: WebSocket,
+    fleet: Fleet,
+    _conn: crate::interest::ConnectionGuard,
+    pk: u64,
+    mut region: u32,
+    anchor: (i32, i32),
+    handle: Arc<RoadsRegionHandle>,
+) {
+    let (mut sink, mut source) = socket.split();
+    let Some(fleet_roads) = fleet.roads.clone() else {
+        return;
+    };
+    let (mut listener, mut rx) = fleet_roads.watch.register(&handle, pk, anchor);
+
+    let dict_version = {
+        let grid = handle.grid.read();
+        if grid.ready {
+            grid.resource_map.dict_version()
+        } else {
+            0
+        }
+    };
+    let ack = json!({
+        "type": "subscribed",
+        "player_entity_id": pk.to_string(),
+        "region": region,
+        "anchor": {"x": anchor.0, "z": anchor.1},
+        "width": RESOURCE_WINDOW_WIDTH,
+        "dict_version": dict_version,
+    });
+    if !send_ws_text(&mut sink, &ack.to_string()).await {
+        return;
+    }
+
+    let mut heartbeat = tokio::time::interval(RESOURCE_WS_HEARTBEAT);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    heartbeat.tick().await; // consume the immediate first tick
+    let mut anchor_tick = tokio::time::interval(RESOURCE_WS_ANCHOR_TICK);
+    anchor_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    anchor_tick.tick().await; // consume the immediate first tick
+    let mut gone_streak: u32 = 0;
+
+    tracing::info!(
+        target: "relay_cache::bitme",
+        player_entity_id = pk,
+        region,
+        "resource stream connected"
+    );
+
+    loop {
+        tokio::select! {
+            biased;
+            frame = rx.recv() => {
+                let Some(frame) = frame else { break };
+                if !send_watch_frame(&mut sink, frame).await {
+                    break;
+                }
+            }
+            _ = anchor_tick.tick() => match find_player_tile(&fleet, pk) {
+                Some((r, (x, z))) if r == region => {
+                    gone_streak = 0;
+                    listener.update_anchor(x, z);
+                }
+                Some((r, (x, z))) => {
+                    gone_streak = 0;
+                    // Crossed into another region: re-anchor there and tell
+                    // the client (its window is elsewhere — refetch BMR1).
+                    match roads_region(&fleet, r) {
+                        Ok(new_handle) => {
+                            let moved = json!({
+                                "type": "moved",
+                                "region": r,
+                                "anchor": {"x": x, "z": z},
+                            });
+                            if !send_ws_text(&mut sink, &moved.to_string()).await {
+                                break;
+                            }
+                            let (new_listener, new_rx) = fleet_roads.watch.register(&new_handle, pk, (x, z));
+                            listener = new_listener;
+                            rx = new_rx;
+                            region = r;
+                        }
+                        Err(resp) => {
+                            let _ = resp; // region without a roads grid: nothing to stream
+                            break;
+                        }
+                    }
+                }
+                None => {
+                    gone_streak += 1;
+                    if gone_streak >= RESOURCE_WS_GONE_AFTER {
+                        let gone = json!({
+                            "type": "gone",
+                            "player_entity_id": pk.to_string(),
+                        });
+                        let _ = send_ws_text(&mut sink, &gone.to_string()).await;
+                        break;
+                    }
+                }
+            },
+            _ = heartbeat.tick() => {
+                fleet.bitme.touch_session(pk);
+                let ts = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                if !send_ws_text(&mut sink, &format!("{{\"ts\":{ts}}}")).await {
+                    break;
+                }
+            }
+            msg = source.next() => match msg {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                Some(Ok(Message::Ping(p))) => {
+                    if sink.send(Message::Pong(p)).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Ok(_)) => {} // text/binary from client: ignored
+            },
+        }
+        if listener.poisoned() {
+            break;
+        }
+    }
+    let _ = sink.send(Message::Close(None)).await;
+    tracing::info!(
+        target: "relay_cache::bitme",
+        player_entity_id = pk,
+        region,
+        "resource stream closed"
+    );
+}
+
+async fn send_ws_text(sink: &mut SplitSink<WebSocket, Message>, text: &str) -> bool {
+    sink.send(Message::Text(text.to_owned())).await.is_ok()
+}
+
+/// One hub frame → socket message(s). Deltas pack as `BMD1` binary: magic,
+/// u16 version, u32 region, u32 dict_version, u16 count, then `count ×`
+/// (i32 world_x, i32 world_z, u16 word) — world tiles so frames are
+/// anchor-independent. Resyncs stay JSON (hand-formatted, matching the
+/// dim-buildings house style).
+async fn send_watch_frame(sink: &mut SplitSink<WebSocket, Message>, frame: WatchFrame) -> bool {
+    match frame {
+        WatchFrame::Resync { region, reason } => {
+            send_ws_text(
+                sink,
+                &format!("{{\"type\":\"resync\",\"region\":{region},\"reason\":\"{reason}\"}}"),
+            )
+            .await
+        }
+        WatchFrame::Delta {
+            region,
+            dict_version,
+            tiles,
+        } => {
+            for chunk in tiles.chunks(BMD1_MAX_TILES) {
+                let mut body = Vec::with_capacity(16 + chunk.len() * 10);
+                body.extend_from_slice(b"BMD1");
+                body.extend_from_slice(&1u16.to_le_bytes());
+                body.extend_from_slice(&region.to_le_bytes());
+                body.extend_from_slice(&dict_version.to_le_bytes());
+                body.extend_from_slice(&(chunk.len() as u16).to_le_bytes());
+                for &(x, z, word) in chunk {
+                    body.extend_from_slice(&x.to_le_bytes());
+                    body.extend_from_slice(&z.to_le_bytes());
+                    body.extend_from_slice(&word.to_le_bytes());
+                }
+                if sink.send(Message::Binary(body)).await.is_err() {
+                    return false;
+                }
+            }
+            true
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bitme::BitmeHub;
     use crate::decode::{ExtractionRecipeRow, MobileEntityRow, ResourceDescRow};
     use crate::interest::InterestHub;
-    use crate::roads::coords::{small_corner_supers, small_is_corner};
     use crate::roads::catalog::{GlobalRoadsCatalog, RoadsFleet};
+    use crate::roads::coords::{small_corner_supers, small_is_corner};
     use crate::roads::grid::{pack_terrain, unpack_terrain_water};
     use crate::roads::store::{RoadsRegionGrid, RoadsRegionHandle};
     use crate::shard::ShardHandle;
@@ -1225,9 +1519,9 @@ mod tests {
         assert_eq!(u16::from_le_bytes(body[4..6].try_into().unwrap()), 2); // version
         assert_eq!(u16::from_le_bytes(body[6..8].try_into().unwrap()), 137); // width
         assert_eq!(u16::from_le_bytes(body[8..10].try_into().unwrap()), 136); // height
-                                                                           // Cell (0,0) = super (−65, −61); its center tile is (3·(−65)+1,
-                                                                           // 3·(−61)) local → world (7680 − 194, 7680 − 183) — odd super rows
-                                                                           // sit one tile right.
+                                                                              // Cell (0,0) = super (−65, −61); its center tile is (3·(−65)+1,
+                                                                              // 3·(−61)) local → world (7680 − 194, 7680 − 183) — odd super rows
+                                                                              // sit one tile right.
         assert_eq!(i32::from_le_bytes(body[10..14].try_into().unwrap()), 7486);
         assert_eq!(i32::from_le_bytes(body[14..18].try_into().unwrap()), 7497);
         assert_eq!(u32::from_le_bytes(body[18..22].try_into().unwrap()), 7);
@@ -1530,5 +1824,119 @@ mod tests {
         });
         let t = build_target(&fleet, &legacy, 9001, None);
         assert_eq!(t["growth_ends_at_ms"], json!(1_788_664_248_840i64));
+    }
+
+    // ---- resource change stream (`/bitme/session/:id/resources/ws`) ----
+
+    /// Serve the bitme routes on an ephemeral loopback port. Pre-upgrade
+    /// errors can only be exercised over a real connection: the
+    /// `WebSocketUpgrade` extractor requires hyper's `OnUpgrade` state,
+    /// which `tower::ServiceExt::oneshot` never injects.
+    async fn spawn_bitme(fleet: Fleet) -> std::net::SocketAddr {
+        let app = bitme_routes().with_state(fleet);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr
+    }
+
+    /// HTTP status a WS client gets when the upgrade is refused pre-handler.
+    async fn ws_refused_status(addr: std::net::SocketAddr, path: &str) -> u16 {
+        match tokio_tungstenite::connect_async(format!("ws://{addr}{path}")).await {
+            Ok(_) => panic!("upgrade must be refused for {path}"),
+            Err(e) => match e {
+                tokio_tungstenite::tungstenite::Error::Http(resp) => resp.status().as_u16(),
+                other => panic!("expected HTTP rejection for {path}, got {other:?}"),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_ws_preupgrade_errors() {
+        // Bad entity id.
+        let addr = spawn_bitme(fleet_with_player(1, true)).await;
+        assert_eq!(ws_refused_status(addr, "/bitme/session/abc/resources/ws").await, 400);
+
+        // Unknown player.
+        assert_eq!(ws_refused_status(addr, "/bitme/session/999/resources/ws").await, 404);
+
+        // Roads cache disabled.
+        let addr = spawn_bitme(fleet_with_player(1, false)).await;
+        assert_eq!(ws_refused_status(addr, "/bitme/session/42/resources/ws").await, 503);
+
+        // Player present but not on the overworld.
+        let addr = spawn_bitme(fleet_with_player(2, true)).await;
+        assert_eq!(ws_refused_status(addr, "/bitme/session/42/resources/ws").await, 404);
+    }
+
+    #[tokio::test]
+    async fn resource_ws_streams_deltas_and_resync() {
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+        let fleet = fleet_with_player(1, true);
+        let roads = fleet.roads.clone().expect("roads fixture");
+        let addr = spawn_bitme(fleet).await;
+
+        let (stream, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/bitme/session/42/resources/ws"))
+            .await
+            .unwrap();
+        let (mut write, mut read) = stream.split();
+
+        // Ack: subscribed with the player's region and anchor.
+        let msg = tokio::time::timeout(Duration::from_secs(5), read.next())
+            .await
+            .expect("ack within 5s")
+            .unwrap()
+            .unwrap();
+        let WsMessage::Text(text) = msg else {
+            panic!("ack must be text, got {msg:?}");
+        };
+        let ack: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(ack["type"], "subscribed");
+        assert_eq!(ack["region"], 7);
+        assert_eq!(ack["anchor"]["x"], 7690);
+        assert_eq!(ack["anchor"]["z"], 7700);
+        assert_eq!(ack["width"], 400);
+
+        // One in-window change (the player's own tile, local (10, 20) in
+        // region 7) and one far out of window — only the first is pushed.
+        let near = (20u32 * 7680) + 10;
+        let far = (7000u32 * 7680) + 7000;
+        roads.watch.fanout(7, &[(near, 0x0205), (far, 0x0007)], 99);
+        let msg = tokio::time::timeout(Duration::from_secs(5), read.next())
+            .await
+            .expect("delta within 5s")
+            .unwrap()
+            .unwrap();
+        let WsMessage::Binary(data) = msg else {
+            panic!("delta must be binary, got {msg:?}");
+        };
+        assert_eq!(&data[0..4], b"BMD1");
+        assert_eq!(u16::from_le_bytes(data[4..6].try_into().unwrap()), 1); // version
+        assert_eq!(u32::from_le_bytes(data[6..10].try_into().unwrap()), 7); // region
+        assert_eq!(u32::from_le_bytes(data[10..14].try_into().unwrap()), 99); // dict_version
+        assert_eq!(u16::from_le_bytes(data[14..16].try_into().unwrap()), 1); // count
+        assert_eq!(i32::from_le_bytes(data[16..20].try_into().unwrap()), 7690);
+        assert_eq!(i32::from_le_bytes(data[20..24].try_into().unwrap()), 7700);
+        assert_eq!(u16::from_le_bytes(data[24..26].try_into().unwrap()), 0x0205);
+
+        // Upstream re-seed → JSON resync frame.
+        let handle = roads.region_handle(7).unwrap();
+        roads.watch.on_grid_replaced(&handle, "reseed");
+        let msg = tokio::time::timeout(Duration::from_secs(5), read.next())
+            .await
+            .expect("resync within 5s")
+            .unwrap()
+            .unwrap();
+        let WsMessage::Text(text) = msg else {
+            panic!("resync must be text, got {msg:?}");
+        };
+        let resync: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(resync["type"], "resync");
+        assert_eq!(resync["reason"], "reseed");
+
+        write.close().await.unwrap();
     }
 }
