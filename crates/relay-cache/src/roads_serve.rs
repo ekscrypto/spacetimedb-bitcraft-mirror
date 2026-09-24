@@ -521,7 +521,8 @@ mod tests {
             grid.resource_map.note_desc(74, &[]);
             grid.resource_map.note_desc(5, &[]);
             grid.resource_map.upsert(1, 74, 0, Some((23050, 7700)));
-            grid.resource_map.upsert(2, 5, 3, Some((23050, 7701)));
+            // Raw direction 6 (even 0..=10 domain) → stored effective 6/2 = 3.
+            grid.resource_map.upsert(2, 5, 6, Some((23050, 7701)));
             grid.mark_ready();
         }
 

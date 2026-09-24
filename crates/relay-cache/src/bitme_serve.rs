@@ -1257,11 +1257,11 @@ mod tests {
         assert_ne!(u32::from_le_bytes(body[20..24].try_into().unwrap()), 0); // dict_version
 
         // The player's own tile carries resource 74 (dictionary index 1),
-        // direction 2, origin flag set.
+        // effective rotation 1 (raw direction_index 2 / 2), origin flag set.
         let off = 24 + (200 * 400 + 200) * 2;
         let word = u16::from_le_bytes(body[off..off + 2].try_into().unwrap());
         assert_eq!(word & 0x03FF, 1);
-        assert_eq!(word >> 11, 2);
+        assert_eq!(word >> 11, 1);
         assert_ne!(word & (1 << 10), 0);
 
         // The paved tile one column east carries bit 14 + paving index 1.

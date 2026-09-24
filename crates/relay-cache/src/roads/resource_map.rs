@@ -9,8 +9,11 @@
 //! Tile word layout (u16 LE):
 //!   bits  0-9 : dictionary index of the resource (0 = empty tile)
 //!   bit  10   : origin flag — the resource's anchor tile
-//!   bits 11-13: `resource_state.direction_index` (0..=5), repeated on
-//!               every footprint tile so any tile can seed reconstruction
+//!   bits 11-13: effective rotation = `resource_state.direction_index / 2`
+//!               (0..=5, the game's clockwise `rotate_around` step count —
+//!               raw indices are even 0..=10 and don't fit in 3 bits),
+//!               repeated on every footprint tile so any tile can seed
+//!               reconstruction
 //!   bit  14   : paving flag — the tile is player-paved; bits 0-9 then hold
 //!               a paving index from the separate paving namespace
 //!               ([`Self::stamp_paving`], exposed via the dictionary's
@@ -26,10 +29,13 @@
 //!               when any of their three supers is) and preserved by every
 //!               later write; terrain never flips water↔land.
 //!
-//! Footprints come from `resource_desc.footprint` (axial offsets, rotated by
-//! direction via [`footprint_world_hexes`]) and are stamped server-side onto
-//! every occupied tile — clients render per-tile or reconstruct instances
-//! from origin tiles + direction, never doing footprint math themselves.
+//! Footprints come from `resource_desc.footprint` (axial offsets) and are
+//! stamped server-side onto every occupied tile, rotated exactly like the
+//! official server's `ResourceDesc::get_footprint`: clockwise by
+//! `direction_index / 2` 60°-steps around the anchor (see
+//! [`Self::stamp_footprint`] for the mirroring into our CCW rotator).
+//! Clients render per-tile or reconstruct instances from origin tiles +
+//! direction, never doing footprint math themselves.
 //!
 //! Overlap policy: the world does spawn single-hex forageables on the
 //! footprint tiles of multi-hex resources (verified against live data).
@@ -416,7 +422,11 @@ impl ResourceTileMap {
             self.delete(entity_id);
             return;
         };
-        let direction = direction.rem_euclid(6) as u8;
+        // `resource_state.direction_index` is even 0..=10 (flat slots of the
+        // 12-direction HexDirection enum). Normalize to the official
+        // effective rotation — clockwise `direction_index / 2` steps — which
+        // is what the tile word stores and what stamping mirrors.
+        let direction = (direction / 2).rem_euclid(6) as u8;
         let previous = self.by_entity.remove(&entity_id);
         if let Some(node) = &previous {
             if node.index == index && node.direction == direction && node.loc == loc {
@@ -570,6 +580,12 @@ impl ResourceTileMap {
     /// spawn forageables under multi-hex resources, and the visible (bigger)
     /// occupant should keep the tile. Water-only tiles count as empty, and
     /// the terrain water bit rides along on every written word.
+    ///
+    /// `direction` is the effective rotation (clockwise steps,
+    /// `direction_index / 2`, 0..=5). The official server rotates the tile
+    /// around the anchor CW by that count (`HexCoordinates::rotate_around`,
+    /// `(q, r) → (q + r, −q)` per step); our `rotate_ccw_axial` is the
+    /// inverse chirality, so mirror: CW `k` ≡ CCW `6 − k`.
     fn stamp_footprint(&mut self, origin: (i32, i32), index: u16, direction: u8) -> Vec<(u32, u16)> {
         // Cloned so the pending-recording writes below can borrow `self`
         // mutably while iterating (footprints are ≤ ~7 offsets).
@@ -579,8 +595,9 @@ impl ResourceTileMap {
         };
         let multi = offsets.len() > 1;
         let region = self.region;
+        let steps = (6 - direction as i32 % 6) % 6;
         let mut owned = Vec::with_capacity(offsets.len());
-        for (x, z) in footprint_world_hexes(origin.0, origin.1, direction as i32, &offsets) {
+        for (x, z) in footprint_world_hexes(origin.0, origin.1, steps, &offsets) {
             let Some(idx) = world_to_local(region, x, z).and_then(|(lx, lz)| overlay_index(lx, lz)) else {
                 continue;
             };
@@ -707,14 +724,52 @@ mod tests {
         }
         // Neighbors stay empty.
         assert!(m.resource_at_local(10, 19).is_none());
+    }
 
-        // Direction rotates the footprint; origin flag follows the anchor.
-        // Dir 1 = ccw rotation: axial (0,-1)→(1,-1) and (-1,0)→(0,-1),
-        // which land on odd-r (10,19) and (9,19) around the same origin.
-        m.upsert(1, MUD_MOUND, 1, Some((10, 20)));
-        assert!(m.resource_at_local(9, 20).is_none()); // dir-0-only tile vacated
-        let rotated = tiles_at(&m, &[(10, 20), (10, 19)]);
-        assert_eq!(rotated.len(), 2);
+    /// Raw `resource_state.direction_index` (even 0..=10) → the tiles the
+    /// official server's `ResourceDesc::get_footprint` produces: rotate
+    /// clockwise by `direction_index / 2` 60°-steps around the anchor.
+    /// Verified against the live game 2026-09-23 (region 14, entity
+    /// 1008806316536221912 at anchor (24481,18481), raw dir 10 → footprint
+    /// tiles (24481,18480)/(24482,18480), one row south; raw 2/4/8 sampled
+    /// the same way via `footprint_tile_state`/`location_state`). The
+    /// pre-fix code rotated CCW by `direction_index mod 6`, which matched
+    /// only raw 0/4/8 and flipped the other half — raw 10 rendered the two
+    /// tiles north instead of south.
+    #[test]
+    fn footprint_rotation_matches_official_direction_semantics() {
+        let mut m = map();
+        m.note_desc(MUD_MOUND, &[(0, 0), (0, -1), (-1, 0)]);
+        // Anchor (10, 20) is an even odd-r row → axial (0, 20). Non-anchor
+        // footprint tiles per raw direction, derived from the official CW
+        // rotation and cross-checked against live game rows. The tuple is
+        // (raw direction_index, stored effective direction, tiles).
+        let expected: [(i32, u8, &[(i32, i32)]); 6] = [
+            (0, 0, &[(9, 19), (9, 20)]),   // unrotated: axial SW + W
+            (2, 1, &[(9, 20), (9, 21)]),   // CW 1
+            (4, 2, &[(9, 21), (10, 21)]),  // CW 2
+            (6, 3, &[(10, 21), (11, 20)]), // CW 3 — the old code's 180° flip
+            (8, 4, &[(10, 19), (11, 20)]), // CW 4
+            (10, 5, &[(9, 19), (10, 19)]), // CW 5 — the reported N↔S flip
+        ];
+        let probe: [(i32, i32); 7] = [(10, 20), (9, 19), (9, 20), (9, 21), (10, 19), (10, 21), (11, 20)];
+        for (raw, stored, tiles) in expected {
+            m.upsert(1, MUD_MOUND, raw, Some((10, 20)));
+            let mut got: Vec<(i32, i32)> = Vec::new();
+            for &(x, z) in &probe {
+                if let Some(t) = m.resource_at_local(x, z) {
+                    assert_eq!(t.resource_id, MUD_MOUND, "raw {raw} at ({x},{z})");
+                    assert_eq!(t.direction, stored, "raw {raw} stored direction");
+                    assert_eq!(t.is_origin, (x, z) == (10, 20), "raw {raw} origin flag");
+                    got.push((x, z));
+                }
+            }
+            let mut want: Vec<(i32, i32)> = tiles.to_vec();
+            want.push((10, 20));
+            want.sort_unstable();
+            got.sort_unstable();
+            assert_eq!(got, want, "raw direction {raw}");
+        }
     }
 
     #[test]

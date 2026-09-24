@@ -47,8 +47,14 @@ pub fn axial_to_offset(q: i32, r: i32) -> Hex {
 
 /// 60° counter-clockwise cube rotation, `steps` times: `(q, r) → (−r, q + r)`.
 ///
-/// `resource_state.direction_index` / `building_state.direction_index` are
-/// `0..=5`. See `bitcraft-mats/docs/footprints-rotation.md`.
+/// This is the **inverse** of the game's `HexCoordinates::rotate_around`
+/// (BitCraftPublic), whose positive steps rotate clockwise,
+/// `(q, r) → (q + r, −q)`. `resource_state.direction_index` /
+/// `building_state.direction_index` are even values `0..=10` (the flat slots
+/// of the 12-direction `HexDirection` enum), and the game rotates footprints
+/// clockwise by `direction_index / 2` steps — CW `k` ≡ CCW `6 − k`, the same
+/// mirrored mapping `bitcraft-mats/docs/footprints-rotation.md` verified for
+/// buildings. See [`ResourceTileMap::stamp_footprint`](crate::roads::resource_map::ResourceTileMap::stamp_footprint).
 pub fn rotate_ccw_axial(q: i32, r: i32, steps: i32) -> (i32, i32) {
     let mut x = q;
     let mut z = r;
@@ -69,15 +75,18 @@ pub fn rotate_ccw_axial(q: i32, r: i32, steps: i32) -> (i32, i32) {
 /// Footprint cells are axial offsets (schema names them `x`/`z`). They must
 /// be rotated in cube space then added to the origin in axial, not added
 /// directly to odd-r world coords (that shears on odd `z` rows).
+/// `rotation_steps` counts 60° CCW turns — callers holding a game
+/// `direction_index` must first mirror it to `(6 − direction_index / 2) % 6`
+/// (the game rotates CW by `direction_index / 2`).
 pub fn footprint_world_hexes(
     wx: i32,
     wz: i32,
-    direction: i32,
+    rotation_steps: i32,
     offsets: &[(i32, i32)],
 ) -> impl Iterator<Item = (i32, i32)> + '_ {
     let (wq, wr) = offset_to_axial(wx, wz);
     offsets.iter().copied().map(move |(fx, fz)| {
-        let (rx, rz) = rotate_ccw_axial(fx, fz, direction);
+        let (rx, rz) = rotate_ccw_axial(fx, fz, rotation_steps);
         let h = axial_to_offset(wq + rx, wr + rz);
         (h.x, h.z)
     })
