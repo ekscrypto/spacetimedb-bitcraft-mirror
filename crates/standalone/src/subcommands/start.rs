@@ -157,6 +157,20 @@ pub fn cli() -> clap::Command {
                 .action(clap::ArgAction::Append),
         )
         .arg(
+            Arg::new("mirror_event_tables")
+                .long("mirror-event-tables")
+                .help(
+                    "Comma-separated allowlist of *_event tables to forward live (repeatable; applies to \
+                     every --mirror). Event rows are broadcast to downstream subscribers but never \
+                     accumulated locally (the local tables stay empty) — there is no snapshot and no \
+                     catch-up, so consumers must persist on arrival. Non-allowlisted event tables are \
+                     excluded from the upstream subscribe entirely. Pass `none` to disable forwarding.",
+                )
+                .requires("public_mirror_v1")
+                .action(clap::ArgAction::Append)
+                .value_delimiter(','),
+        )
+        .arg(
             Arg::new("reject_one_off_query")
                 .long("reject-one-off-query")
                 .action(SetTrue)
@@ -292,6 +306,7 @@ pub async fn exec(args: &ArgMatches, db_cores: JobCores) -> anyhow::Result<()> {
     let mirror_tables: Option<Vec<String>> = args
         .get_many::<String>("mirror_table")
         .map(|vals| vals.cloned().collect());
+    let mirror_event_tables = resolve_mirror_event_tables(&args)?;
     let mirror_token = resolve_mirror_token(args)?;
     let mirrors = if public_mirror_v1 {
         let raw: Vec<String> = args
@@ -460,6 +475,7 @@ pub async fn exec(args: &ArgMatches, db_cores: JobCores) -> anyhow::Result<()> {
                 &m.database,
                 mirror_token.as_deref(),
                 mirror_tables.clone(),
+                mirror_event_tables.clone(),
                 reject_one_off_query,
                 Arc::clone(&subscribe_gate),
                 coordinator_socket.clone(),
@@ -848,12 +864,60 @@ struct CacheContext {
     roads: Option<std::sync::Arc<relay_cache::roads::RoadsFleet>>,
 }
 
+/// Default event-table forwarding allowlist: the transaction-relevant set.
+/// High-frequency movement/combat events (`player_move_event`,
+/// `enemy_move_event`, `attack_event`, `extract_event`, …) are deliberately
+/// absent — they alone would dwarf the state tables; add them explicitly if
+/// a consumer wants them.
+const DEFAULT_MIRROR_EVENT_TABLES: &[&str] = &[
+    "market_trade_event",
+    "barter_stall_inventory_event",
+    "claim_treasury_event",
+    "player_signed_out_event",
+    "craft_event",
+    "player_death_event",
+];
+
+/// Resolve `--mirror-event-tables` into the forwarding allowlist.
+///
+/// Unset → the transaction-relevant default. `none` (case-insensitive, alone)
+/// disables forwarding entirely.
+fn resolve_mirror_event_tables(args: &ArgMatches) -> anyhow::Result<Vec<String>> {
+    let Some(vals) = args.get_many::<String>("mirror_event_tables") else {
+        return Ok(DEFAULT_MIRROR_EVENT_TABLES.iter().map(|s| s.to_string()).collect());
+    };
+    let tables: Vec<String> = vals
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if tables.is_empty() {
+        return Ok(Vec::new());
+    }
+    if tables.iter().any(|t| t.eq_ignore_ascii_case("none")) {
+        anyhow::ensure!(
+            tables.len() == 1,
+            "`none` cannot be combined with table names in --mirror-event-tables"
+        );
+        return Ok(Vec::new());
+    }
+    for t in &tables {
+        anyhow::ensure!(
+            t.ends_with("_event"),
+            "--mirror-event-tables entry `{t}` does not end in `_event` (event-table capture is for *_event tables)"
+        );
+    }
+    Ok(tables)
+}
+
 async fn bootstrap_public_mirror(
     ctx: &StandaloneEnv,
     upstream_url: &Url,
     mirror_database: &str,
     token: Option<&str>,
     tables: Option<Vec<String>>,
+    event_tables: Vec<String>,
     reject_one_off_query: bool,
     subscribe_gate: Arc<tokio::sync::Semaphore>,
     coordinator_socket: Option<std::path::PathBuf>,
@@ -988,6 +1052,7 @@ async fn bootstrap_public_mirror(
         tables,
         connect_timeout: Duration::from_secs(60),
         bootstrap_schema_hash: initial_program,
+        event_tables,
     };
     let observers = cache.as_ref().map(|c| c.registry.clone());
     let mirror_status_registry = std::sync::Arc::clone(ctx.mirror_status_registry());

@@ -28,6 +28,20 @@ pub enum SubscribePhase {
     ApplyingSeed,
 }
 
+/// Forwarding status for one allowlisted `*_event` table (v2-only wire
+/// feature: event rows are broadcast to subscribers live, never persisted
+/// locally, and have no snapshot or catch-up — rows missed while
+/// disconnected are gone for good).
+#[derive(Debug, Clone, Serialize)]
+pub struct EventTableStatus {
+    pub table: String,
+    /// Lifetime count of event rows decoded off the wire and broadcast.
+    pub events_forwarded: u64,
+    /// Wall clock of the most recently forwarded event row, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_event_forwarded_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MirrorStatusSnapshot {
     pub host: String,
@@ -69,6 +83,10 @@ pub struct MirrorStatusSnapshot {
     /// Wall clock of the last seed-insert progress tick (hang detector during apply).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_seed_apply_at: Option<String>,
+    /// Per-table event forwarding stats. `None` when event-table forwarding
+    /// is disabled for this mirror, so pre-event deployments' JSON is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_tables: Option<Vec<EventTableStatus>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

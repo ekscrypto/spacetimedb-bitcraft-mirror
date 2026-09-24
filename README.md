@@ -173,13 +173,27 @@ more `--mirror` targets. Key flags (all require `--public-mirror-v1`):
 | `--mirror <url>/<db>` | Upstream to mirror (repeatable). Local clients select by database name. |
 | `--mirror-token` / `--mirror-token-file` | Upstream bearer JWT (also `BITCRAFT_TOKEN`, `MIRROR_TOKEN`, `RELAY_UPSTREAM_TOKEN`, `MIRROR_TOKEN_FILE`). Shared across all mirrors. |
 | `--mirror-table <name>` | Limit upstream subscribe set (repeatable; default: all public user tables). Shared across all mirrors. |
+| `--mirror-event-tables <list>` | Allowlist of `*_event` tables to forward (comma-separated, repeatable; default: the transaction-relevant set — `market_trade_event`, `barter_stall_inventory_event`, `claim_treasury_event`, `player_signed_out_event`, `craft_event`, `player_death_event`; `none` disables). Event rows are broadcast live to downstream subscribers on every subprotocol but never accumulated locally — the local tables stay empty, matching the game server's own wire-only semantics. There is no snapshot and no catch-up: rows missed while disconnected are gone, so consumers must persist on arrival. Non-allowlisted event tables are excluded from the upstream subscribe entirely (they would dwarf the state tables). |
 | `--mirror-subscribe-concurrency <n>` | Max mirrors that may run initial setup at once (default **1**; production keeps it at 1 — serialized seeding is a stability requirement, not a suggestion, on slower hosts). Slot held for connect + every table seed + local apply; released when that mirror goes `live`. |
 | `--mirror-status-listen-addr <addr>` | Isolated readiness listener (default `127.0.0.1:<main-port+1>`). |
 | `--reject-one-off-query` | Also reject `OneOffQuery` (allowed by default). `CallReducer` / `CallProcedure` are always rejected. |
 | `--bitcraft-cache` | Embed the relay-cache (this fork). Adds `--cache-bind` and `--cache-mem-ceiling-bytes`. |
 
 Status and per-table seed progress: `GET /v1/mirrors` (main port and the
-status sidecar).
+status sidecar). Event forwarding exposes per-table `events_forwarded` and
+`last_event_forwarded_at` there (under `event_tables`) for gap detection.
+
+**Event-table forwarding semantics.** Event rows arrive only on the v2 wire
+(v1 subscriptions to event tables are rejected upstream) and exist only in
+flight: the mirror inserts them in the broadcast transaction — so every
+downstream subscriber receives them, including content-duplicate rows — and
+immediately purges the local table in an un-broadcast follow-up transaction.
+Local event tables therefore stay empty; snapshot subscribers see 0 rows and
+then receive live events. The purge is what keeps duplicate events flowing:
+SpacetimeDB tables are row *sets*, so inserting a content-identical row into
+a non-empty table is silently elided (no write, no broadcast). Consumers
+persist on arrival (bitcraftsync writes them to PostgreSQL) — the mirror
+intentionally keeps nothing.
 
 **Clients are gated per database.** A downstream WebSocket subscribe to a
 given database is accepted once *that database's* mirror reports `live`, and

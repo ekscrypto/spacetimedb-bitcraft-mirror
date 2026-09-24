@@ -1860,10 +1860,16 @@ impl ModuleHost {
     /// [`SingleThreadedExecutor`].
     ///
     /// `progress` is attached to seed updates only.
+    ///
+    /// `event_tables` carries the mirrored `*_event` table ids: their live
+    /// inserts are broadcast to subscribers and then purged from the local
+    /// table (forward-only; see
+    /// [`super::public_mirror::apply_external_update`]).
     pub async fn apply_mirrored_updates(
         &self,
         updates: Vec<super::public_mirror::MirroredUpdate>,
         progress: Option<super::public_mirror::SeedApplyProgress>,
+        event_tables: Arc<std::collections::HashSet<TableId>>,
     ) -> Result<(), DBError> {
         self.guard_closed()
             .map_err(|_| DBError::Other(anyhow::anyhow!("module closed")))?;
@@ -1884,6 +1890,7 @@ impl ModuleHost {
                         update.ops,
                         progress,
                         update.is_seed,
+                        &event_tables,
                     )?;
                 }
                 Ok(())
@@ -1930,7 +1937,9 @@ impl ModuleHost {
             "public-mirror: flushing {} table(s) before reconnect re-seed",
             updates.len()
         );
-        self.apply_mirrored_updates(updates, None).await
+        // Reconnect flush is state-tables-only; event tables are forwarded
+        // wire-only and never hold rows to flush.
+        self.apply_mirrored_updates(updates, None, Arc::default()).await
     }
 
     #[inline]

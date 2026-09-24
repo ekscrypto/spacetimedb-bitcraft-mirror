@@ -157,6 +157,31 @@ fn commit_live_tx(subs: &ModuleSubscriptions, event: ModuleEvent, tx: MutTxId) -
     Ok(())
 }
 
+/// Forwarding semantics for mirrored event tables: event rows are inserted in
+/// the broadcast tx purely so the subscription machinery sees them as writes
+/// and delivers them to subscribers, then purged from the local table in an
+/// **un-broadcast** tx right after. The local event tables therefore stay
+/// empty (wire-only, like the game server itself) — which also sidesteps the
+/// datastore's set semantics: tables are row SETS, so inserting a
+/// content-identical row into a non-empty table is silently elided (no
+/// write, no broadcast). With the table purged between batches, every
+/// incoming event — including content-duplicates like a player's second
+/// death — produces a fresh write and reaches subscribers.
+///
+/// Rows missed while disconnected are gone for good: event tables have no
+/// upstream snapshot or catch-up. Consumers persist on receipt.
+fn purge_event_tables(
+    subs: &ModuleSubscriptions,
+    table_ids: impl IntoIterator<Item = TableId>,
+) -> Result<(), DBError> {
+    let stdb = subs.relational_db();
+    let mut tx = stdb.begin_mut_tx(IsolationLevel::Serializable, Workload::Update);
+    for table_id in table_ids {
+        tx.clear_table(table_id)?;
+    }
+    commit_seed_tx(subs, tx)
+}
+
 /// Apply row ops in one mut tx and (for live updates) broadcast with upstream provenance.
 ///
 /// When `is_seed` is set, each table is cleared on the first chunk then rows
@@ -165,17 +190,23 @@ fn commit_live_tx(subs: &ModuleSubscriptions, event: ModuleEvent, tx: MutTxId) -
 /// evaluation — clients are not accepted until the mirror is fully live.
 /// Reconnect re-seeds otherwise collide with rows left over from the previous
 /// session (unique constraint violation → endless reconnect loop).
+///
+/// `event_tables` lists the mirrored `*_event` tables in `ops`: their live
+/// inserts are broadcast to subscribers and then purged from the local table
+/// (see [`purge_event_tables`]) — the local event tables stay empty.
 pub fn apply_external_update(
     subs: &ModuleSubscriptions,
     provenance: Option<ExternalProvenance>,
     ops: impl IntoIterator<Item = TableOps>,
     progress: Option<SeedApplyProgress>,
     is_seed: bool,
+    event_tables: &std::collections::HashSet<TableId>,
 ) -> Result<(), DBError> {
     let stdb = subs.relational_db();
     let ops: Vec<TableOps> = ops.into_iter().collect();
-
     if is_seed {
+        // Event tables never carry seed rows and must never be cleared here:
+        // they hold no state to re-seed (and stay empty under forwarding).
         let mut total_applied = 0u64;
         let mut since_tick = 0u64;
         // One summary line instead of one per table: 274 INFO lines per cold
@@ -228,17 +259,28 @@ pub fn apply_external_update(
         return Ok(());
     }
 
+    let mut forwarded_event_tables = Vec::new();
     let mut tx = stdb.begin_mut_tx(IsolationLevel::Serializable, Workload::Update);
     for table_ops in ops {
+        let is_event = event_tables.contains(&table_ops.table_id);
         for row in &table_ops.deletes {
             tx.delete_product_value(table_ops.table_id, row)?;
         }
         for row_bytes in &table_ops.inserts {
             stdb.insert(&mut tx, table_ops.table_id, row_bytes)?;
         }
+        if is_event && !table_ops.inserts.is_empty() {
+            forwarded_event_tables.push(table_ops.table_id);
+        }
     }
 
-    commit_live_tx(subs, mirror_event(&provenance), tx)
+    commit_live_tx(subs, mirror_event(&provenance), tx)?;
+    // The broadcast derives from the committed writes, so purge only after it
+    // has committed; subscribers keep what they already received.
+    if !forwarded_event_tables.is_empty() {
+        purge_event_tables(subs, forwarded_event_tables)?;
+    }
+    Ok(())
 }
 
 /// Bootstrap user tables (and views) from a [`ModuleDef`] without running an init reducer.
@@ -354,6 +396,25 @@ mod tests {
             }],
             None,
             false,
+            &std::collections::HashSet::new(),
+        )?;
+        Ok(())
+    }
+
+    /// Insert `value` as a row of a forwarded event table: broadcast to the
+    /// subscriber, then purged from the local table.
+    fn forward_event(region: &Region, value: u8) -> ResultTest<()> {
+        apply_external_update(
+            &region.subs,
+            None,
+            [TableOps {
+                table_id: region.table,
+                deletes: vec![],
+                inserts: vec![Bytes::from(vec![value])],
+            }],
+            None,
+            false,
+            &std::collections::HashSet::from([region.table]),
         )?;
         Ok(())
     }
@@ -371,6 +432,7 @@ mod tests {
             }],
             None,
             true,
+            &std::collections::HashSet::new(),
         )?;
         Ok(())
     }
@@ -395,6 +457,32 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(150), rx.recv()).await
         });
         assert!(got.is_err(), "expected no further client message ({ctx})");
+    }
+
+    /// Event rows must reach subscribers but never accumulate locally —
+    /// including content-duplicate rows, which the datastore's set semantics
+    /// would silently elide against a non-empty table (no write, no
+    /// broadcast). Forwarding purges the table after every broadcast, so a
+    /// duplicate row always lands on an empty table and is delivered again.
+    #[test]
+    fn event_rows_forwarded_then_purged_duplicates_still_delivered() -> ResultTest<()> {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _rt = runtime.enter();
+
+        let mut region = setup_region(3)?;
+        for v in [1u8, 1, 2, 1] {
+            forward_event(&region, v)?;
+        }
+        // Every event — including the repeats of row 1 — was broadcast
+        // (one message per forwarded event).
+        for ctx in ["event 1a", "event 1b (duplicate)", "event 2", "event 1c (duplicate)"] {
+            recv_one(&runtime, &mut region.rx, ctx);
+        }
+        assert_no_message(&runtime, &mut region.rx, "no extra broadcasts");
+        // ... and none of them accumulated locally.
+        assert_eq!(row_count(&region), 0, "forwarded events must not accumulate");
+
+        Ok(())
     }
 
     /// A mirror session dying must kick and flush only its own database: the

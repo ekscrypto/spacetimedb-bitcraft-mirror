@@ -258,7 +258,15 @@ type ApplyFn = Arc<
         + Sync,
 >;
 
-/// Connect to upstream v1, sequentially subscribe to each table, apply seeds and live updates.
+/// Connect to upstream v2, sequentially subscribe to each table, apply seeds and live updates.
+///
+/// `event_tables` names the allowlisted `*_event` tables inside `tables`
+/// whose live [`TableUpdateRows::EventTable`] rows are **forwarded** to
+/// downstream subscribers. Event tables have no upstream state: their
+/// `SubscribeApplied` seed is always empty, their rows are broadcast-only
+/// locally (never accumulated), and rows missed while disconnected are gone
+/// for good (see `/v1/mirrors` per-table `last_event_forwarded_at` for gap
+/// detection).
 ///
 /// When the live update loop begins, `live_started` is set to `Instant::now()` so the
 /// caller can measure how long the session was actually live (for reconnect backoff).
@@ -291,6 +299,7 @@ pub async fn connect_and_mirror(
     config: UpstreamConfig,
     module_def: &ModuleDef,
     tables: &[String],
+    event_tables: Arc<HashSet<String>>,
     on_update: ApplyFn,
     live_started: &mut Option<tokio::time::Instant>,
     failed_table: &mut Option<String>,
@@ -399,6 +408,7 @@ pub async fn connect_and_mirror(
         probe_late_warned: false,
         pace_seeds,
         deferred: VecDeque::new(),
+        event_tables,
     };
 
     let result = mirror_session(
@@ -520,22 +530,33 @@ where
     let (mut tables_ops, n_rows, wire_bytes) = ctx.await_seed(query_set_id, table).await?;
     log::debug!("public-mirror: SubscribeApplied for {table} ({n_rows} seed rows, {wire_bytes} wire bytes)");
 
-    // An empty seed must still clear the local table: after a reconnect the
-    // previous session's rows may be stale (upstream table now empty).
-    if tables_ops.is_empty() {
-        tables_ops.push(UpstreamTableOps {
-            table_name: table.to_owned(),
-            deletes: Vec::new(),
-            delete_bytes: Vec::new(),
-            inserts: Vec::new(),
-        });
-    }
+    let is_event_table = ctx.event_tables.contains(table);
+    let is_seed = if is_event_table {
+        // Event tables have no upstream state: the seed is always empty and
+        // the local table must NOT be cleared (nothing re-seeds it — rows are
+        // forwarded-only and the table is purged after every broadcast).
+        // Applying as a live update keeps that invariant even if a server
+        // ever seeded rows.
+        false
+    } else {
+        // An empty seed must still clear the local table: after a reconnect the
+        // previous session's rows may be stale (upstream table now empty).
+        if tables_ops.is_empty() {
+            tables_ops.push(UpstreamTableOps {
+                table_name: table.to_owned(),
+                deletes: Vec::new(),
+                delete_bytes: Vec::new(),
+                inserts: Vec::new(),
+            });
+        }
+        true
+    };
     ctx.applier.enqueue_seed(
         table.to_owned(),
         UpstreamUpdate {
             provenance: None,
             tables: tables_ops,
-            is_seed: true,
+            is_seed,
         },
         n_rows as u64,
         (idx as u32).saturating_add(1),
@@ -637,6 +658,10 @@ struct SessionCtx<S> {
     /// violation). They are replayed in arrival order once the decoded seed
     /// (or non-seed message) has been routed.
     deferred: VecDeque<Bytes>,
+    /// Allowlisted event tables whose live wire events are forwarded to
+    /// subscribers (broadcast-only locally). Shared with off-thread
+    /// decode closures.
+    event_tables: Arc<HashSet<String>>,
 }
 
 /// In-process observer context for one session (see [`crate::observer`]).
@@ -822,10 +847,14 @@ where
             };
             let decoded = if is_heavy_frame(&frame) {
                 let row_types = Arc::clone(&self.row_types);
-                self.run_blocking_decode(move || decode_background_frame(&frame, &row_types))
-                    .await?
+                let event_tables = Arc::clone(&self.event_tables);
+                let status = self.status.clone();
+                self.run_blocking_decode(move || {
+                    decode_background_frame(&frame, &row_types, &event_tables, &status)
+                })
+                .await?
             } else {
-                decode_background_frame(&frame, &self.row_types)?
+                decode_background_frame(&frame, &self.row_types, &self.event_tables, &self.status)?
             };
             self.apply_decoded_background(decoded)?;
         }
@@ -852,10 +881,14 @@ where
             };
             let decoded = if is_heavy_frame(&frame) {
                 let row_types = Arc::clone(&self.row_types);
-                self.run_blocking_decode(move || decode_seed_wait_frame(&frame, query_set_id, &row_types))
-                    .await?
+                let event_tables = Arc::clone(&self.event_tables);
+                let status = self.status.clone();
+                self.run_blocking_decode(move || {
+                    decode_seed_wait_frame(&frame, query_set_id, &row_types, &event_tables, &status)
+                })
+                .await?
             } else {
-                decode_seed_wait_frame(&frame, query_set_id, &self.row_types)?
+                decode_seed_wait_frame(&frame, query_set_id, &self.row_types, &self.event_tables, &self.status)?
             };
             match decoded {
                 SeedWaitDecode::Seed {
@@ -940,7 +973,12 @@ where
                             log::info!("public-mirror: identity token received (identity={})", ic.identity);
                             return Ok(());
                         }
-                        other => self.apply_decoded_background(classify_background(other, &self.row_types)?)?,
+                        other => self.apply_decoded_background(classify_background(
+                            other,
+                            &self.row_types,
+                            &self.event_tables,
+                            &self.status,
+                        )?)?,
                     }
                 }
                 Event::Applied | Event::Tick | Event::Probe => {}
@@ -1281,9 +1319,13 @@ enum DecodedBackground {
 fn classify_background(
     server: ServerMessage,
     row_types: &HashMap<String, ProductType>,
+    event_tables: &HashSet<String>,
+    status: &MirrorStatusHandle,
 ) -> Result<DecodedBackground, UpstreamError> {
     Ok(match server {
-        ServerMessage::TransactionUpdate(tu) => DecodedBackground::Update(transaction_to_update(tu, row_types)?),
+        ServerMessage::TransactionUpdate(tu) => {
+            DecodedBackground::Update(transaction_to_update(tu, row_types, event_tables, status)?)
+        }
         ServerMessage::OneOffQueryResult(_) => DecodedBackground::ProbeResponse,
         ServerMessage::SubscriptionError(err) => DecodedBackground::SubscriptionError(err.error.to_string()),
         other => DecodedBackground::Ignored(variant_name(&other)),
@@ -1293,8 +1335,10 @@ fn classify_background(
 fn decode_background_frame(
     frame: &[u8],
     row_types: &HashMap<String, ProductType>,
+    event_tables: &HashSet<String>,
+    status: &MirrorStatusHandle,
 ) -> Result<DecodedBackground, UpstreamError> {
-    classify_background(decode_server_message(frame)?, row_types)
+    classify_background(decode_server_message(frame)?, row_types, event_tables, status)
 }
 
 /// Whether a frame must be decompressed + decoded on the blocking pool: any
@@ -1329,6 +1373,8 @@ fn decode_seed_wait_frame(
     frame: &[u8],
     query_set_id: u32,
     row_types: &HashMap<String, ProductType>,
+    event_tables: &HashSet<String>,
+    status: &MirrorStatusHandle,
 ) -> Result<SeedWaitDecode, UpstreamError> {
     let wire_bytes = frame.len();
     let server = decode_server_message(frame)?;
@@ -1348,7 +1394,9 @@ fn decode_seed_wait_frame(
                 wire_bytes,
             })
         }
-        other => Ok(SeedWaitDecode::Background(classify_background(other, row_types)?)),
+        other => Ok(SeedWaitDecode::Background(classify_background(
+            other, row_types, event_tables, status,
+        )?)),
     }
 }
 
@@ -1356,11 +1404,17 @@ fn decode_seed_wait_frame(
 ///
 /// One wire message == one upstream transaction. v2 carries no reducer
 /// provenance, so the update applies with `provenance: None`. Event-table
-/// rows are dropped: v2 servers do not persist them, so applying them would
-/// diverge local row counts from upstream and grow without bound.
+/// rows (`TableUpdateRows::EventTable`) flow through as inserts for
+/// allowlisted tables — they exist only on the wire (v2 servers never
+/// persist them), so the apply path broadcasts them to subscribers and then
+/// purges the local table (forward-only). Rows for non-allowlisted event
+/// tables are dropped: nothing subscribes to those tables, so this is
+/// defensive only.
 fn transaction_to_update(
     tu: TransactionUpdate,
     row_types: &HashMap<String, ProductType>,
+    event_tables: &HashSet<String>,
+    status: &MirrorStatusHandle,
 ) -> Result<Option<UpstreamUpdate>, UpstreamError> {
     let mut out = Vec::with_capacity(tu.query_sets.len());
     for query_set in &tu.query_sets {
@@ -1373,7 +1427,7 @@ fn transaction_to_update(
             let mut inserts = Vec::new();
             let mut deletes = Vec::new();
             let mut delete_bytes = Vec::new();
-            let mut event_rows = 0usize;
+            let mut event_rows_dropped = 0usize;
             for rows in &table.rows {
                 match rows {
                     TableUpdateRows::PersistentTable(p) => {
@@ -1390,12 +1444,18 @@ fn transaction_to_update(
                         }
                     }
                     TableUpdateRows::EventTable(e) => {
-                        event_rows += e.events.len();
+                        if event_tables.contains(table_name.as_str()) {
+                            let n = e.events.len();
+                            inserts.extend(&e.events);
+                            status.record_event_rows(&table_name, n);
+                        } else {
+                            event_rows_dropped += e.events.len();
+                        }
                     }
                 }
             }
-            if event_rows > 0 {
-                log::debug!("public-mirror: dropping {event_rows} transient event row(s) for {table_name}");
+            if event_rows_dropped > 0 {
+                log::debug!("public-mirror: dropping {event_rows_dropped} event row(s) for non-forwarded {table_name}");
             }
             if inserts.is_empty() && deletes.is_empty() {
                 continue;
@@ -1616,16 +1676,26 @@ mod tests {
     use super::*;
     use crate::status::MirrorStatusRegistry;
     use futures::FutureExt;
+    use spacetimedb_client_api_messages::websocket::common::{BsatnRowList, RowSizeHint};
+    use spacetimedb_client_api_messages::websocket::v2::{
+        EventTableRows, PersistentTableRows, QuerySetUpdate, TableUpdate,
+    };
+    use spacetimedb_sats::AlgebraicType;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn test_status() -> MirrorStatusHandle {
+        test_status_pair().1
+    }
+
+    fn test_status_pair() -> (MirrorStatusRegistry, MirrorStatusHandle) {
         let reg = MirrorStatusRegistry::new();
-        reg.register(
+        let handle = reg.register(
             &Url::parse("wss://test.example").unwrap(),
             "db",
             Identity::from_claims("public-mirror-v1", "db"),
             1,
-        )
+        );
+        (reg, handle)
     }
 
     fn live_update(n_tx: bool, insert_bytes: usize) -> UpstreamUpdate {
@@ -1760,6 +1830,123 @@ mod tests {
             decode_server_message(&[9, 1, 2]),
             Err(UpstreamError::UnknownCompression(9))
         ));
+    }
+
+    /// Build a wire frame carrying one v2 `TransactionUpdate` whose single
+    /// table has both persistent and/or event rows (1-byte fixed-size rows).
+    fn tu_frame(tables: Vec<TableUpdate>) -> Vec<u8> {
+        let msg = ServerMessage::TransactionUpdate(TransactionUpdate {
+            query_sets: vec![QuerySetUpdate {
+                query_set_id: QuerySetId::new(1),
+                tables: tables.into_boxed_slice(),
+            }]
+            .into_boxed_slice(),
+        });
+        let mut frame = vec![SERVER_MSG_COMPRESSION_TAG_NONE];
+        frame.extend_from_slice(&bsatn::to_vec(&msg).unwrap());
+        frame
+    }
+
+    fn fixed_rows(bytes: &[u8]) -> BsatnRowList {
+        BsatnRowList::new(RowSizeHint::FixedSize(1), Bytes::copy_from_slice(bytes))
+    }
+
+    fn u8_row_type() -> HashMap<String, ProductType> {
+        HashMap::from([("t".to_string(), ProductType::from([AlgebraicType::U8]))])
+    }
+
+    #[test]
+    fn event_rows_forwarded_for_allowlisted_table() {
+        let (reg, status) = test_status_pair();
+        status.init_event_tables(["market_trade_event".to_string()]);
+        let allow: HashSet<String> = HashSet::from(["market_trade_event".to_string()]);
+        let row_types = HashMap::from([(
+            "market_trade_event".to_string(),
+            ProductType::from([AlgebraicType::U8]),
+        )]);
+
+        let frame = tu_frame(vec![TableUpdate {
+            table_name: "market_trade_event".to_string().into(),
+            rows: vec![TableUpdateRows::EventTable(EventTableRows {
+                events: fixed_rows(&[7, 8, 9]),
+            })]
+            .into_boxed_slice(),
+        }]);
+
+        let decoded = decode_background_frame(&frame, &row_types, &allow, &status).unwrap();
+        let DecodedBackground::Update(Some(update)) = decoded else {
+            panic!("expected a live update, got {decoded:?}");
+        };
+        assert!(!update.is_seed);
+        assert_eq!(update.tables.len(), 1);
+        assert_eq!(update.tables[0].table_name, "market_trade_event");
+        assert_eq!(update.tables[0].inserts, vec![Bytes::from(vec![7u8]), Bytes::from(vec![8u8]), Bytes::from(vec![9u8])]);
+        assert!(update.tables[0].deletes.is_empty());
+
+        let m = &reg.snapshot().mirrors[0];
+        let events = m.event_tables.as_ref().unwrap();
+        let market = events.iter().find(|t| t.table == "market_trade_event").unwrap();
+        assert_eq!(market.events_forwarded, 3);
+        assert!(market.last_event_forwarded_at.is_some());
+    }
+
+    #[test]
+    fn event_rows_dropped_for_non_allowlisted_table() {
+        let (_reg, status) = test_status_pair();
+        let allow: HashSet<String> = HashSet::from(["market_trade_event".to_string()]);
+        let row_types = u8_row_type();
+
+        let frame = tu_frame(vec![TableUpdate {
+            table_name: "t".to_string().into(),
+            rows: vec![TableUpdateRows::EventTable(EventTableRows {
+                events: fixed_rows(&[1, 2]),
+            })]
+            .into_boxed_slice(),
+        }]);
+
+        let decoded = decode_background_frame(&frame, &row_types, &allow, &status).unwrap();
+        assert!(matches!(decoded, DecodedBackground::Update(None)));
+    }
+
+    #[test]
+    fn persistent_and_event_rows_coexist_in_one_update() {
+        let (_reg, status) = test_status_pair();
+        let allow: HashSet<String> = HashSet::from(["t".to_string()]);
+        let row_types = u8_row_type();
+
+        // One TableUpdate carrying both row kinds, plus a second TableUpdate
+        // for the same table (the wire permits both shapes).
+        let frame = tu_frame(vec![
+            TableUpdate {
+                table_name: "t".to_string().into(),
+                rows: vec![
+                    TableUpdateRows::PersistentTable(PersistentTableRows {
+                        inserts: fixed_rows(&[1]),
+                        deletes: fixed_rows(&[2]),
+                    }),
+                    TableUpdateRows::EventTable(EventTableRows {
+                        events: fixed_rows(&[3]),
+                    }),
+                ]
+                .into_boxed_slice(),
+            },
+            TableUpdate {
+                table_name: "t".to_string().into(),
+                rows: vec![TableUpdateRows::EventTable(EventTableRows {
+                    events: fixed_rows(&[4]),
+                })]
+                .into_boxed_slice(),
+            },
+        ]);
+
+        let decoded = decode_background_frame(&frame, &row_types, &allow, &status).unwrap();
+        let DecodedBackground::Update(Some(update)) = decoded else {
+            panic!("expected a live update, got {decoded:?}");
+        };
+        let inserts: usize = update.tables.iter().map(|ops| ops.inserts.len()).sum();
+        let deletes: usize = update.tables.iter().map(|ops| ops.deletes.len()).sum();
+        assert_eq!(inserts, 3, "persistent insert + 2 forwarded event rows");
+        assert_eq!(deletes, 1, "persistent delete decoded against the row type");
     }
 
     #[test]

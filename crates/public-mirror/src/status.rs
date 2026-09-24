@@ -1,5 +1,6 @@
 //! Per-mirror connectivity status for `GET /v1/mirrors`.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -8,7 +9,7 @@ use spacetimedb_lib::Identity;
 use url::Url;
 
 pub use spacetimedb_client_api::routes::mirrors::{
-    MirrorConnectivity, MirrorStatusSnapshot, MirrorsResponse, SubscribePhase,
+    EventTableStatus, MirrorConnectivity, MirrorStatusSnapshot, MirrorsResponse, SubscribePhase,
 };
 
 /// Shared socket byte counter attached for one upstream WebSocket session.
@@ -85,6 +86,21 @@ struct MirrorStatusInner {
     /// Unix millis of last seed-insert progress tick.
     last_seed_apply_unix_ms: Option<Arc<AtomicU64>>,
     byte_counter: Option<ByteCounter>,
+    /// Per-table event-row forwarding stats. Lifetime across reconnects:
+    /// events have no snapshot or catch-up, so the counters are the only
+    /// continuity signal. Map is empty when forwarding is disabled.
+    event_captures: HashMap<String, EventCapture>,
+    /// `false` when this mirror forwards no event tables; keeps snapshots'
+    /// `event_tables` field absent for pre-event deployments.
+    event_capture_enabled: bool,
+}
+
+/// Accumulating forwarding stats for one allowlisted event table.
+#[derive(Debug, Default)]
+struct EventCapture {
+    events_forwarded: u64,
+    /// Unix millis of the most recently forwarded row (0 = none).
+    last_event_unix_ms: u64,
 }
 
 impl MirrorStatusInner {
@@ -144,6 +160,21 @@ impl MirrorStatusInner {
             }
         });
 
+        let event_tables = self.event_capture_enabled.then(|| {
+            let mut tables: Vec<EventTableStatus> = self
+                .event_captures
+                .iter()
+                .map(|(table, cap)| EventTableStatus {
+                    table: table.clone(),
+                    events_forwarded: cap.events_forwarded,
+                    last_event_forwarded_at: (cap.last_event_unix_ms != 0)
+                        .then(|| format_rfc3339(UNIX_EPOCH + Duration::from_millis(cap.last_event_unix_ms))),
+                })
+                .collect();
+            tables.sort_by(|a, b| a.table.cmp(&b.table));
+            tables
+        });
+
         MirrorStatusSnapshot {
             host: self.host.clone(),
             database: self.database.clone(),
@@ -164,6 +195,7 @@ impl MirrorStatusInner {
             current_table_seed_rows: self.current_table_seed_rows,
             current_table_seed_rows_applied,
             last_seed_apply_at,
+            event_tables,
         }
     }
 }
@@ -211,6 +243,8 @@ impl MirrorStatusRegistry {
             current_table_seed_rows_applied: None,
             last_seed_apply_unix_ms: None,
             byte_counter: None,
+            event_captures: HashMap::new(),
+            event_capture_enabled: false,
         }));
         self.mirrors
             .lock()
@@ -395,6 +429,37 @@ impl MirrorStatusHandle {
     pub fn set_tables_total(&self, tables_total: u32) {
         self.with_mut(|s| {
             s.tables_total = tables_total;
+        });
+    }
+
+    /// Enable event-table forwarding and pre-register the allowlisted tables
+    /// so `/v1/mirrors` surfaces them (with zero counts) before the first
+    /// event.
+    pub fn init_event_tables(&self, tables: impl IntoIterator<Item = String>) {
+        self.with_mut(|s| {
+            s.event_capture_enabled = true;
+            for name in tables {
+                s.event_captures.entry(name).or_default();
+            }
+        });
+    }
+
+    /// Record `n` event rows forwarded for `table` (decoded off the live wire
+    /// and broadcast to subscribers).
+    ///
+    /// Cheap enough to call per decoded frame: a mutex lock and two stores.
+    pub fn record_event_rows(&self, table: &str, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_millis() as u64;
+        self.with_mut(|s| {
+            let cap = s.event_captures.entry(table.to_owned()).or_default();
+            cap.events_forwarded = cap.events_forwarded.saturating_add(n as u64);
+            cap.last_event_unix_ms = ms;
         });
     }
 }
@@ -585,6 +650,51 @@ mod tests {
         let snap = reg.snapshot();
         assert!(snap.mirrors.is_empty());
         assert_eq!(serde_json::to_string(&snap).unwrap(), r#"{"mirrors":[]}"#);
+    }
+
+    #[test]
+    fn event_forwarding_stats_surface_and_persist_across_reconnect() {
+        let reg = MirrorStatusRegistry::new();
+        let host = Url::parse("wss://ea.example").unwrap();
+        let h = reg.register(&host, "db", Identity::from_claims("public-mirror-v1", "db"), 1);
+
+        // Before init: field absent (pre-event deployments' JSON unchanged).
+        let json = serde_json::to_value(reg.snapshot()).unwrap();
+        assert!(json["mirrors"][0].get("event_tables").is_none());
+
+        h.init_event_tables(["market_trade_event".to_string(), "craft_event".to_string()]);
+        let m = &reg.snapshot().mirrors[0];
+        let tables = m.event_tables.as_ref().unwrap();
+        assert_eq!(tables.len(), 2);
+        assert_eq!(tables[0].table, "craft_event");
+        assert_eq!(tables[0].events_forwarded, 0);
+        assert!(tables[0].last_event_forwarded_at.is_none());
+
+        h.record_event_rows("market_trade_event", 3);
+        h.record_event_rows("market_trade_event", 2);
+        // Unknown-to-init tables are recorded too (defensive).
+        h.record_event_rows("craft_event", 1);
+
+        // Counts survive a disconnect → reconnect cycle.
+        h.set_disconnected(SystemTime::now() + Duration::from_secs(1));
+        h.set_connecting();
+
+        let m = &reg.snapshot().mirrors[0];
+        let tables = m.event_tables.as_ref().unwrap();
+        assert_eq!(
+            tables.iter().find(|t| t.table == "market_trade_event").unwrap().events_forwarded,
+            5
+        );
+        assert!(tables
+            .iter()
+            .find(|t| t.table == "market_trade_event")
+            .unwrap()
+            .last_event_forwarded_at
+            .is_some());
+        assert_eq!(tables.iter().find(|t| t.table == "craft_event").unwrap().events_forwarded, 1);
+
+        let json = serde_json::to_value(reg.snapshot()).unwrap();
+        assert!(json["mirrors"][0]["event_tables"].is_array());
     }
 
     #[test]
