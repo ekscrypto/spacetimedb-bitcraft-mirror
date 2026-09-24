@@ -13,7 +13,7 @@ pub use coordinator_client::{CoordinatorClient, CoordinatorPermit};
 pub use observer::{MirrorObserver, MirrorObserverRegistry};
 
 pub use runtime::{run_public_mirror_loop, schema_program_hash, PublicMirrorConfig, SchemaChanged};
-pub use schema::{fetch_and_parse_schema, public_user_table_names, SchemaFetchError};
+pub use schema::{event_table_names, fetch_and_parse_schema, public_user_table_names, SchemaFetchError};
 pub use status::{host_origin, MirrorStatusHandle, MirrorStatusRegistry};
 pub use status::{MirrorConnectivity, MirrorStatusSnapshot, MirrorsResponse, SubscribePhase};
 pub use upstream::{UpstreamConfig, UpstreamError, UpstreamUpdate};

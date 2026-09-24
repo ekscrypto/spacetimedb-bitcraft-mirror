@@ -1,10 +1,16 @@
 //! Debug tool: subscribe to a table on a running public-mirror like a real
-//! downstream v1 client and dump decoded rows as JSON.
+//! downstream client and dump decoded rows as JSON.
 //!
-//! Used to verify captured `*_event` rows end to end (row content, not just
+//! Used to verify forwarded `*_event` rows end to end (row content, not just
 //! counts — `/v1/mirrors` has the counts). The mirror's local schema equals
 //! the upstream schema (tables are created from it), so row types are
 //! resolved from the upstream module def.
+//!
+//! Event tables are v2-only downstream (the mirror republishes them with
+//! their native `is_event` marker, so v1 subscriptions are rejected with the
+//! standard "requires WebSocket v2" error) — pass `--v2` for those. In v2
+//! mode the end-of-window summary reports how many rows arrived as
+//! `EventTable` vs `PersistentTable` frames.
 //!
 //! Usage:
 //! ```text
@@ -13,6 +19,7 @@
 //!   --database bitcraft-live-14 \
 //!   --upstream wss://bitcraft-early-access.spacetimedb.com \
 //!   --table market_trade_event \
+//!   --v2 \
 //!   --seconds 120
 //! ```
 
@@ -68,6 +75,10 @@ struct Args {
     /// Run a one-off SQL query over v2 instead of subscribing, print raw rows.
     #[arg(long)]
     sql: Option<String>,
+
+    /// Subscribe over the v2 protocol (v2.bsatn.spacetimedb) instead of v1.
+    #[arg(long, default_value_t = false)]
+    v2: bool,
 }
 
 fn build_row_types(module_def: &ModuleDef) -> anyhow::Result<HashMap<String, ProductType>> {
@@ -125,6 +136,9 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(sql) = args.sql {
         return one_off_query(&args.url, &args.database, &sql, &row_types).await;
+    }
+    if args.v2 {
+        return subscribe_v2(&args, &row_types).await;
     }
 
     let mut url: Url = args.url.parse()?;
@@ -213,6 +227,142 @@ async fn main() -> anyhow::Result<()> {
 
 fn query_all(table: &str) -> String {
     format!("SELECT * FROM {table}")
+}
+
+/// Subscribe over the v2 protocol: `Subscribe` → `SubscribeApplied`, then
+/// live `TransactionUpdate`s. Event-table rows arrive as ordinary
+/// `PersistentTable` inserts because the mirror publishes them as plain
+/// tables.
+async fn subscribe_v2(args: &Args, row_types: &HashMap<String, ProductType>) -> anyhow::Result<()> {
+    use spacetimedb_client_api_messages::websocket::v2::{
+        ClientMessage as V2Client, ServerMessage as V2Server, Subscribe, TableUpdateRows,
+        TransactionUpdate,
+    };
+
+    let mut request = build_subscribe_request(&args.url, &args.database)?;
+    request.headers_mut().insert(
+        SEC_WEBSOCKET_PROTOCOL,
+        "v2.bsatn.spacetimedb"
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid subprotocol header"))?,
+    );
+    let (mut sock, _) = tokio_tungstenite::connect_async(request).await?;
+
+    // Drain InitialConnection.
+    loop {
+        let msg = next_binary(&mut sock).await?;
+        let server: V2Server = bsatn::from_slice(&msg[1..])?;
+        if matches!(server, V2Server::InitialConnection(_)) {
+            break;
+        }
+    }
+
+    let mut stats = V2RowStats::default();
+    for (i, table) in args.tables.iter().enumerate() {
+        let id = (i as u32) + 1;
+        let frame = bsatn::to_vec(&V2Client::Subscribe(Subscribe {
+            query_strings: vec![query_all(table).into()].into(),
+            request_id: id,
+            query_set_id: QuerySetId::new(id),
+        }))?;
+        sock.send(Message::Binary(frame.into())).await?;
+        loop {
+            let msg = next_binary(&mut sock).await?;
+            let server: V2Server = bsatn::from_slice(&msg[1..])?;
+            match server {
+                V2Server::SubscribeApplied(sap) if sap.query_set_id.id == id => {
+                    let n: usize = sap.rows.tables.iter().map(|t| t.rows.len()).sum();
+                    eprintln!("subscribed(v2) {table} ({n} seed rows)");
+                    break;
+                }
+                V2Server::SubscriptionError(e) => anyhow::bail!("subscribe error: {}", e.error),
+                V2Server::TransactionUpdate(tu) => dump_v2_update(&tu, row_types, &mut stats),
+                _ => {}
+            }
+        }
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(args.seconds);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let msg = match tokio::time::timeout(remaining, next_binary(&mut sock)).await {
+            Ok(Ok(m)) => m,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => break,
+        };
+        let server: V2Server = bsatn::from_slice(&msg[1..])?;
+        if let V2Server::TransactionUpdate(tu) = server {
+            dump_v2_update(&tu, row_types, &mut stats);
+        }
+    }
+    eprintln!(
+        "window ended (rows: persistent_table={} event_table={})",
+        stats.persistent, stats.event
+    );
+    Ok(())
+}
+
+#[derive(Default)]
+struct V2RowStats {
+    persistent: usize,
+    event: usize,
+}
+
+fn dump_v2_update(tu: &spacetimedb_client_api_messages::websocket::v2::TransactionUpdate, row_types: &HashMap<String, ProductType>, stats: &mut V2RowStats) {
+    use spacetimedb_client_api_messages::websocket::v2::TableUpdateRows;
+    for query_set in &tu.query_sets {
+        for t in &query_set.tables {
+            let Some(ty) = row_types.get(&*t.table_name) else { continue };
+            for rows in &t.rows {
+                let list = match rows {
+                    TableUpdateRows::PersistentTable(p) => {
+                        stats.persistent += p.inserts.len();
+                        inserts_of(&p.inserts)
+                    }
+                    TableUpdateRows::EventTable(e) => {
+                        stats.event += e.events.len();
+                        inserts_of(&e.events)
+                    }
+                };
+                for row in list {
+                    let mut bytes: &[u8] = &row;
+                    match ProductValue::decode(ty, &mut bytes) {
+                        Ok(pv) => println!(
+                            "{} {}",
+                            t.table_name,
+                            serde_json::to_string(&pv).unwrap_or_else(|e| format!("<serde error: {e}>"))
+                        ),
+                        Err(e) => println!("{} <decode error: {e}>", t.table_name),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Build a `/v1/database/{db}/subscribe?compression=None` WS request without
+/// subprotocol headers (caller sets the subprotocol).
+fn build_subscribe_request(
+    url: &str,
+    database: &str,
+) -> anyhow::Result<tokio_tungstenite::tungstenite::handshake::client::Request> {
+    let mut url: Url = url.parse()?;
+    match url.scheme() {
+        "ws" | "wss" => {}
+        "http" => url.set_scheme("ws").map_err(|_| anyhow::anyhow!("scheme rewrite"))?,
+        "https" => url.set_scheme("wss").map_err(|_| anyhow::anyhow!("scheme rewrite"))?,
+        other => anyhow::bail!("unsupported scheme {other}"),
+    }
+    let mut path = url.path().trim_end_matches('/').to_string();
+    path.push_str("/v1/database/");
+    path.push_str(database);
+    path.push_str("/subscribe");
+    url.set_path(&path);
+    url.query_pairs_mut().clear().append_pair("compression", "None");
+    Ok(url.as_str().into_client_request()?)
 }
 
 /// One-off SQL over the v2 protocol: `OneOffQuery` → `OneOffQueryResult`.

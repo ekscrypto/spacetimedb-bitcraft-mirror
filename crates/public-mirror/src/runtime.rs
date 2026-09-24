@@ -19,7 +19,7 @@ use url::Url;
 use crate::coordinator_client::CoordinatorClient;
 
 use crate::observer::MirrorObserverRegistry;
-use crate::schema::{fetch_and_parse_schema, public_user_table_names};
+use crate::schema::{event_table_names, fetch_and_parse_schema, public_user_table_names};
 use crate::status::{MirrorConnectivity, MirrorStatusHandle, MirrorStatusRegistry};
 use crate::upstream::{self, UpstreamConfig, UpstreamError, UpstreamUpdate};
 
@@ -176,24 +176,26 @@ fn update_to_mirrored(update: UpstreamUpdate, table_ids: &HashMap<String, TableI
     })
 }
 
-/// Suffix identifying BitCraft event tables. The v9 schema reports them as
-/// plain `User` tables (no event marker reaches the client), so the naming
-/// convention is the only client-visible signal for the subscribe list; the
-/// wire (`TableUpdateRows::EventTable`) is authoritative for forwarding.
-const EVENT_TABLE_SUFFIX: &str = "_event";
-
 /// Split the candidate subscribe set around the event-table forwarding allowlist.
 ///
-/// - `forwarded`: allowlisted `*_event` tables — subscribed, with live event
-///   rows broadcast to downstream subscribers (local tables stay empty).
-/// - `excluded`: other `*_event` tables — dropped from the subscribe set so
+/// `event_tables` is the module def's authoritative event-table set (v10
+/// `is_event`) — never the `_event` suffix, which misclassifies persistent
+/// tables like `player_notification_event`.
+///
+/// - `forwarded`: allowlisted event tables — subscribed, with live event rows
+///   forwarded to downstream v2 subscribers as proper `EventTable` frames.
+/// - `excluded`: other event tables — dropped from the subscribe set so
 ///   their (high-frequency) events never reach this host.
-pub fn partition_event_tables(tables: &[String], allowlist: &[String]) -> (Vec<String>, Vec<String>) {
+pub fn partition_event_tables(
+    tables: &[String],
+    allowlist: &[String],
+    event_tables: &HashSet<String>,
+) -> (Vec<String>, Vec<String>) {
     let allow: HashSet<&str> = allowlist.iter().map(String::as_str).collect();
     let mut captured = Vec::new();
     let mut excluded = Vec::new();
     for table in tables {
-        if table.ends_with(EVENT_TABLE_SUFFIX) {
+        if event_tables.contains(table.as_str()) {
             if allow.contains(table.as_str()) {
                 captured.push(table.clone());
             } else {
@@ -239,14 +241,15 @@ pub async fn run_public_mirror_loop(
     // Event-table forwarding: keep allowlisted event tables in the subscribe
     // set (forwarding their live rows to subscribers), drop the rest from the
     // wire entirely.
-    let (forwarded_events, excluded_events) = partition_event_tables(&tables, &config.event_tables);
+    let module_event_tables = event_table_names(&module_def);
+    let (forwarded_events, excluded_events) = partition_event_tables(&tables, &config.event_tables, &module_event_tables);
     let forwarded_set: HashSet<&str> = forwarded_events.iter().map(String::as_str).collect();
     // State tables keep their order; forwarded event tables subscribe last —
     // their seeds are always-empty and instant, so they never hold the
     // subscribe gate behind a state seed.
     let mut tables: Vec<String> = tables
         .into_iter()
-        .filter(|t| !t.ends_with(EVENT_TABLE_SUFFIX))
+        .filter(|t| !module_event_tables.contains(t.as_str()))
         .collect();
     tables.extend(forwarded_events.iter().cloned());
     if !excluded_events.is_empty() {
@@ -291,16 +294,14 @@ pub async fn run_public_mirror_loop(
 
     let stdb = module_host.relational_db().clone();
     let table_ids = resolve_table_ids(&stdb, &tables)?;
-    // Reconnect cold-reset flushes STATE tables only: forwarded event tables
-    // hold no rows (purged after every broadcast) and no upstream seed could
-    // rebuild them anyway.
+    // Reconnect cold-reset flushes STATE tables only: event tables never
+    // hold committed rows (wire-only) and no upstream seed could rebuild
+    // them anyway.
     let flush_table_ids: Vec<TableId> = tables
         .iter()
         .filter(|t| !forwarded_set.contains(t.as_str()))
         .filter_map(|t| table_ids.get(t).copied())
         .collect();
-    let event_table_ids: Arc<HashSet<TableId>> =
-        Arc::new(forwarded_events.iter().filter_map(|t| table_ids.get(t).copied()).collect());
     let event_allowlist: Arc<HashSet<String>> = Arc::new(config.event_tables.iter().cloned().collect());
     let module_for_reset = module_host.clone();
 
@@ -341,7 +342,6 @@ pub async fn run_public_mirror_loop(
         let on_update = {
             let module_host = module_host.clone();
             let table_ids = table_ids.clone();
-            let event_table_ids = Arc::clone(&event_table_ids);
             let database = config.database.clone();
             let observers = observers.clone();
             Arc::new(
@@ -350,7 +350,6 @@ pub async fn run_public_mirror_loop(
                       -> BoxFuture<'static, Result<(), anyhow::Error>> {
                     let module_host = module_host.clone();
                     let table_ids = table_ids.clone();
-                    let event_table_ids = event_table_ids.clone();
                     let database = database.clone();
                     let observers = observers.clone();
                     async move {
@@ -376,7 +375,7 @@ pub async fn run_public_mirror_loop(
                             last_apply_unix_ms: p.last_apply_unix_ms,
                         });
                         module_host
-                            .apply_mirrored_updates(batch, progress, event_table_ids)
+                            .apply_mirrored_updates(batch, progress)
                             .await
                             .map_err(|e| anyhow::anyhow!(e))?;
                         Ok(())
@@ -515,6 +514,7 @@ pub fn schema_program_hash(schema_bytes: &[u8]) -> spacetimedb_lib::Hash {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::time::Duration;
 
     use super::{should_refetch_schema, partition_event_tables, SchemaChanged};
@@ -522,7 +522,7 @@ mod tests {
     use spacetimedb_lib::Hash;
 
     #[test]
-    fn event_tables_partition_into_captured_and_excluded() {
+    fn event_tables_partition_into_forwarded_and_excluded() {
         let tables: Vec<String> = [
             "player_state",
             "market_trade_event",
@@ -538,16 +538,37 @@ mod tests {
             .into_iter()
             .map(String::from)
             .collect();
+        let event_tables: HashSet<String> = ["market_trade_event", "player_move_event", "claim_treasury_event", "enemy_move_event"]
+            .into_iter()
+            .map(String::from)
+            .collect();
 
-        let (captured, excluded) = partition_event_tables(&tables, &allowlist);
+        let (captured, excluded) = partition_event_tables(&tables, &allowlist, &event_tables);
         assert_eq!(captured, vec!["market_trade_event".to_string(), "claim_treasury_event".to_string()]);
         assert_eq!(excluded, vec!["player_move_event".to_string(), "enemy_move_event".to_string()]);
     }
 
     #[test]
+    fn event_partition_uses_schema_truth_not_suffix() {
+        // `player_notification_event` is a persistent table despite the
+        // suffix: not in the event set → stays in the subscribe list.
+        let tables: Vec<String> = ["player_state", "player_notification_event", "craft_event"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let allowlist: Vec<String> = ["craft_event"].into_iter().map(String::from).collect();
+        let event_tables: HashSet<String> = ["craft_event"].into_iter().map(String::from).collect();
+
+        let (captured, excluded) = partition_event_tables(&tables, &allowlist, &event_tables);
+        assert_eq!(captured, vec!["craft_event".to_string()]);
+        assert!(excluded.is_empty());
+    }
+
+    #[test]
     fn event_partition_empty_allowlist_excludes_all_events() {
         let tables: Vec<String> = ["player_state", "craft_event"].into_iter().map(String::from).collect();
-        let (captured, excluded) = partition_event_tables(&tables, &[]);
+        let event_tables: HashSet<String> = ["craft_event"].into_iter().map(String::from).collect();
+        let (captured, excluded) = partition_event_tables(&tables, &[], &event_tables);
         assert!(captured.is_empty());
         assert_eq!(excluded, vec!["craft_event".to_string()]);
     }
@@ -556,7 +577,8 @@ mod tests {
     fn event_partition_ignores_allowlist_entries_absent_from_tables() {
         let tables: Vec<String> = ["player_state"].into_iter().map(String::from).collect();
         let allowlist: Vec<String> = ["ghost_event"].into_iter().map(String::from).collect();
-        let (captured, excluded) = partition_event_tables(&tables, &allowlist);
+        let event_tables: HashSet<String> = HashSet::new();
+        let (captured, excluded) = partition_event_tables(&tables, &allowlist, &event_tables);
         assert!(captured.is_empty());
         assert!(excluded.is_empty());
     }

@@ -161,10 +161,12 @@ pub fn cli() -> clap::Command {
                 .long("mirror-event-tables")
                 .help(
                     "Comma-separated allowlist of *_event tables to forward live (repeatable; applies to \
-                     every --mirror). Event rows are broadcast to downstream subscribers but never \
-                     accumulated locally (the local tables stay empty) — there is no snapshot and no \
-                     catch-up, so consumers must persist on arrival. Non-allowlisted event tables are \
-                     excluded from the upstream subscribe entirely. Pass `none` to disable forwarding.",
+                     every --mirror). Event rows are forwarded to downstream v2 subscribers as proper \
+                     EventTable frames (inserts-only, wire-only — nothing accumulates locally). Event \
+                     tables are v2-only downstream: v1 subscriptions to them are rejected, matching the \
+                     upstream game server. There is no snapshot and no catch-up, so consumers must \
+                     persist on arrival. Non-allowlisted event tables are excluded from the upstream \
+                     subscribe entirely. Pass `none` to disable forwarding.",
                 )
                 .requires("public_mirror_v1")
                 .action(clap::ArgAction::Append)
