@@ -38,6 +38,8 @@ use crate::decode::{
 /// Session re-registration window. Bit-Me polls at ~1 Hz; anything quieter
 /// than this is treated as a closed session and its targets are dropped.
 const SESSION_TTL: Duration = Duration::from_secs(15 * 60);
+/// Cadence of the poll-driven TTL sweep for sessions and tracked targets.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// Hard cap on concurrent sessions (abuse backstop; each is ~50 bytes).
 const MAX_SESSIONS: usize = 8192;
 /// Hard cap on tracked action targets fleet-wide.
@@ -356,6 +358,9 @@ pub struct BitmeHub {
     sessions: Mutex<HashMap<u64, SessionEntry>>,
     targets: Mutex<HashMap<u64, TargetHealth>>,
     spawns: Mutex<HashMap<u32, Vec<SpawnEntry>>>,
+    /// Last TTL sweep, so poll-driven cleanup runs at SWEEP_INTERVAL
+    /// cadence rather than on every GET.
+    last_sweep: Mutex<Option<Instant>>,
 }
 
 impl BitmeHub {
@@ -365,6 +370,7 @@ impl BitmeHub {
             sessions: Mutex::new(HashMap::new()),
             targets: Mutex::new(HashMap::new()),
             spawns: Mutex::new(HashMap::new()),
+            last_sweep: Mutex::new(None),
         })
     }
 
@@ -376,8 +382,12 @@ impl BitmeHub {
 
     /// Register/refresh a session (the GET itself is the registration).
     pub fn touch_session(&self, player_entity_id: u64) {
+        self.touch_session_at(player_entity_id, Instant::now());
+    }
+
+    fn touch_session_at(&self, player_entity_id: u64, now: Instant) {
         let mut sessions = self.sessions.lock();
-        let now = Instant::now();
+        self.sweep_if_due(&mut sessions, now);
         if sessions.len() >= MAX_SESSIONS && !sessions.contains_key(&player_entity_id) {
             self.sweep_sessions(&mut sessions, now);
         }
@@ -390,6 +400,27 @@ impl BitmeHub {
         sessions.insert(player_entity_id, SessionEntry { last_seen: now });
     }
 
+    /// Drive the TTL sweep from session polls at SWEEP_INTERVAL cadence.
+    /// The capacity trigger in `touch_session_at` is an abuse backstop that
+    /// never fires under normal load; without a cadence the tracked-target
+    /// map only ever grows until `note_targets` starts refusing entries.
+    fn sweep_if_due(&self, sessions: &mut HashMap<u64, SessionEntry>, now: Instant) {
+        let due = {
+            let mut last = self.last_sweep.lock();
+            let due = match *last {
+                Some(t) => now.duration_since(t) >= SWEEP_INTERVAL,
+                None => true,
+            };
+            if due {
+                *last = Some(now);
+            }
+            due
+        };
+        if due {
+            self.sweep_sessions(sessions, now);
+        }
+    }
+
     fn sweep_sessions(&self, sessions: &mut HashMap<u64, SessionEntry>, now: Instant) {
         let before = sessions.len();
         sessions.retain(|_, s| now.duration_since(s.last_seen) < SESSION_TTL);
@@ -398,21 +429,29 @@ impl BitmeHub {
         }
         // Opportunistic target GC alongside its sessions.
         let mut targets = self.targets.lock();
-        targets.retain(|_, t| now.duration_since(t.last_update) < TARGET_TTL);
+        retain_fresh_targets(&mut targets, now);
     }
 
     /// Track a session's action targets so `resource_health_state` updates
     /// for them are retained. Called by the session handler (each poll) and
     /// whenever a target is (re)observed.
     pub fn note_targets<I: IntoIterator<Item = u64>>(&self, targets: I) {
+        self.note_targets_at(targets, Instant::now());
+    }
+
+    fn note_targets_at<I: IntoIterator<Item = u64>>(&self, targets: I, now: Instant) {
         let mut map = self.targets.lock();
-        let now = Instant::now();
         for t in targets {
             if t == 0 {
                 continue;
             }
             if map.len() >= MAX_TARGETS && !map.contains_key(&t) {
-                return; // abuse backstop; existing targets keep their slots
+                // Full: drop TTL-expired entries before refusing — the cap
+                // guards against a map full of *fresh* targets.
+                retain_fresh_targets(&mut map, now);
+                if map.len() >= MAX_TARGETS {
+                    return; // abuse backstop; existing targets keep their slots
+                }
             }
             map.entry(t).or_insert_with(|| TargetHealth {
                 health: None,
@@ -583,6 +622,15 @@ impl BitmeHub {
     }
 }
 
+/// Drop targets whose last feed activity predates TARGET_TTL. Shared by the
+/// periodic sweep and the at-capacity path in `note_targets_at`; callers
+/// hold the targets lock. Returns the number of entries dropped.
+fn retain_fresh_targets(map: &mut HashMap<u64, TargetHealth>, now: Instant) -> usize {
+    let before = map.len();
+    map.retain(|_, t| now.duration_since(t.last_update) < TARGET_TTL);
+    before - map.len()
+}
+
 fn decode_resource(
     meta: &BitmeRegionMeta,
     schema: &MirroredSchema,
@@ -636,6 +684,57 @@ mod tests {
         // note_targets is idempotent.
         hub.note_targets([10]);
         assert_eq!(hub.targets.lock().len(), 2);
+    }
+
+    #[test]
+    fn full_target_map_of_fresh_entries_refuses_new_ones() {
+        let hub = BitmeHub::new();
+        let now = Instant::now();
+        {
+            let mut map = hub.targets.lock();
+            for i in 1..=(MAX_TARGETS as u64) {
+                map.insert(i, TargetHealth { health: Some(1), last_update: now });
+            }
+        }
+        hub.note_targets_at([u64::MAX], now);
+        assert!(!hub.targets.lock().contains_key(&u64::MAX));
+        assert_eq!(hub.targets.lock().len(), MAX_TARGETS);
+    }
+
+    #[test]
+    fn full_target_map_of_stale_entries_makes_room() {
+        let hub = BitmeHub::new();
+        let now = Instant::now();
+        {
+            let mut map = hub.targets.lock();
+            for i in 1..=(MAX_TARGETS as u64) {
+                map.insert(i, TargetHealth { health: Some(1), last_update: now });
+            }
+        }
+        // A full map must still admit a new target once the existing
+        // entries age past TARGET_TTL.
+        hub.note_targets_at([u64::MAX], now + TARGET_TTL + Duration::from_secs(1));
+        assert!(hub.targets.lock().contains_key(&u64::MAX));
+        assert!(hub.targets.lock().len() <= MAX_TARGETS);
+    }
+
+    #[test]
+    fn touch_session_sweeps_expired_state_on_interval() {
+        let hub = BitmeHub::new();
+        let t0 = Instant::now();
+        hub.touch_session_at(1, t0);
+        hub.note_targets_at([10], t0);
+        // Within the sweep interval nothing is dropped.
+        hub.touch_session_at(2, t0 + SWEEP_INTERVAL - Duration::from_secs(1));
+        assert_eq!(hub.sessions.lock().len(), 2);
+        assert_eq!(hub.targets.lock().len(), 1);
+        // Past both TTLs the next poll sweeps sessions and targets alike.
+        hub.touch_session_at(3, t0 + TARGET_TTL + Duration::from_secs(1));
+        let sessions = hub.sessions.lock();
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions.contains_key(&3));
+        drop(sessions);
+        assert!(hub.targets.lock().is_empty());
     }
 
     #[test]
