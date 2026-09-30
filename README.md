@@ -193,6 +193,10 @@ them in the commitlog/subscription path only — so nothing accumulates, and
 content-duplicate events are delivered rather than elided by table set
 semantics), and v1 subscriptions to event tables are rejected exactly as
 they are on the game server. State tables keep serving on all subprotocols.
+(Known gap: the legacy **v1.json** subscription path is not covered by that
+guard — a v1.json subscribe to an event table is accepted and yields an
+empty snapshot plus insert-only `TransactionUpdate`s. Event rows still
+never enter committed state; treat v1.json + event tables as unsupported.)
 Event-table identification is schema truth, not the `_event` suffix —
 persistent tables suffixed `_event` (e.g. `player_notification_event`)
 mirror as ordinary state tables. Consumers persist on arrival (bitcraftsync
