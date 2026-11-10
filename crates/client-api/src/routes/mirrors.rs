@@ -155,6 +155,7 @@ mod tests {
             current_table_seed_rows: None,
             current_table_seed_rows_applied: None,
             last_seed_apply_at: None,
+            event_tables: None,
         }
     }
 

@@ -389,8 +389,19 @@ fn feed_rejects_non_regional_database_names() {
     let manager = FeedManager::new(interest);
     assert!(
         manager.register_region("something-else", SCHEMA_JSON).is_err(),
-        "only bitcraft-live-<N> / bitcraft-live-global are valid"
+        "only idc-<N> (or legacy bitcraft-live-<N>) / *-global are valid"
     );
+}
+
+#[tokio::test]
+async fn feed_accepts_release_fleet_database_names() {
+    let interest = InterestHub::new();
+    let manager = FeedManager::new(interest);
+    let handle = manager
+        .register_region("idc-8", SCHEMA_JSON)
+        .expect("register")
+        .expect("regional database yields a handle");
+    assert_eq!(handle.region, 8);
 }
 
 #[tokio::test]

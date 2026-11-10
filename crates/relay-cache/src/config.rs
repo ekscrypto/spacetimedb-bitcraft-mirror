@@ -30,7 +30,7 @@ pub struct Args {
     pub unit_dir: PathBuf,
 
     /// Public-mirror readiness URL (`GET /v1/mirrors`). When set, each
-    /// regional `bitcraft-live-N` row is subscribed via public-mirror
+    /// regional `idc-N` row is subscribed via public-mirror
     /// instead of the matching `relay-bcN` unit. Unset = relay-fleet only.
     #[arg(long, env = "RELAY_CACHE_MIRRORS_URL", default_value = "")]
     pub mirrors_url: String,
@@ -51,7 +51,7 @@ pub struct Args {
 
     /// Database name on the schema host. Defaults to the production
     /// mirror; override for staging.
-    #[arg(long, env = "RELAY_CACHE_SCHEMA_DB", default_value = "relay-mirror-bc14")]
+    #[arg(long, env = "RELAY_CACHE_SCHEMA_DB", default_value = "idc-14")]
     pub schema_db: String,
 
     /// Soft memory ceiling in bytes. On approach: log at `warn`, flip the

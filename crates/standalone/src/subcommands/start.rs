@@ -1034,7 +1034,7 @@ async fn bootstrap_public_mirror(
                 mirror_database,
                 cache.feed.clone() as Arc<dyn spacetimedb_public_mirror_client::observer::MirrorObserver>,
             ),
-            Ok(None) if mirror_database == "bitcraft-live-global" && cache.roads.is_some() => {
+            Ok(None) if mirror_database.ends_with("-global") && cache.roads.is_some() => {
                 cache.registry.register(
                     mirror_database,
                     cache.feed.clone() as Arc<dyn spacetimedb_public_mirror_client::observer::MirrorObserver>,
@@ -1296,6 +1296,16 @@ mod tests {
         let spec = parse_mirror_spec("wss://ea.example/bitcraft-live-global").unwrap();
         assert_eq!(spec.database, "bitcraft-live-global");
         assert_eq!(spec.upstream.as_str(), "wss://ea.example/");
+    }
+
+    #[test]
+    fn parse_mirror_spec_happy_path_release_fleet() {
+        let spec = parse_mirror_spec("wss://release.example/idc-global").unwrap();
+        assert_eq!(spec.database, "idc-global");
+        assert_eq!(spec.upstream.as_str(), "wss://release.example/");
+        let region = parse_mirror_spec("wss://release.example/idc-10").unwrap();
+        assert_eq!(region.database, "idc-10");
+        assert_eq!(region.upstream.as_str(), "wss://release.example/");
     }
 
     #[test]

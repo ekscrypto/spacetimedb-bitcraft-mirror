@@ -19,7 +19,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use legacy_units::{discover, NamingSpec};
-use naming::{public_port_for_database, source_name_for_database};
+use naming::{public_port_for_database, source_name_for_database, REGION_DB_PREFIXES};
 use reqwest::Client;
 use serde_json::Value;
 use url::Url;
@@ -158,7 +158,7 @@ async fn discover_from_mirrors_one(mirrors_url: &str, mirror_ws_host: Option<&st
     let mut out = Vec::new();
     for m in arr {
         let database = m.get("database").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        if database.is_empty() || database == "bitcraft-live-global" {
+        if database.is_empty() || database.ends_with("-global") {
             continue;
         }
         let name = source_name_for_database(&database);
@@ -187,9 +187,11 @@ async fn discover_from_mirrors_one(mirrors_url: &str, mirror_ws_host: Option<&st
     Ok(out)
 }
 
-/// `"bitcraft-live-14"` → `Some(14)`.
+/// `"idc-14"` / `"bitcraft-live-14"` → `Some(14)`.
 fn parse_region_number(name: &str) -> Option<u32> {
-    name.strip_prefix("bitcraft-live-")?.parse().ok()
+    REGION_DB_PREFIXES
+        .iter()
+        .find_map(|p| name.strip_prefix(p)?.parse().ok())
 }
 
 #[cfg(test)]
@@ -199,9 +201,12 @@ mod tests {
 
     #[test]
     fn parse_region_from_source_name() {
+        assert_eq!(parse_region_number("idc-14"), Some(14));
+        assert_eq!(parse_region_number("idc-10"), Some(10));
         assert_eq!(parse_region_number("bitcraft-live-14"), Some(14));
         assert_eq!(parse_region_number("bitcraft-live-3"), Some(3));
         assert_eq!(parse_region_number("global"), None);
+        assert_eq!(parse_region_number("idc-global"), None);
     }
 
     #[tokio::test]

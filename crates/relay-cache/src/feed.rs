@@ -29,8 +29,25 @@ use crate::store::RegionStore;
 
 const FEED_CHANNEL_CAPACITY: usize = 64;
 
-const DATABASE_PREFIX: &str = "bitcraft-live-";
-const DATABASE_GLOBAL: &str = "bitcraft-live-global";
+const DATABASE_PREFIX: &str = "idc-";
+const DATABASE_GLOBAL: &str = "idc-global";
+/// EA2-era names. Still accepted so the post-migration binary can run the
+/// pre-cutover unit file unchanged (that rollback path restores only the
+/// unit file, not the binary).
+const LEGACY_DATABASE_PREFIX: &str = "bitcraft-live-";
+const LEGACY_DATABASE_GLOBAL: &str = "bitcraft-live-global";
+
+fn is_global_database(database: &str) -> bool {
+    database == DATABASE_GLOBAL || database == LEGACY_DATABASE_GLOBAL
+}
+
+/// Region id parsed from a mirrored database name (`idc-14`, `bitcraft-live-14`).
+fn region_number_from_database(database: &str) -> Option<u32> {
+    database
+        .strip_prefix(DATABASE_PREFIX)
+        .or_else(|| database.strip_prefix(LEGACY_DATABASE_PREFIX))
+        .and_then(|suffix| suffix.parse().ok())
+}
 
 enum FeedMsg {
     Updates {
@@ -129,14 +146,13 @@ impl FeedManager {
     }
 
     pub fn register_region(&self, database: &str, schema_json: &[u8]) -> Result<Option<Arc<ShardHandle>>> {
-        if database == DATABASE_GLOBAL {
+        if is_global_database(database) {
             self.register_global(database, schema_json)?;
             return Ok(None);
         }
-        let region: u32 = database
-            .strip_prefix(DATABASE_PREFIX)
-            .and_then(|suffix| suffix.parse().ok())
-            .with_context(|| format!("`{database}` is not `{DATABASE_PREFIX}<N>` or {DATABASE_GLOBAL}"))?;
+        let region: u32 = region_number_from_database(database).with_context(|| {
+            format!("`{database}` is not `{DATABASE_PREFIX}<N>` (or legacy `{LEGACY_DATABASE_PREFIX}<N>`)")
+        })?;
 
         let schema = Arc::new(
             parse_schema(schema_json).with_context(|| format!("parse schema for embedded feed `{database}`"))?,
@@ -253,7 +269,7 @@ impl FeedManager {
 
 impl MirrorObserver for FeedManager {
     fn on_updates(&self, database: Arc<str>, generation: u64, updates: Vec<UpstreamUpdate>) -> ObserverFuture {
-        if database.as_ref() == DATABASE_GLOBAL {
+        if is_global_database(database.as_ref()) {
             if let Some(tx) = self.global_sender() {
                 return async move {
                     tx.send(GlobalFeedMsg::Updates { generation, updates })
@@ -278,7 +294,7 @@ impl MirrorObserver for FeedManager {
     }
 
     fn on_live(&self, database: Arc<str>, generation: u64) -> ObserverFuture {
-        if database.as_ref() == DATABASE_GLOBAL {
+        if is_global_database(database.as_ref()) {
             if let Some(tx) = self.global_sender() {
                 return async move {
                     tx.send(GlobalFeedMsg::Live { generation })
@@ -303,7 +319,7 @@ impl MirrorObserver for FeedManager {
     }
 
     fn on_reset(&self, database: Arc<str>, generation: u64) -> ObserverFuture {
-        if database.as_ref() == DATABASE_GLOBAL {
+        if is_global_database(database.as_ref()) {
             if let Some(tx) = self.global_sender() {
                 return async move {
                     tx.send(GlobalFeedMsg::Reset { generation })

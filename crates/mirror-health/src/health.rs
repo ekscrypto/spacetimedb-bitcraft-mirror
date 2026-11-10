@@ -416,19 +416,23 @@ fn now_unix() -> u64 {
 }
 
 pub fn public_port_for_database(database: &str) -> u16 {
-    if database == "bitcraft-live-global" || database.ends_with("-global") {
+    if database.ends_with("-global") {
         return 3000;
     }
-    if let Some(n) = database.strip_prefix("bitcraft-live-")
-        && let Ok(id) = n.parse::<u16>()
-    {
-        return 3000 + id;
+    // `idc-N` (1.0 release fleet) or `bitcraft-live-N` (EA2, rollback path).
+    for prefix in ["idc-", "bitcraft-live-"] {
+        if let Some(id) = database
+            .strip_prefix(prefix)
+            .and_then(|n| n.parse::<u16>().ok())
+        {
+            return 3000 + id;
+        }
     }
     3000
 }
 
 pub fn source_name_for_database(database: &str) -> String {
-    if database == "bitcraft-live-global" {
+    if database.ends_with("-global") {
         "global".to_string()
     } else {
         database.to_string()
@@ -451,8 +455,13 @@ mod tests {
 
     #[test]
     fn public_port_and_source_name_from_database() {
+        assert_eq!(public_port_for_database("idc-global"), 3000);
+        assert_eq!(public_port_for_database("idc-14"), 3014);
+        assert_eq!(public_port_for_database("idc-10"), 3010);
         assert_eq!(public_port_for_database("bitcraft-live-global"), 3000);
         assert_eq!(public_port_for_database("bitcraft-live-14"), 3014);
+        assert_eq!(source_name_for_database("idc-global"), "global");
+        assert_eq!(source_name_for_database("idc-14"), "idc-14");
         assert_eq!(source_name_for_database("bitcraft-live-global"), "global");
         assert_eq!(source_name_for_database("bitcraft-live-14"), "bitcraft-live-14");
     }
