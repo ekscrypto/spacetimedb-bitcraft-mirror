@@ -6,7 +6,8 @@
 //! We do not depend on `spacetimedb-lib`'s `RawModuleDefV9` for this
 //! because those types only implement SATS serialization, not plain
 //! `serde::Deserialize`, so the JSON returned by
-//! `/v1/database/{name}/schema?version=9` cannot be deserialised into
+//! `/v1/database/{name}/schema` (flat at `?version=9`, sectioned
+//! `RawModuleDefV10` at `?version=10`) cannot be deserialised into
 //! them with `serde_json` alone. The `MirroredSchema` types here are a
 //! deliberate subset that captures everything we need for:
 //!   - generating Postgres DDL,
@@ -94,26 +95,56 @@ pub enum SchemaParseError {
     Shape { path: String, msg: String },
 }
 
-/// Parse the SATS-JSON `/schema?version=9` response into a `MirroredSchema`.
+/// Parse the SATS-JSON `/schema?version=9` (flat) or `?version=10`
+/// (sectioned `RawModuleDefV10`) response into a `MirroredSchema`.
+///
+/// The mirror bootstrap fetches v10 (it needs `is_event`, which v9 drops)
+/// and hands the same raw bytes to the embedded relay-cache; both envelope
+/// shapes must therefore parse here. The type encoding inside the v10
+/// `Typespace` section is identical to the flat `typespace.types` array —
+/// only the wrapper differs, and v10 table defs carry their name under
+/// `source_name` instead of `name`.
 pub fn parse_schema(bytes: &[u8]) -> Result<MirroredSchema, SchemaParseError> {
     let root: Value = serde_json::from_slice(bytes)?;
-    let typespace_types = root
-        .get("typespace")
-        .and_then(|t| t.get("types"))
-        .and_then(Value::as_array)
-        .ok_or_else(|| shape("typespace.types", "missing or not array"))?;
+
+    let (typespace_types, tables_arr, tables_path) = if let Some(sections) =
+        root.get("sections").and_then(Value::as_array)
+    {
+        // v10 sectioned envelope: sections = [{Typespace: {types: [...]}},
+        // {Tables: [...]}, ...]. Unwrap the two sections we consume.
+        let typespace_types = sections
+            .iter()
+            .find_map(|s| s.get("Typespace"))
+            .and_then(|t| t.get("types"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| shape("sections[Typespace].types", "missing or not array"))?;
+        let tables_arr = sections
+            .iter()
+            .find_map(|s| s.get("Tables"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| shape("sections[Tables]", "missing or not array"))?;
+        (typespace_types, tables_arr, "sections[Tables]")
+    } else {
+        let typespace_types = root
+            .get("typespace")
+            .and_then(|t| t.get("types"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| shape("typespace.types", "missing or not array"))?;
+        let tables_arr = root
+            .get("tables")
+            .and_then(Value::as_array)
+            .ok_or_else(|| shape("tables", "missing or not array"))?;
+        (typespace_types, tables_arr, "tables")
+    };
+
     let mut typespace = Vec::with_capacity(typespace_types.len());
     for (i, t) in typespace_types.iter().enumerate() {
         typespace.push(parse_type(t, &format!("typespace.types[{i}]"))?);
     }
 
-    let tables_arr = root
-        .get("tables")
-        .and_then(Value::as_array)
-        .ok_or_else(|| shape("tables", "missing or not array"))?;
     let mut tables = Vec::with_capacity(tables_arr.len());
     for (i, t) in tables_arr.iter().enumerate() {
-        tables.push(parse_table(t, &format!("tables[{i}]"))?);
+        tables.push(parse_table(t, &format!("{tables_path}[{i}]"))?);
     }
 
     Ok(MirroredSchema { typespace, tables })
@@ -127,10 +158,12 @@ fn shape(path: impl Into<String>, msg: impl Into<String>) -> SchemaParseError {
 }
 
 fn parse_table(v: &Value, path: &str) -> Result<MirroredTable, SchemaParseError> {
+    // v10 table defs name themselves `source_name`; flat v9 uses `name`.
     let name = v
-        .get("name")
+        .get("source_name")
+        .or_else(|| v.get("name"))
         .and_then(Value::as_str)
-        .ok_or_else(|| shape(format!("{path}.name"), "expected string"))?
+        .ok_or_else(|| shape(format!("{path}.source_name"), "expected string"))?
         .to_string();
     let product_type_ref = v
         .get("product_type_ref")
@@ -362,4 +395,84 @@ fn sha256_simple(data: &[u8]) -> [u8; 32] {
         }
     }
     state
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal flat (v9) schema: one table, product of U64 + String.
+    const FLAT: &str = r#"{
+        "typespace": {"types": [
+            {"Product": {"elements": [
+                {"name": {"some": "entity_id"}, "algebraic_type": {"U64": []}},
+                {"name": {"some": "name"},     "algebraic_type": {"Ref": 1}}
+            ]}},
+            {"String": []}
+        ]},
+        "tables": [
+            {"name": "player_state", "product_type_ref": 0, "primary_key": [0],
+             "table_access": {"Public": []}, "table_type": {"User": []}}
+        ]
+    }"#;
+
+    /// The same schema as the sectioned (v10 `RawModuleDefV10`) envelope
+    /// the game server serves at `?version=10`: types under
+    /// `sections[Typespace].types`, table defs under `sections[Tables]`
+    /// with `source_name` instead of `name`.
+    const SECTIONED: &str = r#"{
+        "sections": [
+            {"Typespace": {"types": [
+                {"Product": {"elements": [
+                    {"name": {"some": "entity_id"}, "algebraic_type": {"U64": []}},
+                    {"name": {"some": "name"},     "algebraic_type": {"Ref": 1}}
+                ]}},
+                {"String": []}
+            ]}},
+            {"Tables": [
+                {"source_name": "player_state", "product_type_ref": 0,
+                 "primary_key": [0], "is_event": false,
+                 "table_access": {"Public": []}, "table_type": {"User": []}}
+            ]}
+        ]
+    }"#;
+
+    fn assert_player(schema: &MirroredSchema) {
+        assert_eq!(schema.tables.len(), 1);
+        assert_eq!(schema.tables[0].name, "player_state");
+        assert_eq!(schema.tables[0].product_type_ref, 0);
+        assert_eq!(schema.tables[0].primary_key, vec![0]);
+        assert_eq!(schema.tables[0].access, TableAccess::Public);
+        assert_eq!(schema.tables[0].kind, TableKind::User);
+        let fields = schema.table_product(&schema.tables[0]).expect("product");
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[1].name.as_deref(), Some("name"));
+        assert!(matches!(schema.resolve(&fields[1].ty), MirroredType::String));
+    }
+
+    #[test]
+    fn parses_flat_v9() {
+        assert_player(&parse_schema(FLAT.as_bytes()).expect("flat parses"));
+    }
+
+    #[test]
+    fn parses_sectioned_v10() {
+        assert_player(&parse_schema(SECTIONED.as_bytes()).expect("sectioned parses"));
+    }
+
+    #[test]
+    fn both_envelopes_agree() {
+        let flat = parse_schema(FLAT.as_bytes()).unwrap();
+        let sectioned = parse_schema(SECTIONED.as_bytes()).unwrap();
+        assert_eq!(
+            serde_json::to_string(&flat).unwrap(),
+            serde_json::to_string(&sectioned).unwrap()
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_shape() {
+        let err = parse_schema(br#"{"nope": 1}"#).unwrap_err();
+        assert!(err.to_string().contains("unexpected shape"), "{err}");
+    }
 }
