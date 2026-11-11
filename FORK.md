@@ -41,8 +41,9 @@ relay-bitcraftsync-app/
 └── spacetimedb-public-mirror/  # this fork (experimental)
 ```
 
-Live validation target: BitCraft EA2 region 1 (`bitcraft-live-1`), which the
-current fleet does not mirror.
+Live validation target: BitCraft 1.0 region 7 (`idc-7`) on
+`bitcraft-release.spacetimedb.com` — an unpopulated region that production
+does not mirror.
 
 ## Quick start (mirror mode)
 
@@ -55,13 +56,13 @@ cargo build -p spacetimedb-standalone --release
 # on a single --listen-addr (clients select by database name).
 ./target/release/spacetimedb-standalone start \
   --data-dir /tmp/public-mirror-data \
-  --listen-addr 127.0.0.1:3001 \
+  --listen-addr 127.0.0.1:3000 \
   --jwt-pub-key-path /path/to/id_ecdsa.pub \
   --jwt-priv-key-path /path/to/id_ecdsa \
   --public-mirror-v1 \
   --mirror-token-file /path/to/.developer-token \
-  --mirror wss://bitcraft-early-access.spacetimedb.com/bitcraft-live-global \
-  --mirror wss://bitcraft-early-access.spacetimedb.com/bitcraft-live-1 \
+  --mirror wss://bitcraft-release.spacetimedb.com/idc-global \
+  --mirror wss://bitcraft-release.spacetimedb.com/idc-7 \
   --mirror-table player_username_state \
   --mirror-table player_state
 ```
@@ -75,8 +76,8 @@ or `MIRROR_TOKEN_FILE`. Use
 `--mirror-table` to limit the upstream subscribe set (default: all public user
 tables). Each mirrored database runs on its own JobCores thread.
 
-Clients connect to the local mirror by database name (`bitcraft-live-1`,
-`bitcraft-live-global`, …) on the listen address, speaking `v1.bsatn.spacetimedb`.
+Clients connect to the local mirror by database name (`idc-7`,
+`idc-global`, …) on the listen address, speaking `v1.bsatn.spacetimedb`.
 
 Client WebSocket upgrades are gated **per database**: a database accepts
 connections once *its own* mirror is `live`, and is rejected with 503 only
@@ -122,8 +123,8 @@ table sync progress, transaction counts, and reconnect ETA are exposed at
 `GET /v1/mirrors` (JSON, unauthenticated — same posture as `/v1/metrics`).
 
 In `--public-mirror-v1` mode an **isolated sidecar listener** also serves the
-same JSON at `127.0.0.1:<main-port+1>/v1/mirrors` (e.g. main `:3000` → status
-`:3001`, trial main `:3030` → status `:3031`). Poll the sidecar for readiness
+same JSON at `127.0.0.1:<main-port+30>/v1/mirrors` (e.g. main `:3000` → status
+`:3030`, production main `:3100` → status `:3130`). Poll the sidecar for readiness
 during large-table seed — the main HTTP port may not respond until seed apply
 finishes. Override with `--mirror-status-listen-addr`.
 While `subscribing`, the response also includes the current table name/phase,
@@ -161,10 +162,10 @@ design:
 
 ```sh
 cargo run -p spacetimedb-public-mirror-client --bin mirror-harness -- \
-  --upstream wss://bitcraft-early-access.spacetimedb.com \
-  --database bitcraft-live-1 \
+  --upstream wss://bitcraft-release.spacetimedb.com \
+  --database idc-7 \
   --token "$MIRROR_TOKEN" \
-  --mirror-url ws://127.0.0.1:3001 \
+  --mirror-url ws://127.0.0.1:3000 \
   --table player_username_state \
   --seconds 30
 ```

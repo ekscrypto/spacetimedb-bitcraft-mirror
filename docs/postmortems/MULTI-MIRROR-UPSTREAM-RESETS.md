@@ -1,4 +1,6 @@
-# Upstream connection resets in one-process multi-mirror mode (root cause found in #5: unit `MemoryHigh=32G` memcg throttle — local, ours, fixed; soak in progress)
+# Upstream connection resets in one-process multi-mirror mode (root cause found in #5: unit `MemoryHigh=32G` memcg throttle — local, ours, fixed)
+
+> **Status: Resolved — historical** (one-process cutover completed 2026-08-17; Early Access era, `bitcraft-live-*` databases; the blue fleet referenced below is decommissioned).
 
 > First hard evidence: 2026-08-17 production switch attempt (01:13–01:26 UTC).
 > Status: attempts #1–#3 all lost busy regions to upstream closes.

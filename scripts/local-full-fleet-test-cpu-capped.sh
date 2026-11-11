@@ -1,6 +1,6 @@
 #!/bin/sh
 # CPU-capped local repro for the one-process multi-mirror upstream resets
-# (MULTI-MIRROR-UPSTREAM-RESETS.md): the same full-fleet run as
+# (docs/postmortems/MULTI-MIRROR-UPSTREAM-RESETS.md): the same full-fleet run as
 # local-full-fleet-test.sh, but inside a Linux Docker container capped with
 # --cpus=N so aggregate CPU starvation can be reproduced on a fast dev
 # machine. Tests the worker-starvation mechanism: on a saturated runtime the

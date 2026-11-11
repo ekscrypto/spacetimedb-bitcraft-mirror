@@ -1,15 +1,21 @@
 # Running the BitCraft mirror on an OVH K-5 (and similar spinning-disk hosts)
 
 > **Who this is for:** anyone deploying this fork to mirror the BitCraft
-> `bitcraft-live-*` databases on their own hardware — specifically on OVH's
+> `idc-*` databases (BitCraft 1.0: `idc-global` + 9 populated regions = 10
+> databases) on their own hardware — specifically on OVH's
 > K-5 dedicated-server template, but every lesson here applies to any host
 > whose storage is legacy HDDs rather than NVMe/SSD.
 >
 > This is the distilled, ordered list of everything we had to change to make
 > the one-process mirror survive in production on that machine. The full
 > evidence trail (telemetry, timelines, kill chains) lives in
-> [`MULTI-MIRROR-UPSTREAM-RESETS.md`](MULTI-MIRROR-UPSTREAM-RESETS.md); this
+> [`MULTI-MIRROR-UPSTREAM-RESETS.md`](docs/postmortems/MULTI-MIRROR-UPSTREAM-RESETS.md); this
 > document is the operator-facing "do these things" version.
+>
+> **Measurement era:** the numbers below were measured in the Early Access
+> era, when production mirrored 14 `bitcraft-live-*` databases. Since the
+> 2026-11 BitCraft 1.0 migration production mirrors 10 databases; treat the
+> EA-era figures as a conservative upper bound until re-measured.
 
 ## The machine
 
@@ -18,7 +24,7 @@ OVH **K-5** (Advance line, 2026-era order):
 | Component | Spec | Note |
 |---|---|---|
 | CPU | Xeon E3-1270 v6 — 4 cores / 8 threads | ~4k CPU-score class; fine for steady state, tight during re-seed bursts |
-| RAM | 64 GB DDR4 | the mirror needs ~35–40 GiB once all 14 regions are seeded |
+| RAM | 64 GB DDR4 | EA-era measurement: ~35–40 GiB with all 14 EA databases seeded (1.0 mirrors 10) |
 | Storage | 2× 2 TB-class SATA HDD, mdadm RAID1 (`md3`) | **the weakness.** No SSD/NVMe tier. Measured effective platter drain under contention: **~2.5–3.2 MB/s** |
 | OS | Debian, systemd, nginx front | stock server image — see the logrotate gotcha below |
 
@@ -35,7 +41,7 @@ The mirror holds long-lived WebSocket sessions upstream with hard deadlines:
 - upstream **RSTs a connection whose pongs aren't flushed within ~30 s**,
 - liveness probe (**OneOffQuery**): **30 s** send-to-process budget.
 
-One process mirrors all 14 regions (plus the embedded read cache), so one
+One process mirrors every database (10 in 1.0, plus the embedded read cache), so one
 stalled Tokio worker can blow the deadline for every session it polls. The
 upstream edge does not wait: a missed pong is an RST, an RST is a cold reset,
 a cold reset is a **full re-seed of that region** (hundreds of MB of Brotli
@@ -43,7 +49,7 @@ decode + millions of row inserts), and re-seed bursts make further stalls
 more likely. On a fast dev box you will never notice any of this; on a K-5
 it is fatal unless you do the work below.
 
-Measured production footprint after all 14 regions are live: **~35–37 GiB
+Measured EA-era production footprint after all 14 EA databases were live: **~35–37 GiB
 RSS** (creeping toward 40 GiB as live data accumulates), ~140 MB of binary +
 shared libraries, steady disk traffic near zero *after* the fixes.
 
@@ -76,7 +82,7 @@ INFO→DEBUG (`/v1/mirrors` exposes the same progress live).
   already captures stdout; the rolling `stdb.log` in the data dir is a
   double-write of every line to the slow array.
 - Keep `RUST_LOG` at `info` (or tighter). At `debug` a single region re-seed
-  emits thousands of lines; multiply by 14 regions.
+  emits thousands of lines; multiply by every mirrored database (10 in 1.0).
 - The fork also aggregates the re-seed "cleared stale rows" lines to one
   summary per table per flush (was: one line per chunk — 274 lines per
   re-seed, per region).
@@ -132,7 +138,7 @@ WantedBy=multi-user.target
    which is why the script pins the `ldd` closure and not just the ELF.
 
 **Verification:** after startup, `grep read_bytes /proc/$(pidof spacetimedb-standalone)/io`
-should be flat (we measured **536 KB total for a full 14-region seed+soak**
+should be flat (we measured **536 KB total for a full 14-database EA-era seed+soak**
 after pinning, vs 224 MB of fault reads before).
 
 ## Fix 3 — de-fang nginx (the burster you didn't know you had)
@@ -232,7 +238,7 @@ named the killer after four failed production attempts.
 - **Serialized seeding** (`--mirror-subscribe-concurrency 1`): one region
   seeds at a time, one table at a time through the subscribe gate. On this
   class of host, parallel re-seeds stack decode bursts onto the shared
-  runtime and start the cascade. Full 14-region cold seed takes ~15–17 min;
+  runtime and start the cascade. Full cold seed took ~15–17 min for the 14 EA-era databases (expect less with 10);
   plan the maintenance window for it.
 - **ram-guard:** a sidecar unit stops the mirror if `MemAvailable` drops
   below 2 GiB. With `memory.max` unlimited, it is the real OOM protection.

@@ -17,7 +17,7 @@
 #   STATUS_ADDR      /v1/mirrors sidecar (default 127.0.0.1:3130 = main port + 30)
 #   CACHE_BIND       embedded cache bind (default 127.0.0.1:8089)
 #   CONCURRENCY      --mirror-subscribe-concurrency (default 1; each extra slot
-#                    adds ~8 GB transient seed memory — see MULTI-MIRROR-STARVATION.md)
+#                    adds ~8 GB transient seed memory — see docs/postmortems/MULTI-MIRROR-STARVATION.md)
 #   SOAK_MINUTES     steady-state soak after all-live (default 60)
 #   TOKEN_FILE       upstream bearer token file
 #   JWT_KEY_DIR      dir with id_ecdsa / id_ecdsa.pub (default ~/.config/spacetime)

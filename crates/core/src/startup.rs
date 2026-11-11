@@ -66,7 +66,7 @@ pub fn configure_tracing(opts: TracingOptions) {
     // stdout is a pipe to journald, and when the host's storage stalls the
     // pipe fills and any task logging from inside a Tokio worker blocks in
     // `write()`. That froze every mirror session process-wide for as long as
-    // the pipe stayed full (see MULTI-MIRROR-UPSTREAM-RESETS.md, 2026-08-17
+    // the pipe stayed full (see docs/postmortems/MULTI-MIRROR-UPSTREAM-RESETS.md, 2026-08-17
     // attempt #3: CPU ~0, all event loops silent, everyone released the instant the
     // pipe drained. With the worker thread, a stalled sink drops log lines
     // instead of freezing the database.

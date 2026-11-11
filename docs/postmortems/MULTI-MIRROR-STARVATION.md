@@ -1,5 +1,7 @@
 # Multi-mirror starvation analysis (single instance, N upstreams)
 
+> **Status: Resolved — historical** (fixed 2026-08-16; Early Access era, `bitcraft-live-*` databases).
+
 > **Follow-up (2026-08-17):** after the fixes below, a *distinct* failure
 > mode remains where the upstream edge itself kills our connections
 > (RSTs + probe timeouts) once many mirrors share one process — tracked in

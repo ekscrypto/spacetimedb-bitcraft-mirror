@@ -4,7 +4,7 @@
 # emulator of journald falling behind on a stalled host disk — and count
 # `event loop gap` warnings in the data-dir rolling logs.
 #
-# Freeze mechanism under test (MULTI-MIRROR-UPSTREAM-RESETS.md): the fmt layer
+# Freeze mechanism under test (docs/postmortems/MULTI-MIRROR-UPSTREAM-RESETS.md): the fmt layer
 # wrote every log line synchronously from the emitting task. stdout under
 # systemd is a pipe to journald; when the host storage stalls the pipe fills
 # and every Tokio task that logs blocks in write() — CPU drops to ~0, all

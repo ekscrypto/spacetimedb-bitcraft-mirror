@@ -30,9 +30,9 @@ one-process topology on 2026-08-17; it is the final shape.
 One process, `--mirror` per region database, single `--listen-addr` for
 WebSocket clients, embedded cache on `--cache-bind` (default `127.0.0.1:8089`
 — same contract as the standalone `relay-cache`, so nginx and the explorer
-keep working unchanged). See [`MULTI-MIRROR-STARVATION.md`](MULTI-MIRROR-STARVATION.md) (inherited) for why
+keep working unchanged). See [`MULTI-MIRROR-STARVATION.md`](docs/postmortems/MULTI-MIRROR-STARVATION.md) (inherited) for why
 per-database client gating matters in this topology, and
-[`MULTI-MIRROR-UPSTREAM-RESETS.md`](MULTI-MIRROR-UPSTREAM-RESETS.md) (resolved
+[`MULTI-MIRROR-UPSTREAM-RESETS.md`](docs/postmortems/MULTI-MIRROR-UPSTREAM-RESETS.md) (resolved
 2026-08-17: all four failure layers were local — logging, disk, swap, memory
 cap) for the incident history. Deploying on modest/legacy hardware (e.g. an
 OVH K-5 with spinning disks)? Read [`OVH-CLOUD-K5.md`](OVH-CLOUD-K5.md)
@@ -50,15 +50,14 @@ cargo build -p spacetimedb-standalone --release
   --jwt-priv-key-path /path/to/id_ecdsa \
   --public-mirror-v1 \
   --mirror-token-file /path/to/.developer-token \
-  --mirror wss://bitcraft-early-access.spacetimedb.com/bitcraft-live-7 \
-  --mirror wss://bitcraft-early-access.spacetimedb.com/bitcraft-live-8 \
+  --mirror wss://bitcraft-release.spacetimedb.com/idc-7 \
+  --mirror wss://bitcraft-release.spacetimedb.com/idc-8 \
   --bitcraft-cache \
   --cache-bind 127.0.0.1:8089
 ```
 
 Everything from [`FORK.md`](FORK.md) applies unchanged (per-database client
-gating, subscribe gate, idempotent seeds, `/v1/mirrors` sidecar, coordinator
-socket). `--bitcraft-cache` adds:
+gating, subscribe gate, idempotent seeds, `/v1/mirrors` sidecar). `--bitcraft-cache` adds:
 
 ## Upstream protocol: WebSocket v2
 
@@ -85,7 +84,7 @@ global + regions 3/7 live with all tables; per-table row counts match staging
 exactly on all 318 region tables and 282 global tables; seed frames
 byte-identical except row ordering; live updates flow.
 
-- an embedded `relay-cache` fed in-process per mirrored `bitcraft-live-N`
+- an embedded `relay-cache` fed in-process per mirrored region database (`idc-N`)
   (schema taken from the same raw schema JSON the mirror fetched — no extra
   HTTP, no drift),
 - the full cache HTTP/protobuf API + dim-buildings WebSocket on
@@ -102,7 +101,9 @@ per-deposit subscription set and its `HexiteLocationsMissing` reconnect class.
 
 ## Merge policy vs spacetimedb-public-mirror
 
-The `public-mirror` remote tracks the parent fork. Pull fixes with:
+Work lands on `bitcraft-mirror-v2` (the default and deploy branch; the old
+`bitcraft-mirror` branch is the v1 lineage and must not be deployed). The
+`public-mirror` remote tracks the parent fork. Pull fixes with:
 
 ```sh
 git fetch public-mirror

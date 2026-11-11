@@ -1,7 +1,8 @@
 # spacetimedb-bitcraft-mirror
 
 A custom fork of **SpacetimeDB built specifically for mirroring BitCraft game
-servers** — all `bitcraft-live-*` region databases in **one process**, with a
+servers** — the BitCraft 1.0 `idc-*` databases (global + every populated
+region) in **one process**, with a
 read-cache API for game tools embedded in that same process.
 
 This is not a generic SpacetimeDB deployment. It is a purpose-built mirroring
@@ -27,18 +28,22 @@ ekscrypto/spacetimedb-public-mirror    adds --public-mirror-v1: in-memory
         │                              call-stack provenance for subscribers
         ▼
 ekscrypto/spacetimedb-bitcraft-mirror  ← you are here
-                                       BitCraft tuning: 14-region production
+                                       BitCraft tuning: multi-region production
                                        hardening, serialized seeding, async
                                        lossy logging, and relay-cache
                                        embedded behind --bitcraft-cache
 ```
 
 - **Expect this fork to lag mainline SpacetimeDB.** The upstream pin is
-  deliberate (v2.7.1 is what the BitCraft early-access edge speaks), and
+  deliberate (v2.7.1 is what the BitCraft upstream edge speaks), and
   fixes are pulled in by cherry-pick from the parent fork rather than by
   tracking `main` — see the merge policy in
   [`BITCRAFT-FORK.md`](BITCRAFT-FORK.md). New upstream features may arrive
   late or never here; security-relevant fixes are prioritized.
+- **Branches:** `bitcraft-mirror-v2` is the default branch and the only
+  deploy branch — production (`bitcraft-mirror.service`) is built from it.
+  The older `bitcraft-mirror` branch is the v1 lineage; deploying from it
+  would downgrade production.
 - Both fork layers keep SpacetimeDB's Business Source License 1.1
   ([`LICENSE.txt`](LICENSE.txt)). `crates/relay-cache` is MIT.
 
@@ -47,14 +52,13 @@ ekscrypto/spacetimedb-bitcraft-mirror  ← you are here
 ```
                  ┌──────────────────────────────────────────┐
                  │     BitCraft upstream (Clockwork Labs)   │
-                 │     wss://bitcraft-early-access.         │
+                 │     wss://bitcraft-release.              │
                  │          spacetimedb.com                 │
                  │                                          │
-                 │  bitcraft-live-global, -3, -7, -8, -9,   │
-                 │  -11, -12, -13, -14, -15, -17, -18,      │
-                 │  -19, -23          (14 databases)        │
+                 │  idc-global, idc-7, -8, -9, -12, -13,    │
+                 │  -14, -17, -18, -19     (10 databases)   │
                  └────────────┬────────────────┬────────────┘
-                              │ 14 × mirrored WebSocket sessions
+                              │ 10 × mirrored WebSocket sessions
                               │ (Brotli-compressed BSATN subscribe)
                               ▼
  ┌────────────────────────────────────────────────────────────────┐
@@ -147,17 +151,22 @@ cargo build -p spacetimedb-standalone --release
   --jwt-priv-key-path /path/to/id_ecdsa \
   --public-mirror-v1 \
   --mirror-token-file /path/to/.developer-token \
-  --mirror wss://bitcraft-early-access.spacetimedb.com/bitcraft-live-7 \
-  --mirror wss://bitcraft-early-access.spacetimedb.com/bitcraft-live-8 \
+  --mirror wss://bitcraft-release.spacetimedb.com/idc-7 \
+  --mirror wss://bitcraft-release.spacetimedb.com/idc-8 \
   --bitcraft-cache \
   --cache-bind 127.0.0.1:8089
 ```
 
-Add one `--mirror` per region database you want (production runs all 14).
+Add one `--mirror` per region database you want. Production mirrors 10
+databases: `idc-global` plus the 9 regions that have player settlements in
+BitCraft 1.0 (7, 8, 9, 12, 13, 14, 17, 18, 19). The other 16 of the 25
+regions are empty (reserved for future development) and are not mirrored.
+(Until the 2026-11 1.0 migration production mirrored 14 Early Access
+`bitcraft-live-*` databases on `bitcraft-early-access.spacetimedb.com`.)
 
 **Before deploying to real hardware**, read
-[`OVH-CLOUD-K5.md`](OVH-CLOUD-K5.md): the full 14-region mirror is
-memory-heavy (~36 GiB RSS) and extremely sensitive to storage stalls and
+[`OVH-CLOUD-K5.md`](OVH-CLOUD-K5.md): the full production mirror is
+memory-heavy (~36 GiB RSS measured with the 14 Early Access databases) and extremely sensitive to storage stalls and
 mis-sized cgroup limits. That guide lists every host-level change
 (async-lossy logging already in this fork, vmtouch page pinning, nginx log
 buffering, swap removal, `MemoryHigh` sizing) that production required —
@@ -175,7 +184,7 @@ more `--mirror` targets. Key flags (all require `--public-mirror-v1`):
 | `--mirror-table <name>` | Limit upstream subscribe set (repeatable; default: all public user tables). Shared across all mirrors. |
 | `--mirror-event-tables <list>` | Allowlist of `*_event` tables to forward (comma-separated, repeatable; default: the transaction-relevant set — `market_trade_event`, `barter_stall_inventory_event`, `claim_treasury_event`, `player_signed_out_event`, `craft_event`, `player_death_event`; `none` disables). Event rows are forwarded to downstream **v2** subscribers as proper `EventTable` frames, inserts-only, nothing accumulated locally — the same wire-only semantics as the game server. There is no snapshot and no catch-up: rows missed while disconnected are gone, so consumers must persist on arrival. v1 subscriptions to event tables are rejected ("requires WebSocket v2"), matching upstream. Non-allowlisted event tables are excluded from the upstream subscribe entirely (they would dwarf the state tables). |
 | `--mirror-subscribe-concurrency <n>` | Max mirrors that may run initial setup at once (default **1**; production keeps it at 1 — serialized seeding is a stability requirement, not a suggestion, on slower hosts). Slot held for connect + every table seed + local apply; released when that mirror goes `live`. |
-| `--mirror-status-listen-addr <addr>` | Isolated readiness listener (default `127.0.0.1:<main-port+1>`). |
+| `--mirror-status-listen-addr <addr>` | Isolated readiness listener (default `127.0.0.1:<main-port+30>`, e.g. `:3100` → `:3130`). |
 | `--reject-one-off-query` | Also reject `OneOffQuery` (allowed by default). `CallReducer` / `CallProcedure` are always rejected. |
 | `--bitcraft-cache` | Embed the relay-cache (this fork). Adds `--cache-bind` and `--cache-mem-ceiling-bytes`. |
 
@@ -219,7 +228,7 @@ from upstream at bootstrap, storage is forced in-memory (no durable mirror
 state across restarts), local database names/identities are derived from
 upstream, and the surface is read-only fan-out (`CallReducer` /
 `CallProcedure` rejected). You never `spacetime publish` into this process.
-Details, seed/reconnect behavior, and the coordinator socket:
+Details and seed/reconnect behavior:
 [`FORK.md`](FORK.md) and [`BITCRAFT-FORK.md`](BITCRAFT-FORK.md).
 
 ## Documentation
@@ -227,9 +236,10 @@ Details, seed/reconnect behavior, and the coordinator socket:
 - [`BITCRAFT-FORK.md`](BITCRAFT-FORK.md) — this fork's design decisions,
   merge policy vs the parent fork, and what `--bitcraft-cache` adds
 - [`FORK.md`](FORK.md) — the parent fork's `--public-mirror-v1` mechanics
-- [`MULTI-MIRROR-UPSTREAM-RESETS.md`](MULTI-MIRROR-UPSTREAM-RESETS.md) and
-  [`MULTI-MIRROR-STARVATION.md`](MULTI-MIRROR-STARVATION.md) — the full
-  production incident post-mortems (why the hardening exists)
+- [`docs/postmortems/MULTI-MIRROR-UPSTREAM-RESETS.md`](docs/postmortems/MULTI-MIRROR-UPSTREAM-RESETS.md) and
+  [`docs/postmortems/MULTI-MIRROR-STARVATION.md`](docs/postmortems/MULTI-MIRROR-STARVATION.md) — the full
+  production incident post-mortems (resolved, historical, Early Access era;
+  why the hardening exists)
 - [`OVH-CLOUD-K5.md`](OVH-CLOUD-K5.md) — operator guide: running the
   mirror on spinning-disk/legacy hardware
 - [`crates/relay-cache/README.md`](crates/relay-cache/README.md) — cache

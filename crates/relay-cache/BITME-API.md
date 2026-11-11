@@ -8,8 +8,8 @@ binary payloads, and §8 adds one optional WebSocket, the resource change
 stream, for live map updates.)
 
 Source of truth: `src/bitme_serve.rs` (handlers) and `src/bitme.rs`
-(tracker). Operator-facing inventory: `USED-TABLES.md`. Design notes:
-`BITME-DATA-ASSESSMENT.md` in the workspace root.
+(tracker). Operator-facing inventory: `USED-TABLES.md`.
+
 
 ---
 
@@ -36,7 +36,9 @@ not a search. (Substring player search exists separately at
 `GET /player?name=`.)
 
 Works for players of **all 25 regions** (global-module data), independent
-of which regions the mirror currently covers.
+of which regions the mirror currently covers. In BitCraft 1.0 only 9 of the
+25 regions are populated and mirrored (7, 8, 9, 12, 13, 14, 17, 18, 19); the
+rest are empty, reserved for future development.
 
 | Param | Required | Meaning |
 |---|---|---|
@@ -53,8 +55,8 @@ of which regions the mirror currently covers.
   "identity": "c2003111fc31ca323b17ed6063f1522a6a446f1384d78eadb23449b6cb9ce4a6",
   "region_id": 7,
   "region_name": "Virexal",
-  "host": "https://bitcraft-early-access.spacetimedb.com",
-  "module": "bitcraft-live-7",
+  "host": "https://bitcraft-release.spacetimedb.com",
+  "module": "idc-7",
   "signed_in": true
 }
 ```
@@ -69,7 +71,7 @@ of which regions the mirror currently covers.
 | `region_id` | int \| null | Home region (1–25). |
 | `region_name` | string \| null | Player-facing region name (e.g. `Virexal`). |
 | `host` | string \| null | Region sign-in host. |
-| `module` | string \| null | Database/module name (e.g. `bitcraft-live-7`). |
+| `module` | string \| null | Database/module name (e.g. `idc-7`). |
 | `signed_in` | bool \| null | Live sign-in state. `null` only when neither the global presence set nor a mirrored home region knows. |
 
 ### Errors
@@ -308,7 +310,7 @@ HTTP 400  {"error": "entity_id must be a u64"}
 
 A player resolves globally even when their region is not mirrored, but a
 **session** requires them to be present in one of the mirrored regions
-(currently 3, 7, 8, 9, 11, 12, 13, 14, 15, 17, 18, 19, 23).
+(currently 7, 8, 9, 12, 13, 14, 17, 18, 19 — the 9 populated 1.0 regions).
 
 ---
 

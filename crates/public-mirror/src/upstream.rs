@@ -517,7 +517,7 @@ where
     // Per-table progress is debug: a 274-table region logs this pair hundreds
     // of times per seed, and under the strict-serialized cold start that
     // volume is what floods slow-disk logging sinks (see
-    // MULTI-MIRROR-UPSTREAM-RESETS.md). `/v1/mirrors` exposes the same
+    // docs/postmortems/MULTI-MIRROR-UPSTREAM-RESETS.md). `/v1/mirrors` exposes the same
     // progress (`current_table`, seed rows applied) without the log firehose.
     log::debug!(
         "public-mirror: subscribe [{}/{}] {table} (request_id={request_id})",
