@@ -147,6 +147,50 @@ pub(crate) fn no_store_status(status: StatusCode, body: Value) -> Response {
     (status, headers, axum::Json(body)).into_response()
 }
 
+/// Seconds a client should wait before retrying a lookup that missed while
+/// one or more region shards were still on their initial sync.
+const CACHE_SYNCING_RETRY_AFTER_SECS: &str = "30";
+
+/// Response for a claim/player lookup that matched nothing.
+///
+/// Entity IDs do not encode their region, so a miss is only authoritative
+/// once every shard has finished its initial sync:
+///
+/// - any shard not ready → `503` + `Retry-After`, `code: "cache_syncing"`
+///   (the entity may exist in a region we have not loaded yet — retry later);
+/// - all shards ready → `404`, `code: "not_found"` (the entity does not exist
+///   upstream; clients should stop asking for it).
+///
+/// The `code` field is what distinguishes an entity miss from an unknown
+/// route: nginx/axum route 404s carry no JSON `code`.
+pub(crate) fn entity_missing(fleet: &Fleet, kind: &'static str) -> Response {
+    let syncing = fleet.shards.iter().any(|shard| !shard.store.read().ready);
+    entity_missing_response(syncing, kind)
+}
+
+fn entity_missing_response(syncing: bool, kind: &'static str) -> Response {
+    if syncing {
+        let mut resp = no_store_status(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({
+                "error": format!("{kind} not found yet; cache is still syncing"),
+                "code": "cache_syncing",
+                "kind": kind,
+            }),
+        );
+        resp.headers_mut().insert(
+            header::RETRY_AFTER,
+            HeaderValue::from_static(CACHE_SYNCING_RETRY_AFTER_SECS),
+        );
+        resp
+    } else {
+        no_store_status(
+            StatusCode::NOT_FOUND,
+            json!({"error": format!("{kind} not found"), "code": "not_found", "kind": kind}),
+        )
+    }
+}
+
 fn no_store_protobuf(bytes: Vec<u8>) -> Response {
     let mut headers = HeaderMap::new();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -618,7 +662,7 @@ async fn claim_by_pk(State(fleet): State<Fleet>, headers: HeaderMap, Path(entity
             return respond_claim(&headers, claim_detail_from_store(&s, slot as usize));
         }
     }
-    no_store_status(StatusCode::NOT_FOUND, json!({"error": "claim not found"})).into_response()
+    entity_missing(&fleet, "claim").into_response()
 }
 
 async fn claim_inventory(State(fleet): State<Fleet>, headers: HeaderMap, Path(entity_id): Path<String>) -> Response {
@@ -628,7 +672,7 @@ async fn claim_inventory(State(fleet): State<Fleet>, headers: HeaderMap, Path(en
 
     match build_claim_inventory(&fleet, pk) {
         Some(inv) => respond_claim_inventory(&headers, inv),
-        None => no_store_status(StatusCode::NOT_FOUND, json!({"error": "claim not found"})).into_response(),
+        None => entity_missing(&fleet, "claim").into_response(),
     }
 }
 
@@ -1397,7 +1441,7 @@ async fn claim_members(State(fleet): State<Fleet>, headers: HeaderMap, Path(enti
     };
     match build_claim_members(&fleet, pk) {
         Some(body) => respond_claim_members(&headers, body),
-        None => no_store_status(StatusCode::NOT_FOUND, json!({"error": "claim not found"})).into_response(),
+        None => entity_missing(&fleet, "claim").into_response(),
     }
 }
 
@@ -1525,7 +1569,7 @@ async fn claim_citizens(State(fleet): State<Fleet>, headers: HeaderMap, Path(ent
         return no_store_status(StatusCode::BAD_REQUEST, json!({"error": "entity_id must be a u64"})).into_response();
     };
     let Some(full) = build_claim_members(&fleet, pk) else {
-        return no_store_status(StatusCode::NOT_FOUND, json!({"error": "claim not found"})).into_response();
+        return entity_missing(&fleet, "claim").into_response();
     };
     let citizens = full
         .members
@@ -1554,7 +1598,7 @@ async fn claim_hexcoins(State(fleet): State<Fleet>, headers: HeaderMap, Path(ent
         return no_store_status(StatusCode::BAD_REQUEST, json!({"error": "entity_id must be a u64"})).into_response();
     };
     let Some(full) = build_claim_members(&fleet, pk) else {
-        return no_store_status(StatusCode::NOT_FOUND, json!({"error": "claim not found"})).into_response();
+        return entity_missing(&fleet, "claim").into_response();
     };
     let mut members: Vec<pb::MemberHexcoins> = full
         .members
@@ -1602,7 +1646,7 @@ async fn player_skills(State(fleet): State<Fleet>, headers: HeaderMap, Path(enti
         return no_store_status(StatusCode::BAD_REQUEST, json!({"error": "entity_id must be a u64"})).into_response();
     };
     let Some(player) = find_player(&fleet, pk) else {
-        return no_store_status(StatusCode::NOT_FOUND, json!({"error": "player not found"})).into_response();
+        return entity_missing(&fleet, "player").into_response();
     };
     for shard in &fleet.shards {
         let s = shard.store.read();
@@ -1781,7 +1825,7 @@ async fn claim_crafts(
     };
     match build_claim_crafts(&fleet, pk, q.completed) {
         Some(body) => respond_claim_crafts(&headers, body),
-        None => no_store_status(StatusCode::NOT_FOUND, json!({"error": "claim not found"})).into_response(),
+        None => entity_missing(&fleet, "claim").into_response(),
     }
 }
 
@@ -1822,7 +1866,7 @@ async fn player_crafts(
     };
     match build_player_crafts(&fleet, pk, q.completed) {
         Some(body) => respond_player_crafts(&headers, body),
-        None => no_store_status(StatusCode::NOT_FOUND, json!({"error": "player not found"})).into_response(),
+        None => entity_missing(&fleet, "player").into_response(),
     }
 }
 
@@ -2106,7 +2150,7 @@ async fn player_by_pk(State(fleet): State<Fleet>, headers: HeaderMap, Path(entit
     };
     match find_player(&fleet, pk) {
         Some(player) => respond_player(&headers, player),
-        None => no_store_status(StatusCode::NOT_FOUND, json!({"error": "player not found"})).into_response(),
+        None => entity_missing(&fleet, "player").into_response(),
     }
 }
 
@@ -2275,7 +2319,7 @@ async fn player_inventory(State(fleet): State<Fleet>, headers: HeaderMap, Path(e
 
     match build_player_inventory(&fleet, pk) {
         Some(inv) => respond_player_inventory(&headers, inv),
-        None => no_store_status(StatusCode::NOT_FOUND, json!({"error": "player not found"})).into_response(),
+        None => entity_missing(&fleet, "player").into_response(),
     }
 }
 
@@ -2386,7 +2430,7 @@ async fn player_housing(State(fleet): State<Fleet>, headers: HeaderMap, Path(ent
 
     match build_player_housing(&fleet, pk) {
         Some(housing) => respond_player_housing(&headers, housing),
-        None => no_store_status(StatusCode::NOT_FOUND, json!({"error": "player not found"})).into_response(),
+        None => entity_missing(&fleet, "player").into_response(),
     }
 }
 
@@ -2473,6 +2517,31 @@ mod tests {
     };
     use crate::store::RegionStore;
     use prost::Message;
+
+    #[tokio::test]
+    async fn entity_missing_distinguishes_syncing_from_absent() {
+        async fn body(resp: Response) -> Value {
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+
+        let syncing = entity_missing_response(true, "player");
+        assert_eq!(syncing.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(syncing.headers()[header::RETRY_AFTER], CACHE_SYNCING_RETRY_AFTER_SECS);
+        assert_eq!(syncing.headers()[header::CACHE_CONTROL], "no-store");
+        let b = body(syncing).await;
+        assert_eq!(b["code"], "cache_syncing");
+        assert_eq!(b["kind"], "player");
+
+        let absent = entity_missing_response(false, "claim");
+        assert_eq!(absent.status(), StatusCode::NOT_FOUND);
+        assert!(absent.headers().get(header::RETRY_AFTER).is_none());
+        let b = body(absent).await;
+        assert_eq!(b["code"], "not_found");
+        assert_eq!(b["kind"], "claim");
+        // Legacy `error` string preserved for existing clients.
+        assert_eq!(b["error"], "claim not found");
+    }
 
     #[test]
     fn rfc3339_millis_known_instant() {
