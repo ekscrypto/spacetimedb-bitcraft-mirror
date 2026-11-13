@@ -1502,13 +1502,25 @@ fn functions_is_storage(cell: &Cell) -> Result<bool> {
         bail!("building_desc.functions is not a JSON array: {json}");
     };
     for entry in arr {
-        let Value::Object(obj) = entry else {
-            continue;
-        };
-        let storage = obj.get("storage_slots").and_then(Value::as_i64).unwrap_or(0);
-        let cargo = obj.get("cargo_slots").and_then(Value::as_i64).unwrap_or(0);
-        if storage > 0 || cargo > 0 {
-            return Ok(true);
+        match entry {
+            // BitCraft 1.0: positional function array —
+            // [type_id, tier, …, storage_slots@3, cargo_slots@4, …]
+            // (verified live: Bank = [.., 64, 16, ..], Sturdy Chest = [.., 15, 0, ..]).
+            Value::Array(parts) => {
+                let slot = |i: usize| parts.get(i).and_then(Value::as_i64).unwrap_or(0);
+                if slot(3) > 0 || slot(4) > 0 {
+                    return Ok(true);
+                }
+            }
+            // Pre-1.0 object shape, kept for older worlds / fixtures.
+            Value::Object(obj) => {
+                let storage = obj.get("storage_slots").and_then(Value::as_i64).unwrap_or(0);
+                let cargo = obj.get("cargo_slots").and_then(Value::as_i64).unwrap_or(0);
+                if storage > 0 || cargo > 0 {
+                    return Ok(true);
+                }
+            }
+            _ => continue,
         }
     }
     Ok(false)
@@ -3016,6 +3028,28 @@ mod tests {
             {"function_type": 28, "storage_slots": 0, "cargo_slots": 0}
         ]));
         assert!(!functions_is_storage(&totem).unwrap());
+
+        let empty = Cell::Jsonb(json!([]));
+        assert!(!functions_is_storage(&empty).unwrap());
+    }
+
+    /// BitCraft 1.0 positional `functions` arrays: storage_slots@3, cargo_slots@4.
+    /// Values are live 1.0 rows (Bank 64+16, Sturdy Chest 15, wall 0+0).
+    #[test]
+    fn functions_is_storage_handles_1_0_positional_arrays() {
+        let bank = Cell::Jsonb(json!([
+            [622192982, -1, 0, 64, 16, 0, 0, 60000000, 60000000, 0, [], 0, false, 0, 0]
+        ]));
+        assert!(functions_is_storage(&bank).unwrap());
+
+        let chest = Cell::Jsonb(json!([[3, 2, 0, 15, 0, 0, 0, 0, 0, 0, [], 0, false, 0, 0]]));
+        assert!(functions_is_storage(&chest).unwrap());
+
+        let stockpile = Cell::Jsonb(json!([[4, 2, 0, 0, 18, 0, 0, 0, 0, 0, [], 0, false, 0, 0]]));
+        assert!(functions_is_storage(&stockpile).unwrap());
+
+        let wall = Cell::Jsonb(json!([[1, 1, 0, 0, 0, 0, 0, 0, 0, 0, [], 0, false, 0, 0]]));
+        assert!(!functions_is_storage(&wall).unwrap());
 
         let empty = Cell::Jsonb(json!([]));
         assert!(!functions_is_storage(&empty).unwrap());

@@ -2238,6 +2238,14 @@ fn classify_player_bag(s: &RegionStore, inv_slot: u32, player_id: u64) -> Option
         if player_owner != player_id {
             return None;
         }
+        // 1.0 regional bank: the per-region bank is one shared inventory and
+        // each player's view is a row with `owner_entity_id = 0` (no owning
+        // building) and `player_owner = player`. 80 slots = Bank desc's
+        // 64 storage + 16 cargo. (Legacy per-building banks still resolve
+        // through the building branch below.)
+        if owner == 0 {
+            return Some(("bank", "Regional Bank".to_owned(), None, None, None));
+        }
         let b_slot = s.building.find(owner)?;
         let desc_id = s.building.building_description_id[b_slot as usize];
         let building_name = s.building_desc.get(desc_id).unwrap_or("Storage").to_owned();
@@ -2290,6 +2298,32 @@ fn categorize_building_bag(name: &str) -> Option<&'static str> {
     }
 }
 
+/// 1.0 removed `inventory_state` rows for empty deployed deployables
+/// (verified live: row disappears when the last item leaves a deployed
+/// cart). The player inventory must still surface every owned deployable —
+/// emit an empty bag for owned deployables that have no inventory rows.
+fn synthetic_deployable_bags(s: &RegionStore, player_id: u64) -> Vec<pb::PlayerInventoryBag> {
+    let mut bags = Vec::new();
+    for &d_slot in s.deployable.by_owner(player_id) {
+        let dep_eid = s.deployable.entity_id[d_slot as usize];
+        if !s.inventory.by_owner(dep_eid).is_empty() || s.inventory.find(dep_eid).is_some() {
+            continue; // real inventory row(s) exist; classified from those
+        }
+        let (category, name, nickname, claim_entity_id, claim_name) =
+            deployable_bag_fields(s, d_slot);
+        bags.push(pb::PlayerInventoryBag {
+            entity_id: dep_eid,
+            name,
+            nickname,
+            category: category.to_owned(),
+            claim_entity_id,
+            claim_name,
+            items: Vec::new(),
+        });
+    }
+    bags
+}
+
 fn collect_player_bags(fleet: &Fleet, player_id: u64) -> Vec<pb::PlayerInventoryBag> {
     let mut bags = Vec::new();
     let mut seen = HashMap::<u64, ()>::new();
@@ -2302,6 +2336,12 @@ fn collect_player_bags(fleet: &Fleet, player_id: u64) -> Vec<pb::PlayerInventory
             let Some(bag) = classify_player_bag(&s, slot, player_id) else {
                 continue;
             };
+            if seen.insert(bag.entity_id, ()).is_some() {
+                continue;
+            }
+            bags.push(bag);
+        }
+        for bag in synthetic_deployable_bags(&s, player_id) {
             if seen.insert(bag.entity_id, ()).is_some() {
                 continue;
             }
@@ -3220,6 +3260,106 @@ mod tests {
         assert_eq!(goat.name, "Biscuit");
         assert_eq!(goat.nickname.as_deref(), Some("Biscuit"));
         assert_eq!(goat.claim_name.as_deref(), Some("Pasture"));
+    }
+
+    /// BitCraft 1.0 regional bank: one shared per-region inventory; each
+    /// player's row carries `owner_entity_id = 0` + `player_owner = player`.
+    #[test]
+    fn regional_bank_bag_owner_zero() {
+        use crate::decode::InventoryRow;
+        use crate::store::Pocket;
+
+        let mut s = RegionStore::empty(18);
+        s.ready = true;
+        let pocket = Pocket {
+            volume: 100,
+            has_contents: true,
+            item_id: 1170001,
+            quantity: 2,
+            item_type: Pocket::ITEM,
+            has_durability: false,
+            durability: 0,
+        };
+        s.inventory.upsert(InventoryRow {
+            entity_id: 3188,
+            pockets: Box::from([pocket]),
+            inventory_index: 0,
+            cargo_index: 0,
+            owner_entity_id: 0,
+            player_owner_entity_id: 7,
+        });
+
+        let slots = player_inventory_slots(&s, 7);
+        assert_eq!(slots.len(), 1);
+        let bank = classify_player_bag(&s, slots[0], 7).unwrap();
+        assert_eq!(bank.category, "bank");
+        assert_eq!(bank.name, "Regional Bank");
+        assert_eq!(bank.entity_id, 3188);
+        assert_eq!(bank.items.len(), 1);
+        assert_eq!(bank.items[0].item_id, 1170001);
+        assert_eq!(bank.claim_name, None);
+
+        // Another player must not see it.
+        assert!(player_inventory_slots(&s, 8).is_empty());
+        assert!(classify_player_bag(&s, slots[0], 8).is_none());
+    }
+
+    /// 1.0 drops `inventory_state` rows for empty deployed deployables —
+    /// the inventory must synthesize an empty bag from the deployable row.
+    #[test]
+    fn synthetic_empty_deployable_bag() {
+        use crate::decode::InventoryRow;
+        use crate::store::Pocket;
+
+        let mut s = RegionStore::empty(18);
+        s.ready = true;
+        s.deployable_desc.upsert(DeployableDescRow {
+            id: 1,
+            name: "Cart (I)".into(),
+            kind: DeployableKind::Cart,
+        });
+        // Deployed cart with nickname, no inventory row anywhere.
+        s.deployable.upsert(DeployableRow {
+            entity_id: 2651,
+            owner_id: 7,
+            claim_entity_id: 0,
+            deployable_description_id: 1,
+            nickname: "Maplesugar's Cart (I)".into(),
+        });
+        let mut synth = synthetic_deployable_bags(&s, 7);
+        assert_eq!(synth.len(), 1);
+        let bag = synth.pop().unwrap();
+        assert_eq!(bag.entity_id, 2651);
+        assert_eq!(bag.category, "wagon");
+        assert_eq!(bag.name, "Maplesugar's Cart (I)");
+        assert_eq!(bag.nickname.as_deref(), Some("Maplesugar's Cart (I)"));
+        assert!(bag.items.is_empty());
+        // Other players don't get it.
+        assert!(synthetic_deployable_bags(&s, 8).is_empty());
+
+        // Once an inventory row exists the real bag wins — no synthetic.
+        s.inventory.upsert(InventoryRow {
+            entity_id: 8003,
+            pockets: Box::from([Pocket {
+                volume: 50,
+                has_contents: true,
+                item_id: 2,
+                quantity: 5,
+                item_type: Pocket::ITEM,
+                has_durability: false,
+                durability: 0,
+            }]),
+            inventory_index: 0,
+            cargo_index: 0,
+            owner_entity_id: 2651,
+            player_owner_entity_id: 0,
+        });
+        assert!(synthetic_deployable_bags(&s, 7).is_empty());
+        let slots = player_inventory_slots(&s, 7);
+        assert_eq!(slots.len(), 1);
+        let real = classify_player_bag(&s, slots[0], 7).unwrap();
+        assert_eq!(real.entity_id, 8003);
+        assert_eq!(real.items.len(), 1);
     }
 
     #[test]
