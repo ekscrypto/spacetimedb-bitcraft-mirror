@@ -2242,9 +2242,10 @@ fn classify_player_bag(s: &RegionStore, inv_slot: u32, player_id: u64) -> Option
         // each player's view is a row with `owner_entity_id = 0` (no owning
         // building) and `player_owner = player`. 80 slots = Bank desc's
         // 64 storage + 16 cargo. (Legacy per-building banks still resolve
-        // through the building branch below.)
+        // through the building branch below.) The region goes into the name
+        // because a player can hold one bank bag per region they've used.
         if owner == 0 {
-            return Some(("bank", "Regional Bank".to_owned(), None, None, None));
+            return Some(("bank", format!("Regional Bank ({})", s.region), None, None, None));
         }
         let b_slot = s.building.find(owner)?;
         let desc_id = s.building.building_description_id[b_slot as usize];
@@ -3293,7 +3294,7 @@ mod tests {
         assert_eq!(slots.len(), 1);
         let bank = classify_player_bag(&s, slots[0], 7).unwrap();
         assert_eq!(bank.category, "bank");
-        assert_eq!(bank.name, "Regional Bank");
+        assert_eq!(bank.name, "Regional Bank (18)");
         assert_eq!(bank.entity_id, 3188);
         assert_eq!(bank.items.len(), 1);
         assert_eq!(bank.items[0].item_id, 1170001);
