@@ -74,6 +74,23 @@ fn apply_roads_delete(
         LOCATION_TABLE => {
             let r = decode_location_roads(row, &meta.location_fields, meta.location, schema)?;
             if r.dimension == OVERWORLD_DIMENSION {
+                // Tables apply in alphabetical order, so when the game removes
+                // a paved or claim tile its `location_state` delete lands
+                // before the `paved_tile_state` / `claim_tile_state` delete.
+                // Those deletes locate the cell through this join map, so
+                // clear the cell here, while the location is still known —
+                // otherwise the tile stays painted forever. A location that
+                // is merely updated (delete + insert) is repainted by
+                // `apply_location`.
+                if let Some(paving) = grid.join.paving_by_entity.get(&r.entity_id).copied() {
+                    grid.join.clear_paving_at(grid.region, &mut grid.overlay, r.entity_id);
+                    if let Some(&(x, z)) = grid.join.location_by_entity.get(&r.entity_id) {
+                        grid.resource_map.clear_paving(x, z, paving);
+                    }
+                }
+                if grid.join.claim_by_entity.contains_key(&r.entity_id) {
+                    grid.join.clear_claim_at(grid.region, &mut grid.overlay, r.entity_id);
+                }
                 grid.join.location_by_entity.remove(&r.entity_id);
                 grid.resource_map.clear_location(r.entity_id);
             }

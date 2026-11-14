@@ -1016,3 +1016,69 @@ async fn feed_roads_stamps_and_clears_paving() {
     let grid = rh.grid.read();
     assert_eq!(grid.resource_map.paving_at_local(12, 34), None);
 }
+
+/// The game deletes a removed paved tile's `location_state` row in the same
+/// transaction as its `paved_tile_state` row, and tables apply in
+/// alphabetical order — the location goes first. The tile must still clear.
+#[tokio::test]
+async fn feed_roads_clears_paving_when_location_is_deleted_first() {
+    let interest = InterestHub::new();
+    let manager = FeedManager::new(interest);
+    let roads = manager.enable_roads();
+    manager
+        .register_region("bitcraft-live-7", SCHEMA_JSON)
+        .expect("register")
+        .expect("regional database yields a handle");
+
+    let seed = seed_update(vec![
+        ops(
+            "location_state",
+            vec![],
+            vec![location_row(900, 7692, 7714, 1), location_row(901, 7693, 7714, 1)],
+        ),
+        ops(
+            "paved_tile_state",
+            vec![],
+            vec![paved_tile_row(900, 59838), paved_tile_row(901, 59838)],
+        ),
+    ]);
+    manager
+        .on_updates(Arc::from("bitcraft-live-7"), 1, vec![seed])
+        .await
+        .expect("dispatch seed");
+    manager
+        .on_live(Arc::from("bitcraft-live-7"), 1)
+        .await
+        .expect("dispatch live");
+    let rh = roads.region_handle(7).expect("roads region");
+    for _ in 0..200 {
+        if rh.grid.read().ready {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(rh.grid.read().overlay.paved_tile_count(), 2);
+
+    // Tile 900 is removed in game: location delete, then paved-tile delete.
+    // Tile 901 only has its location row rewritten (delete + insert).
+    let live = live_update(vec![
+        ops(
+            "location_state",
+            vec![location_row(900, 7692, 7714, 1), location_row(901, 7693, 7714, 1)],
+            vec![location_row(901, 7693, 7714, 1)],
+        ),
+        ops("paved_tile_state", vec![paved_tile_row(900, 59838)], vec![]),
+    ]);
+    manager
+        .on_updates(Arc::from("bitcraft-live-7"), 1, vec![live])
+        .await
+        .expect("dispatch delete");
+    settle().await;
+
+    let grid = rh.grid.read();
+    assert_eq!(grid.overlay.get(12, 34) & 0xFFFF, 0, "removed tile still painted");
+    assert_eq!(grid.resource_map.paving_at_local(12, 34), None);
+    assert_ne!(grid.overlay.get(13, 34) & 0xFFFF, 0, "surviving tile lost its paving");
+    assert_eq!(grid.resource_map.paving_at_local(13, 34), Some(59838));
+    assert_eq!(grid.overlay.paved_tile_count(), 1);
+}
