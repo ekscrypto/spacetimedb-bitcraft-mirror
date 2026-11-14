@@ -367,22 +367,26 @@ async fn run_worker(feed: Arc<RegionFeed>, mut rx: mpsc::Receiver<FeedMsg>) {
         match msg {
             FeedMsg::Reset { generation: next } => {
                 if next < generation {
-                    continue;
+                    // The emitter's epoch restarted (see `crate::observer`:
+                    // generations increase per reconnect, so this should not
+                    // happen — but if it ever does, rejecting the reset would
+                    // pin this worker to a generation no future batch carries,
+                    // freezing the layer until a process restart. A spurious
+                    // reset only costs one seed cycle; a rejected one costs
+                    // the layer. Accept and re-seed (2026-11-14 postmortem).
+                    tracing::warn!(
+                        target: "relay_cache::feed",
+                        region,
+                        old = generation,
+                        new = next,
+                        "upstream generation rewound; re-seeding from scratch"
+                    );
                 }
                 generation = next;
                 phase = Phase::Seeding(Box::new(RegionStore::empty(region)));
                 *feed.handle.store.write() = RegionStore::empty(region);
                 feed.bitme.clear_region(region);
-                if let Some(rh) = &feed.roads {
-                    roads_phase = Some(RoadsPhase::Seeding(Box::new(RoadsRegionGrid::new(region as u16))));
-                    *rh.grid.write() = RoadsRegionGrid::new(region as u16);
-                    // The grid was wholesale-replaced: tell resource-stream
-                    // listeners to refetch their BMR1 window and re-arm
-                    // change recording on the fresh grid.
-                    if let Some(fleet) = &feed.roads_fleet {
-                        fleet.watch.on_grid_replaced(rh, "reseed");
-                    }
-                }
+                begin_roads_reseed(&feed, &mut roads_phase, "reset");
                 tracing::info!(
                     target: "relay_cache::feed",
                     region,
@@ -398,9 +402,17 @@ async fn run_worker(feed: Arc<RegionFeed>, mut rx: mpsc::Receiver<FeedMsg>) {
                     finalize(&feed, staging);
                     phase = Phase::Live;
                 }
-                if let (Some(rh), Some(RoadsPhase::Seeding(staging))) = (&feed.roads, roads_phase.take()) {
-                    finalize_roads(&feed, rh, staging);
-                    roads_phase = Some(RoadsPhase::Live);
+                if let Some(rh) = &feed.roads {
+                    // Publish only when a seeding grid is actually pending;
+                    // take() + a failed pattern used to leave `roads_phase`
+                    // dangling at `None`, which silenced the roads live path
+                    // for the lifetime of the process.
+                    if let Some(RoadsPhase::Seeding(_)) = roads_phase.as_ref() {
+                        if let Some(RoadsPhase::Seeding(staging)) = roads_phase.take() {
+                            finalize_roads(&feed, rh, staging);
+                            roads_phase = Some(RoadsPhase::Live);
+                        }
+                    }
                 }
             }
             FeedMsg::Updates {
@@ -413,8 +425,23 @@ async fn run_worker(feed: Arc<RegionFeed>, mut rx: mpsc::Receiver<FeedMsg>) {
                 for update in updates {
                     if update.is_seed {
                         if !matches!(phase, Phase::Seeding(_)) {
+                            // Seed rows while live: the session restarted its
+                            // snapshot without dispatching a Reset. Re-enter
+                            // seeding symmetrically — clearing the columnar
+                            // store but not the roads grid here used to leave
+                            // `roads_phase` pointing at the old (published)
+                            // grid, so the re-seed never reached it and the
+                            // next `Live` stranded it (roads frozen, columnar
+                            // live — the 2026-11-14 map-layer freeze).
+                            tracing::warn!(
+                                target: "relay_cache::feed",
+                                region,
+                                generation,
+                                "seed batch during live phase; re-seeding (no Reset was dispatched)"
+                            );
                             phase = Phase::Seeding(Box::new(RegionStore::empty(region)));
                             feed.bitme.clear_region(region);
+                            begin_roads_reseed(&feed, &mut roads_phase, "live seed batch");
                         }
                         let Phase::Seeding(staging) = &mut phase else {
                             unreachable!();
@@ -446,6 +473,25 @@ async fn run_worker(feed: Arc<RegionFeed>, mut rx: mpsc::Receiver<FeedMsg>) {
     }
 }
 
+/// Drop the published roads grid and start a fresh staging one, telling
+/// resource-stream listeners to refetch their windows. Shared by `Reset` and
+/// the seed-during-live recovery path — both mean everything derived from the
+/// previous session must be rebuilt from the incoming seed.
+fn begin_roads_reseed(feed: &RegionFeed, roads_phase: &mut Option<RoadsPhase>, reason: &'static str) {
+    let Some(rh) = &feed.roads else {
+        *roads_phase = None;
+        return;
+    };
+    *roads_phase = Some(RoadsPhase::Seeding(Box::new(RoadsRegionGrid::new(feed.region as u16))));
+    *rh.grid.write() = RoadsRegionGrid::new(feed.region as u16);
+    // The grid was wholesale-replaced: tell resource-stream
+    // listeners to refetch their BMR1 window and re-arm
+    // change recording on the fresh grid.
+    if let Some(fleet) = &feed.roads_fleet {
+        fleet.watch.on_grid_replaced(rh, reason);
+    }
+}
+
 async fn run_global_worker(feed: Arc<GlobalFeed>, mut rx: mpsc::Receiver<GlobalFeedMsg>) {
     let mut generation: u64 = 1;
     let mut seeding = true;
@@ -453,14 +499,25 @@ async fn run_global_worker(feed: Arc<GlobalFeed>, mut rx: mpsc::Receiver<GlobalF
     while let Some(msg) = rx.recv().await {
         match msg {
             GlobalFeedMsg::Reset { generation: next } => {
-                if next >= generation {
-                    generation = next;
-                    seeding = true;
-                    if let Some(catalog) = &feed.catalog {
-                        *catalog.write() = GlobalRoadsCatalog::new();
-                    }
-                    feed.bitme.global().write().clear();
+                if next < generation {
+                    // Same rationale as the region worker: a rewound epoch
+                    // must trigger a re-seed, not a silent freeze (the old
+                    // `next >= generation` guard dropped the reset and every
+                    // later batch with it).
+                    tracing::warn!(
+                        target: "relay_cache::feed",
+                        database = %feed.database,
+                        old = generation,
+                        new = next,
+                        "upstream generation rewound; re-seeding global catalog"
+                    );
                 }
+                generation = next;
+                seeding = true;
+                if let Some(catalog) = &feed.catalog {
+                    *catalog.write() = GlobalRoadsCatalog::new();
+                }
+                feed.bitme.global().write().clear();
             }
             GlobalFeedMsg::Live { generation: gen } if gen == generation => {
                 if let Some(catalog) = &feed.catalog {
