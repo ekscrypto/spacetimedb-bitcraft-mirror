@@ -2286,7 +2286,10 @@ fn classify_player_bag(s: &RegionStore, inv_slot: u32, player_id: u64) -> Option
 
 fn categorize_building_bag(name: &str) -> Option<&'static str> {
     let lower = name.to_ascii_lowercase();
-    if lower.contains("bank") {
+    // "Local Stash" (settlement stash) is a claim-local bank: one building,
+    // a personal inventory row per player. Surfaced as a bank bag; the
+    // building name + claim name tell it apart from regional banks.
+    if lower.contains("bank") || lower.contains("stash") {
         Some("bank")
     } else if lower.contains("recovery") {
         Some("recovery")
@@ -3057,9 +3060,77 @@ mod tests {
     fn categorize_building_bag_names() {
         assert_eq!(categorize_building_bag("Town Bank"), Some("bank"));
         assert_eq!(categorize_building_bag("Ancient Bank"), Some("bank"));
+        assert_eq!(categorize_building_bag("Local Stash"), Some("bank"));
+        // Live 1.0 name for the same building (verified on idc-14).
+        assert_eq!(categorize_building_bag("Settlement Stash"), Some("bank"));
         assert_eq!(categorize_building_bag("Recovery Chest"), Some("recovery"));
         assert_eq!(categorize_building_bag("Personal Cache"), Some("cache"));
         assert_eq!(categorize_building_bag("Sturdy Large Chest"), None);
+    }
+
+    /// Settlement Stash ("Local Stash" in older gamedata): one building in
+    /// the claim, one 80-pocket inventory row per player (`owner = stash
+    /// building`, `player_owner = player`) — verified live on idc-14. Each
+    /// player sees only their own row, labelled with the claim it sits in.
+    #[test]
+    fn classify_local_stash_as_per_player_bank_bag() {
+        use crate::decode::InventoryRow;
+        use crate::store::Pocket;
+
+        let mut s = RegionStore::empty(14);
+        s.ready = true;
+        s.building.upsert(BuildingRow {
+            entity_id: 50,
+            claim_entity_id: 99,
+            building_description_id: 985246037,
+        });
+        s.building_desc.upsert(BuildingDescRow {
+            id: 985246037,
+            name: "Settlement Stash".into(),
+            is_storage: true,
+        });
+        s.claim.upsert(crate::decode::ClaimRow {
+            entity_id: 99,
+            owner_player_entity_id: 0,
+            owner_building_entity_id: 0,
+            name: "Concordia".into(),
+            neutral: false,
+        });
+        let pocket = |quantity| Pocket {
+            volume: 100,
+            has_contents: true,
+            item_id: 42,
+            quantity,
+            item_type: Pocket::ITEM,
+            has_durability: false,
+            durability: 0,
+        };
+        for (entity_id, player, quantity) in [(1001, 7, 3), (1002, 8, 5)] {
+            s.inventory.upsert(InventoryRow {
+                entity_id,
+                pockets: Box::from([pocket(quantity)]),
+                inventory_index: 0,
+                cargo_index: 0,
+                owner_entity_id: 50,
+                player_owner_entity_id: player,
+            });
+        }
+
+        let slots = player_inventory_slots(&s, 7);
+        assert_eq!(slots.len(), 1);
+        let stash = classify_player_bag(&s, slots[0], 7).unwrap();
+        assert_eq!(stash.category, "bank");
+        assert_eq!(stash.name, "Settlement Stash");
+        assert_eq!(stash.entity_id, 1001);
+        assert_eq!(stash.claim_entity_id, Some(99));
+        assert_eq!(stash.claim_name.as_deref(), Some("Concordia"));
+        assert_eq!(stash.items.len(), 1);
+        assert_eq!(stash.items[0].quantity, 3);
+
+        // Player 8's row is theirs alone.
+        assert!(classify_player_bag(&s, slots[0], 8).is_none());
+        // Personal storage stays out of the claim-wide rollup.
+        assert!(!s.building_desc.include_in_claim_inventory(985246037));
     }
 
     #[test]

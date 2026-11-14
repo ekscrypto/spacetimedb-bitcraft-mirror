@@ -9,8 +9,9 @@ use crate::decode::BuildingDescRow;
 struct Entry {
     name: Box<str>,
     is_storage: bool,
-    /// Town Bank / bank-category buildings — personal storage; omitted
-    /// from the claim inventory rollup (matches BitJita's policy).
+    /// Bank / Local Stash buildings — per-player personal storage; omitted
+    /// from the claim inventory rollup (matches BitJita's policy) and
+    /// served through the owning player's inventory instead.
     is_bank: bool,
 }
 
@@ -19,7 +20,8 @@ pub struct BuildingDescStore {
 }
 
 fn name_is_bank(name: &str) -> bool {
-    name.to_ascii_lowercase().contains("bank")
+    let lower = name.to_ascii_lowercase();
+    lower.contains("bank") || lower.contains("stash")
 }
 
 impl BuildingDescStore {
@@ -90,6 +92,13 @@ mod tests {
         let mut s = BuildingDescStore::new();
         s.upsert(row(985246037, "Town Bank", true));
         assert_eq!(s.get(985246037), Some("Town Bank"));
+        assert!(!s.include_in_claim_inventory(985246037));
+    }
+
+    #[test]
+    fn local_stash_excluded_as_personal_storage() {
+        let mut s = BuildingDescStore::new();
+        s.upsert(row(985246037, "Local Stash", true));
         assert!(!s.include_in_claim_inventory(985246037));
     }
 
