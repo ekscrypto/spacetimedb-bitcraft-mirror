@@ -878,6 +878,7 @@ const DEFAULT_MIRROR_EVENT_TABLES: &[&str] = &[
     "player_signed_out_event",
     "craft_event",
     "player_death_event",
+    "building_buff_activate_event",
 ];
 
 /// Resolve `--mirror-event-tables` into the forwarding allowlist.
