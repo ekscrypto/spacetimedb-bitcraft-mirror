@@ -30,6 +30,7 @@ pub mod passive_craft;
 pub mod player_action;
 pub mod player_housing;
 pub mod player_state;
+pub mod player_stats;
 pub mod player_username;
 pub mod progressive_action;
 pub mod public_progressive_action;
@@ -66,6 +67,7 @@ pub use passive_craft::PassiveCraftSoA;
 pub use player_action::PlayerActionSoA;
 pub use player_housing::{PlayerHousingDescStore, PlayerHousingSoA};
 pub use player_state::PlayerStateSoA;
+pub use player_stats::{PlayerSkillStat, PlayerStatsRow, PlayerStatsSoA, PlayerStatsSource};
 pub use player_username::PlayerUsernameSoA;
 pub use progressive_action::ProgressiveActionSoA;
 pub use public_progressive_action::PublicProgressiveActionStore;
@@ -98,6 +100,9 @@ pub struct RegionStore {
     pub dimension_network: DimensionNetworkStore,
     pub player_username: PlayerUsernameSoA,
     pub player_state: PlayerStateSoA,
+    /// Derived from `player_username` / `player_state` / `experience` as
+    /// their rows are applied (`store/player_stats.rs`).
+    pub player_stats: PlayerStatsSoA,
     pub mobile_entity: MobileEntitySoA,
     pub deployable: DeployableSoA,
     pub deployable_desc: DeployableDescStore,
@@ -149,6 +154,7 @@ impl RegionStore {
             dimension_network: DimensionNetworkStore::new(),
             player_username: PlayerUsernameSoA::with_capacity(0),
             player_state: PlayerStateSoA::with_capacity(0),
+            player_stats: PlayerStatsSoA::with_capacity(0),
             mobile_entity: MobileEntitySoA::with_capacity(0),
             deployable: DeployableSoA::with_capacity(0),
             deployable_desc: DeployableDescStore::new(),

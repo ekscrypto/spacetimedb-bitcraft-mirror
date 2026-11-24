@@ -17,7 +17,8 @@
 //! Module map: [`config`] CLI/env args, [`decode`] BSATN row bytes → typed
 //! rows, [`store`] columnar per-table stores (one [`store::RegionStore`] per
 //! region), [`interest`] pub/sub invalidation feeding the dim-buildings
-//! WebSocket ([`stream`]), [`serve`] the HTTP read API, and the
+//! WebSocket ([`stream`]), [`serve`] the HTTP read API, [`leaderboard_serve`]
+//! the ranked player boards over [`store::player_stats`], and the
 //! WebSocket-mode-only ingest trio [`discovery`] / [`shard`] / [`wire`].
 //! [`xp`] holds the vendored XP-threshold table.
 
@@ -28,6 +29,7 @@ pub mod decode;
 pub mod discovery;
 pub mod feed;
 pub mod interest;
+pub mod leaderboard_serve;
 pub mod roads;
 pub mod roads_serve;
 pub mod serve;

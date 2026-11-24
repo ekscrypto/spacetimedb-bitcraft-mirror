@@ -29,7 +29,7 @@ use crate::decode::{
 };
 use crate::discovery::RegionBackend;
 use crate::interest::{InterestHub, TouchBatch};
-use crate::store::RegionStore;
+use crate::store::{PlayerStatsSource, RegionStore};
 use crate::wire;
 
 const PING_INTERVAL: Duration = Duration::from_secs(10);
@@ -1110,6 +1110,7 @@ pub(crate) fn apply_rows(
             }
         }
         PLAYER_USERNAME_TABLE => {
+            let now = Instant::now();
             for row in deletes {
                 let decoded = decode::decode_player_username_with_fields(
                     row,
@@ -1118,6 +1119,9 @@ pub(crate) fn apply_rows(
                     schema,
                 )?;
                 store.player_username.delete(decoded.entity_id);
+                store
+                    .player_stats
+                    .mark_deleted(decoded.entity_id, PlayerStatsSource::Username, now);
             }
             for row in inserts {
                 let decoded = decode::decode_player_username_with_fields(
@@ -1126,10 +1130,14 @@ pub(crate) fn apply_rows(
                     meta.cols.player_username,
                     schema,
                 )?;
+                store
+                    .player_stats
+                    .apply_username(decoded.entity_id, &decoded.username, now);
                 store.player_username.upsert(decoded);
             }
         }
         PLAYER_STATE_TABLE => {
+            let now = Instant::now();
             for row in deletes {
                 let decoded = decode::decode_player_state_with_fields(
                     row,
@@ -1141,6 +1149,9 @@ pub(crate) fn apply_rows(
                     t.member_player(decoded.entity_id);
                 }
                 store.player_state.delete(decoded.entity_id);
+                store
+                    .player_stats
+                    .mark_deleted(decoded.entity_id, PlayerStatsSource::PlayerState, now);
             }
             for row in inserts {
                 let decoded = decode::decode_player_state_with_fields(
@@ -1152,6 +1163,9 @@ pub(crate) fn apply_rows(
                 if let Some(t) = touches.as_deref_mut() {
                     t.member_player(decoded.entity_id);
                 }
+                store
+                    .player_stats
+                    .apply_player_state(decoded.entity_id, decoded.signed_in, now);
                 store.player_state.upsert(decoded);
             }
         }
@@ -1411,6 +1425,7 @@ pub(crate) fn apply_rows(
             }
         }
         EXPERIENCE_TABLE => {
+            let now = Instant::now();
             for row in deletes {
                 let decoded =
                     decode::decode_experience_with_fields(row, &meta.experience_fields, meta.cols.experience, schema)?;
@@ -1418,6 +1433,9 @@ pub(crate) fn apply_rows(
                     t.member_player(decoded.entity_id);
                 }
                 store.experience.delete(decoded.entity_id);
+                store
+                    .player_stats
+                    .mark_deleted(decoded.entity_id, PlayerStatsSource::Experience, now);
             }
             for row in inserts {
                 let decoded =
@@ -1425,6 +1443,9 @@ pub(crate) fn apply_rows(
                 if let Some(t) = touches.as_deref_mut() {
                     t.member_player(decoded.entity_id);
                 }
+                store
+                    .player_stats
+                    .apply_experience(decoded.entity_id, &decoded.stacks, now);
                 store.experience.upsert(decoded);
             }
         }

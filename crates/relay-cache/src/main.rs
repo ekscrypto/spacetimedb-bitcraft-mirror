@@ -13,16 +13,18 @@
 //!   5. player personal inventories (categorized bags)
 //!   6. player housing (first house + interior buildings)
 //!   7. player skills (XP → level)
-//!   8. claim / player crafts (progressive + passive)
-//!   9. Hexite Deposits (neutral claim_state + growth_state)
-//!  10. public `/internal/dim-buildings/ws` — housing-interior building-id
+//!   8. leaderboard: ranked player boards + the professions / regions for
+//!      its pickers (`/leaderboard`, `/leaderboard/options`)
+//!   9. claim / player crafts (progressive + passive)
+//!  10. Hexite Deposits (neutral claim_state + growth_state)
+//!  11. public `/internal/dim-buildings/ws` — housing-interior building-id
 //!      push (primary consumer: bitcraft-streamd; nginx-proxied)
 //!
 //! Embedded mode (`standalone start --bitcraft-cache`) additionally serves:
-//!  11. roads terrain/paving/claim grids + resource tile map
+//!  12. roads terrain/paving/claim grids + resource tile map
 //!      (`/roads/*`; protobuf; see proto/roads_cache.proto and
 //!      `roads/resource_map.rs` for the tile-word layout)
-//!  12. Bit-Me mobile app API (`/bitme/*`; client reference: BITME-API.md)
+//!  13. Bit-Me mobile app API (`/bitme/*`; client reference: BITME-API.md)
 //!      — resolve, activity snapshot, packed resource-map window,
 //!      resource dictionary
 

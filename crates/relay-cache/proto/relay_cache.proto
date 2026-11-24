@@ -314,3 +314,69 @@ message StorageLogList {
   repeated StorageLogEntry logs = 1;
   int32 count = 2;
 }
+
+// One ranked row of GET /leaderboard. `level` / `xp` belong to the selected
+// profession, or are the totals when the board is the overall one.
+message LeaderboardEntry {
+  uint64 entity_id = 1;
+  string username = 2;
+  uint32 region = 3;
+  // In-game region name; absent when the global mirror supplies none.
+  optional string region_name = 4;
+  int64 rank = 5;
+  int64 level = 6;
+  int64 xp = 7;
+  int64 total_level = 8;
+  int64 total_xp = 9;
+  bool signed_in = 10;
+}
+
+// The filters a board was computed with. Absent optionals mean "all".
+message LeaderboardScope {
+  optional int32 skill_id = 1;
+  optional string profession = 2;
+  optional uint32 region = 3;
+  optional string region_name = 4;
+  optional string q = 5;
+  // "xp" | "level"
+  string sort = 6;
+}
+
+message Leaderboard {
+  LeaderboardScope scope = 1;
+  repeated LeaderboardEntry players = 2;
+  // Players in scope before paging; the denominator of `rank`.
+  int32 total_players = 3;
+  // Of those, players whose username contains `q` (all when `q` is absent).
+  int32 matches = 8;
+  int32 offset = 4;
+  int32 limit = 5;
+  // A region in scope was still loading and contributed no rows.
+  bool partial = 6;
+  // ISO-8601 UTC (millis) from when the board was computed.
+  string generated_at = 7;
+}
+
+message LeaderboardProfession {
+  int32 skill_id = 1;
+  string name = 2;
+  string title = 3;
+  int32 max_level = 4;
+}
+
+message LeaderboardRegion {
+  uint32 region = 1;
+  // In-game region name; absent when the global mirror supplies none.
+  optional string name = 2;
+  // Players whose rows are on this region's shard.
+  int32 players = 3;
+  bool ready = 4;
+}
+
+message LeaderboardOptions {
+  repeated LeaderboardProfession professions = 1;
+  repeated LeaderboardRegion regions = 2;
+  int32 default_limit = 3;
+  int32 max_limit = 4;
+  string generated_at = 5;
+}

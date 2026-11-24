@@ -1082,3 +1082,161 @@ async fn feed_roads_clears_paving_when_location_is_deleted_first() {
     assert_eq!(grid.resource_map.paving_at_local(13, 34), Some(59838));
     assert_eq!(grid.overlay.paved_tile_count(), 1);
 }
+
+/// `experience_state`: entity_id u64, experience_stacks
+/// Array<{skill_id i32, quantity i32}>.
+fn experience_row(entity_id: u64, stacks: &[(i32, i32)]) -> Bytes {
+    let mut buf = Vec::with_capacity(12 + 8 * stacks.len());
+    buf.extend_from_slice(&entity_id.to_le_bytes());
+    buf.extend_from_slice(&(stacks.len() as u32).to_le_bytes());
+    for (skill_id, quantity) in stacks {
+        buf.extend_from_slice(&skill_id.to_le_bytes());
+        buf.extend_from_slice(&quantity.to_le_bytes());
+    }
+    Bytes::from(buf)
+}
+
+/// `player_username_state`: entity_id u64, username String (u32 length + UTF-8).
+fn player_username_row(entity_id: u64, username: &str) -> Bytes {
+    let mut buf = Vec::with_capacity(12 + username.len());
+    buf.extend_from_slice(&entity_id.to_le_bytes());
+    buf.extend_from_slice(&(username.len() as u32).to_le_bytes());
+    buf.extend_from_slice(username.as_bytes());
+    Bytes::from(buf)
+}
+
+/// `player_state`: teleport_location {location {x i32, z i32, dimension u32},
+/// location_type tag u8}, entity_id u64, time_played i32,
+/// session_start_timestamp i32, time_signed_in i32, sign_in_timestamp i32,
+/// signed_in Bool, traveler_tasks_expiration i32.
+fn player_state_row(entity_id: u64, signed_in: bool) -> Bytes {
+    let mut buf = Vec::with_capacity(42);
+    buf.extend_from_slice(&0i32.to_le_bytes()); // location.x
+    buf.extend_from_slice(&0i32.to_le_bytes()); // location.z
+    buf.extend_from_slice(&0u32.to_le_bytes()); // location.dimension
+    buf.push(2); // location_type: HomeLocation
+    buf.extend_from_slice(&entity_id.to_le_bytes());
+    buf.extend_from_slice(&0i32.to_le_bytes()); // time_played
+    buf.extend_from_slice(&0i32.to_le_bytes()); // session_start_timestamp
+    buf.extend_from_slice(&0i32.to_le_bytes()); // time_signed_in
+    buf.extend_from_slice(&(if signed_in { 1_700_000_000i32 } else { 0 }).to_le_bytes()); // sign_in_timestamp
+    buf.push(signed_in as u8);
+    buf.extend_from_slice(&0i32.to_le_bytes()); // traveler_tasks_expiration
+    Bytes::from(buf)
+}
+
+#[tokio::test]
+async fn feed_maintains_player_stats_from_seed_and_live_rows() {
+    let interest = InterestHub::new();
+    let manager = FeedManager::new(interest);
+    let handle = manager
+        .register_region("bitcraft-live-7", SCHEMA_JSON)
+        .expect("register")
+        .expect("regional database yields a handle");
+
+    // The hand-encoded rows must decode to what the apply hook sees.
+    let schema = schema();
+    let cols = decode::resolve_cols(&schema).expect("resolve cols");
+    let state = decode::decode_player_state_with_fields(
+        &player_state_row(42, true),
+        &owned_fields(&schema, "player_state"),
+        cols.player_state,
+        &schema,
+    )
+    .expect("player_state row decodes");
+    assert_eq!((state.entity_id, state.signed_in), (42, true));
+
+    // Seed in table-alphabetical order: experience_state lands before the
+    // session and username rows, so the stats row is built a field at a time.
+    let stacks = [(1, 0), (5, 26_539), (2, 14_790)];
+    let seed = seed_update(vec![
+        ops("experience_state", vec![], vec![experience_row(42, &stacks)]),
+        ops("player_state", vec![], vec![player_state_row(42, true)]),
+        ops(
+            "player_username_state",
+            vec![],
+            vec![player_username_row(42, "Spiellegend")],
+        ),
+    ]);
+    manager
+        .on_updates(Arc::from("bitcraft-live-7"), 1, vec![seed])
+        .await
+        .expect("dispatch seed");
+    // While seeding nothing is published.
+    settle().await;
+    assert!(!handle.store.read().ready, "no readiness before on_live");
+    manager
+        .on_live(Arc::from("bitcraft-live-7"), 1)
+        .await
+        .expect("dispatch live");
+    for _ in 0..200 {
+        if handle.store.read().ready {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let now = std::time::Instant::now();
+    let expected_level = relay_cache::xp::xp_to_level(26_539) + relay_cache::xp::xp_to_level(14_790);
+    {
+        let store = handle.store.read();
+        assert!(store.ready, "ready after on_live");
+        let row = store
+            .player_stats
+            .get(42, now)
+            .expect("stats row published with the seed");
+        assert_eq!(
+            (row.username, row.signed_in, row.departing),
+            ("Spiellegend", true, false)
+        );
+        assert_eq!((row.total_xp, row.total_level), (41_329, expected_level));
+        assert_eq!(row.skill(5).map(|s| s.xp), Some(26_539));
+        assert!(row.skill(1).is_none(), "ANY sentinel is not a skill");
+    }
+
+    // A live XP gain is delete + insert of the experience row.
+    let gained = [(1, 0), (5, 27_000), (2, 14_790)];
+    let live = live_update(vec![ops(
+        "experience_state",
+        vec![experience_row(42, &stacks)],
+        vec![experience_row(42, &gained)],
+    )]);
+    manager
+        .on_updates(Arc::from("bitcraft-live-7"), 1, vec![live])
+        .await
+        .expect("dispatch xp gain");
+    settle().await;
+    {
+        let store = handle.store.read();
+        let row = store.player_stats.get(42, now).expect("still ranked");
+        assert!(!row.departing);
+        assert_eq!(
+            (row.total_xp, row.username, row.signed_in),
+            (41_790, "Spiellegend", true)
+        );
+    }
+
+    // A region transfer removes every source row from this shard. The player
+    // stays on the board through the grace instead of flickering off between
+    // shards.
+    let leave = live_update(vec![
+        ops("experience_state", vec![experience_row(42, &gained)], vec![]),
+        ops("player_state", vec![player_state_row(42, true)], vec![]),
+        ops(
+            "player_username_state",
+            vec![player_username_row(42, "Spiellegend")],
+            vec![],
+        ),
+    ]);
+    manager
+        .on_updates(Arc::from("bitcraft-live-7"), 1, vec![leave])
+        .await
+        .expect("dispatch region transfer");
+    settle().await;
+    {
+        let store = handle.store.read();
+        let row = store.player_stats.get(42, now).expect("kept through the delete grace");
+        assert!(row.departing);
+        assert_eq!((row.total_xp, row.username), (41_790, "Spiellegend"));
+    }
+}

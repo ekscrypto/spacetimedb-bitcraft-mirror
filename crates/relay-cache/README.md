@@ -128,6 +128,40 @@ curl -s http://127.0.0.1:8089/player/1297036692699996362/housing
 # Player skill levels (from experience_state + vendored XP thresholds)
 curl -s http://127.0.0.1:8089/player/1297036692699996362/skills
 
+# Ranked player boards over the per-region derived rows in
+# `store/player_stats.rs` (one row per player: name, region, level + XP per
+# skill, totals). The rows are maintained as the player's rows are applied,
+# so a query only folds and orders them.
+curl -s http://127.0.0.1:8089/leaderboard
+# → { "scope": { "skill_id", "profession", "region", "region_name", "q", "sort" },
+#      "total_players": N, "matches": N, "offset": 0, "limit": 100,
+#      "partial": false,
+#      "players": [ { "rank", "entity_id", "username", "region", "region_name",
+#                     "level", "xp", "total_level", "total_xp", "signed_in" }, ... ],
+#      "generated_at": "YYYY-MM-DDTHH:MM:SS.mmmZ" }
+#   profession  skill id or case-insensitive name; omitted = the overall board
+#   region      one region shard; omitted = all regions
+#   q           ASCII-case-insensitive username substring. It narrows what is
+#               returned; ranks stay the ranks on the full board.
+#   sort        xp (default) | level
+#   limit       1..500 (default 100)     offset  >= 0 (default 0)
+# `level` / `xp` belong to the selected profession (the totals otherwise).
+# A player's region is the shard holding their rows right now: where they
+# are, or where they last logged out. `rank` is dense over (profession,
+# region); `total_players` is that scope's size and `matches` how many pass
+# `q`. `partial` means a region was still loading and contributed nothing.
+# 503 + Retry-After (`code: "cache_syncing"`) when no region — or the one
+# asked for — is ready. Each body is reused for 5 s per scope.
+curl -s 'http://127.0.0.1:8089/leaderboard?profession=Mining&region=7&limit=25&offset=25'
+curl -s 'http://127.0.0.1:8089/leaderboard?sort=level'
+curl -s 'http://127.0.0.1:8089/leaderboard?q=maple'
+
+# Professions + regions for the board's pickers (reused for 10 s)
+curl -s http://127.0.0.1:8089/leaderboard/options
+# → { "professions": [ { "skill_id", "name", "title", "max_level" }, ... ],
+#     "regions": [ { "region", "name", "players", "ready" }, ... ],
+#     "defaults": { "limit": 100, "max_limit": 500 }, "generated_at": "..." }
+
 # Crafts at a claim (progressive + passive). Optional `completed=true|false`
 # filter; omit to return both. Owners with inventory permission are filtered
 # client-side via /claim/<id>/members.
@@ -288,6 +322,8 @@ curl -sH 'Accept: application/x-protobuf' \
 curl -sH 'Accept: application/x-protobuf' \
   http://127.0.0.1:8089/player/1297036692699996362/skills -o player-skills.pb
 curl -sH 'Accept: application/x-protobuf' \
+  'http://127.0.0.1:8089/leaderboard?profession=Mining' -o leaderboard.pb
+curl -sH 'Accept: application/x-protobuf' \
   'http://127.0.0.1:8089/claim/1234567890/crafts' -o claim-crafts.pb
 curl -sH 'Accept: application/x-protobuf' \
   'http://127.0.0.1:8089/player/1297036692699996362/crafts' -o player-crafts.pb
@@ -315,6 +351,10 @@ curl -s https://relay.bitcraftsync.app/player/1297036692699996362/inventory
 curl -s https://relay.bitcraftsync.app/player/1297036692699996362/housing
 curl -s https://relay.bitcraftsync.app/player/1297036692699996362/skills
 curl -s 'https://relay.bitcraftsync.app/player/1297036692699996362/crafts?completed=true'
+# Leaderboard (browsers on bitcraftsync.app/leaderboard poll this directly;
+# nginx rate-limits the location per IP)
+curl -s 'https://relay.bitcraftsync.app/leaderboard?profession=Mining&region=7'
+curl -s https://relay.bitcraftsync.app/leaderboard/options
 curl -s 'https://relay.bitcraftsync.app/deposits'
 curl -s 'https://relay.bitcraftsync.app/deposits?region=14'
 curl -s 'https://relay.bitcraftsync.app/storage-logs?storageId=1008806316593474517&limit=50'
@@ -330,6 +370,11 @@ The ceiling is an alarm, not a load shedder. Approaching it logs a warning
 and flips `/cache-health` `ready=false`, but queries keep serving with whatever
 data is loaded. Projected resident grows with player/deployable/rent/
 `experience_state` tables on top of the prior claim/inventory set.
+
+The leaderboard's derived rows (`store/player_stats.rs`) add roughly 300
+bytes per player on top of that — about 3.5 MiB at 11.4k players. They are
+rebuilt with the store on every re-seed and hold nothing beyond the player's
+name, region, 19 skill entries and two totals.
 
 Roads grids are fully dense per region and now include the resource tile map
 (`roads/resource_map.rs`, 7680×7680 u16 = 112.5 MiB/region on top of the

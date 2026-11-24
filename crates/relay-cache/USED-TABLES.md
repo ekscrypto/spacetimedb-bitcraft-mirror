@@ -2,14 +2,14 @@
 
 `relay-cache` subscribes to **36 distinct upstream SpacetimeDB tables** per
 region (plus 6 global-module tables for the Bit-Me resolve chain) and exposes
-them through **21 GET HTTP endpoints** plus
+them through **23 GET HTTP endpoints** plus
 `POST /roads/region/:id/resources`. Every table is
 read by at least one endpoint except two that are subscribed-but-unused
 (`rent_state`, `player_housing_desc`).
 
 Canonical sources: table-name constants in `decode.rs`, subscribe SQL in
 `shard.rs` `base_subscribe_queries()`, store modules in `store/`, routes in
-`serve.rs`.
+`serve.rs` and `leaderboard_serve.rs`.
 
 ---
 
@@ -39,8 +39,8 @@ Canonical sources: table-name constants in `decode.rs`, subscribe SQL in
 
 | Upstream table | Store module | Description | Endpoints |
 |---|---|---|---|
-| `player_username_state` | `store/player_username.rs` | Player → username map | `/claim`, `/claim/:id`, `/claim/:id/crafts`, `/player`, `/player/:id`, `/player/:id/inventory`, `/player/:id/housing`, `/player/:id/skills`, `/player/:id/crafts` |
-| `player_state` | `store/player_state.rs` | Login/session timestamps | `/claim/:id/members` (+aliases), `/player`, `/player/:id`, … |
+| `player_username_state` | `store/player_username.rs` | Player → username map | `/claim`, `/claim/:id`, `/claim/:id/crafts`, `/player`, `/player/:id`, `/player/:id/inventory`, `/player/:id/housing`, `/player/:id/skills`, `/player/:id/crafts`, `/leaderboard` |
+| `player_state` | `store/player_state.rs` | Login/session timestamps | `/claim/:id/members` (+aliases), `/player`, `/player/:id`, …, `/leaderboard` |
 | `mobile_entity_state` | `store/mobile_entity.rs` | Last-move timestamp + live world position (milli-units; public proxy for private `player_timestamp_state`) | same as `player_state`, `/bitme/session/:id` |
 | `stamina_state` | `store/stamina.rs` | Current stamina (F32) + last-decrease clock | `/bitme/session/:id` |
 | `active_buff_state` | `store/active_buff.rs` | Per-entity buff lists (zeroed placeholders filtered at read) | `/bitme/session/:id` |
@@ -50,7 +50,7 @@ Canonical sources: table-name constants in `decode.rs`, subscribe SQL in
 | `extraction_recipe_desc` | `store/extraction_recipe.rs` | Extraction catalog (`recipe_id → resource_id`); runtime-authoritative identity for forageable targets | `/bitme/session/:id` |
 | `resource_desc` | `store/resource_desc.rs` + `roads/decode.rs` (footprint offsets) | Static resource gamedata (name, max health, despawn/respawn, destroy-yield chain); footprint feeds the resource tile map | `/bitme/session/:id`, spawn watch-set, resource tile map |
 | `resource_health_state` | *(tracker-scoped, `src/bitme.rs`)* | Per-resource current health — hundreds of thousands of rows per region, so NOT stored wholesale; retained only for Bit-Me tracked action targets | `/bitme/session/:id` |
-| `experience_state` | `store/experience.rs` | Player → skill XP stacks | `/claim/:id/members` (+aliases), `/player/:id/skills` |
+| `experience_state` | `store/experience.rs` | Player → skill XP stacks | `/claim/:id/members` (+aliases), `/player/:id/skills`, `/leaderboard` |
 
 ### Player Housing / Rent
 
@@ -75,7 +75,7 @@ Canonical sources: table-name constants in `decode.rs`, subscribe SQL in
 | `public_progressive_action_state` | `store/public_progressive_action.rs` | Public craft flag join | `/claim/:id/crafts`, `/player/:id/crafts` |
 | `passive_craft_state` | `store/passive_craft.rs` | Passive crafts | `/claim/:id/crafts`, `/player/:id/crafts` |
 | `crafting_recipe_desc` | `store/crafting_recipe_desc.rs` | Recipe catalog | `/claim/:id/crafts`, `/player/:id/crafts` |
-| `skill_desc` | `store/skill_desc.rs` | Skill catalog | `/claim/:id/members` (+aliases), `/player/:id/skills` |
+| `skill_desc` | `store/skill_desc.rs` | Skill catalog | `/claim/:id/members` (+aliases), `/player/:id/skills`, `/leaderboard`, `/leaderboard/options` |
 
 ### World / Static descriptors
 
@@ -111,6 +111,8 @@ Endpoints with **no** synchronized tables: `/cache-health`, `/proto`,
 | `/player/:id/inventory` | + inventory_state, deployable_*, building_*, claim_state |
 | `/player/:id/housing` | + player_housing_state, dimension_network_state, building_nickname_state, location_state |
 | `/player/:id/skills` | + experience_state, skill_desc |
+| `/leaderboard` | derived `store/player_stats.rs` (from player_username_state, player_state, experience_state), skill_desc, region names via the Bit-Me global store |
+| `/leaderboard/options` | skill_desc, per-region `player_stats` row counts, region names |
 | `/player/:id/crafts` | + progressive_action_*, passive_craft_state, crafting_recipe_desc, building_* |
 | `/deposits` | claim_state, claim_local_state, resource_state, resource_growth_timer, growth_state |
 | `/storage-logs` | storage_log_state, building_*, claim_state |
@@ -123,6 +125,13 @@ Endpoints with **no** synchronized tables: `/cache-health`, `/proto`,
 ---
 
 ## Notable findings
+
+- **Derived player rows (`store/player_stats.rs`):** not a subscribed table.
+  One leaderboard row per player (name, region, level + XP per skill,
+  totals), written from `shard.rs::apply_rows` as the three player tables
+  land. A delete only clears a presence bit; the row is served until every
+  source has been gone for 120 s, so an in-batch UPDATE or a region transfer
+  never knocks a player off the board.
 
 - **Two subscribed-but-unused tables:** `rent_state`, `player_housing_desc`.
 - **Three tables not subscribed:** `deployable_state` (v1), `player_timestamp_state`

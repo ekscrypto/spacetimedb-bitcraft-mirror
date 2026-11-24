@@ -21,6 +21,9 @@
 //! loopback-only — the nginx config enforces that with an explicit
 //! `location /internal/ { return 404; }` catch behind the dim-buildings
 //! route. See `DIM-BUILDINGS-WS.md` for the wire protocol.
+//!
+//! The `/roads/*`, `/bitme/*` and `/leaderboard/*` routes live in their own
+//! modules and are merged into this router; they all read the same `Fleet`.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -43,7 +46,7 @@ use crate::shard::ShardHandle;
 use crate::store::{Pocket, RegionStore};
 use crate::stream;
 
-mod pb {
+pub(crate) mod pb {
     include!(concat!(env!("OUT_DIR"), "/relay_cache.rs"));
 }
 
@@ -105,6 +108,7 @@ pub async fn serve(
         .route("/player/:entity_id/crafts", get(player_crafts))
         .route("/deposits", get(hexite_deposits))
         .route("/storage-logs", get(storage_logs))
+        .merge(crate::leaderboard_serve::leaderboard_routes())
         .merge(crate::roads_serve::roads_routes())
         .merge(crate::bitme_serve::bitme_routes())
         .layer(CorsLayer::permissive())
@@ -120,7 +124,7 @@ pub async fn serve(
     Ok(())
 }
 
-fn wants_protobuf(headers: &HeaderMap) -> bool {
+pub(crate) fn wants_protobuf(headers: &HeaderMap) -> bool {
     headers
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
@@ -170,19 +174,7 @@ pub(crate) fn entity_missing(fleet: &Fleet, kind: &'static str) -> Response {
 
 fn entity_missing_response(syncing: bool, kind: &'static str) -> Response {
     if syncing {
-        let mut resp = no_store_status(
-            StatusCode::SERVICE_UNAVAILABLE,
-            json!({
-                "error": format!("{kind} not found yet; cache is still syncing"),
-                "code": "cache_syncing",
-                "kind": kind,
-            }),
-        );
-        resp.headers_mut().insert(
-            header::RETRY_AFTER,
-            HeaderValue::from_static(CACHE_SYNCING_RETRY_AFTER_SECS),
-        );
-        resp
+        cache_syncing_response(kind, format!("{kind} not found yet; cache is still syncing"))
     } else {
         no_store_status(
             StatusCode::NOT_FOUND,
@@ -191,7 +183,26 @@ fn entity_missing_response(syncing: bool, kind: &'static str) -> Response {
     }
 }
 
-fn no_store_protobuf(bytes: Vec<u8>) -> Response {
+/// `503` + `Retry-After`, `code: "cache_syncing"`: the answer depends on a
+/// region shard that has not finished its initial sync. The `code` is what
+/// tells clients to retry, as opposed to an unknown route's bare 503.
+pub(crate) fn cache_syncing_response(kind: &'static str, error: String) -> Response {
+    let mut resp = no_store_status(
+        StatusCode::SERVICE_UNAVAILABLE,
+        json!({
+            "error": error,
+            "code": "cache_syncing",
+            "kind": kind,
+        }),
+    );
+    resp.headers_mut().insert(
+        header::RETRY_AFTER,
+        HeaderValue::from_static(CACHE_SYNCING_RETRY_AFTER_SECS),
+    );
+    resp
+}
+
+pub(crate) fn no_store_protobuf(bytes: Vec<u8>) -> Response {
     let mut headers = HeaderMap::new();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(PROTOBUF_MIME));
@@ -588,6 +599,7 @@ fn region_rows(s: &RegionStore) -> Value {
         "dimension_network": s.dimension_network.len(),
         "player_username": s.player_username.len(),
         "player_state": s.player_state.len(),
+        "player_stats": s.player_stats.len(),
         "mobile_entity": s.mobile_entity.len(),
         "deployable": s.deployable.len(),
         "deployable_desc": s.deployable_desc.len(),

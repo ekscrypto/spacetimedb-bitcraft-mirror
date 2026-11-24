@@ -36,6 +36,13 @@ impl SkillDescStore {
         self.by_id.get(&id).map(|e| e.name.as_ref())
     }
 
+    /// Every skill, sorted by id.
+    pub fn iter(&self) -> impl Iterator<Item = (i32, &SkillDescEntry)> {
+        let mut entries: Vec<(i32, &SkillDescEntry)> = self.by_id.iter().map(|(&id, e)| (id, e)).collect();
+        entries.sort_unstable_by_key(|(id, _)| *id);
+        entries.into_iter()
+    }
+
     pub fn upsert(&mut self, row: SkillDescRow) {
         self.by_id.insert(
             row.id,

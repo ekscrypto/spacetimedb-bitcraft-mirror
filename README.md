@@ -109,6 +109,7 @@ HTTP (protobuf-encoded bodies; the `.proto` sources self-describe the API):
 | `/claim/:id/hexcoins` | per-member hexcoin totals |
 | `/claim/:id/crafts` | claim craft jobs |
 | `/player?name=` · `/player/:id` | player lookup / detail |
+| `/leaderboard` · `/leaderboard/options` | ranked player boards (overall or per profession, per region, by name) and the professions / regions for its pickers |
 | `/player/:id/inventory` · `/housing` · `/skills` · `/crafts` | per-player data |
 | `/deposits` | hexite deposit locations |
 | `/storage-logs` | storage chest access logs |
