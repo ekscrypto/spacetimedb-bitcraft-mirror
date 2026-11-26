@@ -1477,6 +1477,26 @@ fn is_large_payload(num_bytes: usize) -> bool {
     num_bytes >= V3_MAX_UNCOMPRESSED_PAYLOAD_SIZE
 }
 
+/// Largest v1 message, in rows, that is encoded on the websocket encode task.
+///
+/// v1 messages are serialized straight from their logical form, so unlike
+/// v2/v3 there is no cheap byte length to test before encoding. Row count is
+/// the available proxy.
+const V1_INLINE_ENCODE_MAX_ROWS: usize = 1024;
+
+/// Return whether a v1 websocket message should be encoded on Rayon.
+///
+/// Every v1 message used to be sent to Rayon. For the small per-transaction
+/// updates that make up nearly all traffic, the thread hop costs far more than
+/// the encoding: with 40 v1 subscribers at 1,260 tx/s, encoding inline cut
+/// process CPU from ~185% to ~105-120% of a core (see `tools/fanout-bench`).
+///
+/// Messages without a row count (identity tokens, procedure results, errors)
+/// keep the old behaviour, since their size is unknown here.
+fn is_large_v1_message(num_rows: Option<usize>) -> bool {
+    num_rows.is_none_or(|rows| rows > V1_INLINE_ENCODE_MAX_ROWS)
+}
+
 /// Encoding receive batch size.
 ///
 /// This is deliberately tied to the client connection receive limit so the
@@ -1759,8 +1779,11 @@ impl WsEncoder<'_> {
     ) -> Result<(), mpsc::error::SendError<Frame>> {
         let config = self.config;
         let bsatn_rlb_pool = self.bsatn_rlb_pool;
-        self.encode_and_forward_message(|buf| ws_encode_message(config, buf, message, true, bsatn_rlb_pool, num_rows))
-            .await
+        let is_large = is_large_v1_message(num_rows);
+        self.encode_and_forward_message(|buf| {
+            ws_encode_message(config, buf, message, is_large, bsatn_rlb_pool, num_rows)
+        })
+        .await
     }
 
     /// Encode and forward the currently accumulated binary server messages.
@@ -2864,6 +2887,15 @@ mod tests {
         let options = WebSocketOptions::default();
         let toml = toml::to_string(&options).unwrap();
         assert_eq!(options, toml::from_str::<WebSocketOptions>(&toml).unwrap());
+    }
+
+    #[test]
+    fn v1_messages_are_encoded_inline_up_to_row_limit() {
+        assert!(!is_large_v1_message(Some(0)));
+        assert!(!is_large_v1_message(Some(V1_INLINE_ENCODE_MAX_ROWS)));
+        assert!(is_large_v1_message(Some(V1_INLINE_ENCODE_MAX_ROWS + 1)));
+        // Unknown size keeps the conservative Rayon path.
+        assert!(is_large_v1_message(None));
     }
 
     #[test]

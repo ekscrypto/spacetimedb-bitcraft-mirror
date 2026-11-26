@@ -1,0 +1,71 @@
+diff --git a/crates/client-api/src/routes/subscribe.rs b/crates/client-api/src/routes/subscribe.rs
+index 2793b0259..be6188b98 100644
+--- a/crates/client-api/src/routes/subscribe.rs
++++ b/crates/client-api/src/routes/subscribe.rs
+@@ -1539,6 +1539,31 @@ impl SerializeBufferPool {
+     }
+ }
+ 
++/// EXPERIMENT: row-count threshold below which v1 messages are encoded inline
++/// instead of on Rayon, from `STDB_WS_V1_INLINE_ENCODE_MAX_ROWS`.
++fn ws_v1_inline_encode_max_rows() -> Option<usize> {
++    static MAX: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
++    *MAX.get_or_init(|| {
++        std::env::var("STDB_WS_V1_INLINE_ENCODE_MAX_ROWS")
++            .ok()
++            .and_then(|v| v.parse().ok())
++    })
++}
++
++/// EXPERIMENT: outbound batching window, from `STDB_WS_SEND_LINGER_MS`
++/// (fractional milliseconds allowed). `None` (the default) keeps the stock
++/// behaviour of encoding whatever is queued the moment the task wakes.
++fn ws_send_linger() -> Option<Duration> {
++    static LINGER: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
++    *LINGER.get_or_init(|| {
++        std::env::var("STDB_WS_SEND_LINGER_MS")
++            .ok()
++            .and_then(|v| v.parse::<f64>().ok())
++            .filter(|ms| *ms > 0.0)
++            .map(|ms| Duration::from_secs_f64(ms / 1000.0))
++    })
++}
++
+ /// Task that reads [`OutboundWsMessage`]s from `messages`, encodes them, and
+ /// sends the resulting [`Frame`]s to `outgoing_frames`.
+ ///
+@@ -1562,7 +1587,16 @@ async fn ws_encode_task(
+         binary_server_messages: Vec::new(),
+     };
+     let mut message_batch = Vec::new();
++    let linger = ws_send_linger();
+     while messages.recv_many(&mut message_batch, ENCODE_BATCH_SIZE).await != 0 {
++        // EXPERIMENT (off unless `STDB_WS_SEND_LINGER_MS` is set): wait a short
++        // window after the first message so later ones join the same batch.
++        if let Some(linger) = linger {
++            tokio::time::sleep(linger).await;
++            while let Ok(message) = messages.try_recv() {
++                message_batch.push(message);
++            }
++        }
+         log::trace!("encoding batch of {} websocket messages", message_batch.len());
+         // `encode_batch` drains `message_batch` on success. If forwarding to
+         // the websocket send loop fails, the receiver is gone, so the encode
+@@ -1759,7 +1793,16 @@ impl WsEncoder<'_> {
+     ) -> Result<(), mpsc::error::SendError<Frame>> {
+         let config = self.config;
+         let bsatn_rlb_pool = self.bsatn_rlb_pool;
+-        self.encode_and_forward_message(|buf| ws_encode_message(config, buf, message, true, bsatn_rlb_pool, num_rows))
++        // EXPERIMENT (off unless `STDB_WS_V1_INLINE_ENCODE_MAX_ROWS` is set):
++        // stock behaviour sends every v1 message to Rayon; with the variable
++        // set, messages with at most that many rows are encoded on this task.
++        let is_large = match ws_v1_inline_encode_max_rows() {
++            Some(max_rows) => num_rows.is_none_or(|n| n > max_rows),
++            None => true,
++        };
++        self.encode_and_forward_message(|buf| {
++            ws_encode_message(config, buf, message, is_large, bsatn_rlb_pool, num_rows)
++        })
+             .await
+     }
+ 

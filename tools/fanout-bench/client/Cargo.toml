@@ -1,0 +1,11 @@
+[package]
+name = "fanout-bench-client"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.27"
+futures-util = "0.3"
